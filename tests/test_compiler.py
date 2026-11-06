@@ -1,0 +1,278 @@
+import json
+import os
+import unittest
+
+from pipedsl.compiler import compile_pipeline
+from pipedsl.types import TypeParseError, parse_type
+
+from helpers import compile_text, one_model
+
+EXAMPLE = os.path.join(os.path.dirname(__file__), "..", "examples", "orders")
+
+
+def codes(result):
+    return result.diagnostics.codes()
+
+
+class TypesTest(unittest.TestCase):
+    def test_normalizes(self):
+        self.assertEqual(parse_type("decimal(10,2)").text, "DECIMAL(10, 2)")
+        self.assertEqual(parse_type("string not null").text, "STRING NOT NULL")
+        self.assertEqual(parse_type("long").text, "BIGINT")
+        self.assertEqual(parse_type("map<string, array<int>>").text, "MAP<STRING, ARRAY<INT>>")
+        self.assertEqual(parse_type("ROW<a INT, b STRING>").text, "ROW<`a` INT, `b` STRING>")
+
+    def test_rejects(self):
+        for bad in ("DECIMAL(40, 2)", "VARCHARZ", "MAP<INT>", "INT(3)", "TIMESTAMP(12)"):
+            with self.assertRaises(TypeParseError, msg=bad):
+                parse_type(bad)
+
+
+class ExampleTest(unittest.TestCase):
+    def test_example_compiles_cleanly(self):
+        r = compile_pipeline(EXAMPLE)
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        self.assertEqual([d for d in r.diagnostics.items if d.severity.value != "info"], [])
+        m = r.lowered.manifest
+        self.assertEqual(m["nodes"]["customer_ltv"]["changelog"], "updating")
+        self.assertEqual(m["nodes"]["orders_enriched"]["changelog"], "append")
+        self.assertEqual(m["nodes"]["orders_enriched"]["time_attributes"], ["order_ts"])
+        self.assertEqual(m["nodes"]["revenue_per_minute"]["time_attributes"], [])
+        self.assertIn("org.apache.flink:flink-sql-connector-kafka", m["artifacts"])
+        self.assertEqual(m["secrets"], ["crm/password"])
+        self.assertIsNone(m["nodes"]["clean_orders"]["state_id"])  # stateless
+        self.assertIsNotNone(m["nodes"]["customer_ltv"]["state_id"])
+        json.dumps(m)
+
+    def test_example_sql_shape(self):
+        sql = compile_pipeline(EXAMPLE).lowered.sql
+        self.assertIn("'connector' = 'upsert-kafka'", sql)
+        self.assertIn("WATERMARK FOR `order_ts` AS `order_ts` - INTERVAL '5' SECOND", sql)
+        self.assertIn("PIPEDSL_ASSERT((order_id IS NOT NULL) IS TRUE", sql)
+        self.assertIn("INSERT INTO `clean_orders__quarantine`", sql)
+        self.assertIn("'slot.name' = 'orders_analytics_customers'", sql)
+        self.assertNotIn("${var:", sql)
+        self.assertTrue(sql.rstrip().endswith("END;"))
+
+    def test_env_overrides_vars(self):
+        r = compile_pipeline(EXAMPLE, env="prod")
+        self.assertTrue(r.ok)
+        self.assertIn("s3://prod-lake/warehouse", r.lowered.sql)
+        self.assertIn("kafka/prod/bootstrap", r.lowered.manifest["secrets"])
+
+    def test_unknown_env(self):
+        self.assertIn("PD007", codes(compile_pipeline(EXAMPLE, env="staging")))
+
+
+class StructureTest(unittest.TestCase):
+    def test_unknown_key_suggests(self):
+        r = compile_text("modles: {}\n")
+        d = r.diagnostics.items[0]
+        self.assertEqual(d.code, "PD001")
+        self.assertIn("models", d.hint)
+        with open(d.location.file) as f:  # line numbers point into pipeline.yaml
+            self.assertTrue(f.read().splitlines()[d.location.line - 1].startswith("modles"))
+
+    def test_undefined_var(self):
+        r = compile_text("pipeline: x\nconnections:\n  k: {type: kafka, properties: {bootstrap_servers: '${var:nope}'}}\n",
+                         base=False)
+        self.assertIn("PD004", codes(r))
+
+    def test_literal_secret_rejected(self):
+        r = compile_text("""
+            pipeline: x
+            connections:
+              db: {type: postgres-cdc, properties: {hostname: h, database: d, username: u, password: hunter2}}
+            sources:
+              t: {connection: db, table: public.t, columns: {id: INT}, primary_key: [id]}
+            sinks:
+              o: {from: t, connection: print, mode: upsert, primary_key: [id]}
+            """, base=False)
+        self.assertIn("PD201", codes(r))
+
+    def test_bad_type(self):
+        r = compile_text("""
+            pipeline: x
+            sources:
+              t: {connection: datagen, columns: {id: INTEGERR}}
+            sinks:
+              o: {from: t, connection: print}
+            """, base=False)
+        self.assertIn("PD010", codes(r))
+
+
+class SemanticTest(unittest.TestCase):
+    def test_clean_model(self):
+        r = one_model("SELECT customer_id AS k, SUM(amount) AS total FROM orders GROUP BY customer_id")
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        self.assertIn("`total` DECIMAL(38, 2)", r.lowered.sql)
+
+    def test_unknown_table_suggests(self):
+        r = one_model("SELECT order_id AS k FROM ordrs", sink_mode="append")
+        d = next(x for x in r.diagnostics.items if x.code == "PD302")
+        self.assertIn("orders", d.hint)
+
+    def test_sql_error_location(self):
+        r = one_model("SELECT order_id AS k\nFROM orders\nWHERE (amount > 0", sink_mode="append")
+        d = next(x for x in r.diagnostics.items if x.code == "PD300")
+        self.assertIsNotNone(d.location.line)
+
+    def test_cycle(self):
+        r = compile_text("""
+            defaults: {state_ttl: 1d}
+            models:
+              a: {sql: SELECT * FROM b}
+              b: {sql: SELECT * FROM a}
+            sinks:
+              o: {from: a, connection: print}
+            """)
+        self.assertIn("PD303", codes(r))
+
+    def test_append_sink_rejects_updates(self):
+        r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id", sink_mode="append")
+        d = next(x for x in r.diagnostics.items if x.code == "PD407")
+        self.assertIn("GROUP BY", d.message)
+
+    def test_cdc_source_is_updating(self):
+        r = one_model("SELECT customer_id AS k, tier FROM customers", sink_mode="append")
+        self.assertIn("PD407", codes(r))
+
+    def test_unbounded_state_needs_ttl(self):
+        r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id", defaults="")
+        self.assertIn("PD350", codes(r))
+        r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id", defaults="",
+                      extra="    allow_unbounded_state: true\n")
+        self.assertNotIn("PD350", codes(r))
+
+    def test_window_needs_time_attribute(self):
+        r = one_model("""
+            SELECT window_start AS k, COUNT(*) AS n
+            FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(customer_id), INTERVAL '1' MINUTE))
+            GROUP BY window_start, window_end""", sink_mode="append")
+        self.assertIn("PD330", codes(r))
+
+    def test_time_attribute_lost_after_regular_join(self):
+        r = compile_text("""
+            defaults: {state_ttl: 1d}
+            models:
+              j:
+                sql: SELECT o.order_id, o.ts FROM orders o JOIN payments p ON o.order_id = p.order_id
+              w:
+                sql: |
+                  SELECT window_start, COUNT(*) AS n
+                  FROM TABLE(TUMBLE(TABLE j, DESCRIPTOR(ts), INTERVAL '1' MINUTE))
+                  GROUP BY window_start, window_end
+            sinks:
+              o: {from: w, connection: print}
+            """)
+        self.assertIn("PD331", codes(r))
+
+    def test_interval_join_keeps_time_and_is_append(self):
+        r = compile_text("""
+            models:
+              j:
+                sql: |
+                  SELECT o.order_id, o.ts, p.paid
+                  FROM orders o JOIN payments p ON o.order_id = p.order_id
+                   AND p.pay_ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR
+            sinks:
+              o: {from: j, connection: print}
+            """)
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        self.assertEqual(r.lowered.manifest["nodes"]["j"]["time_attributes"], ["ts"])
+
+    def test_temporal_join_requires_pk(self):
+        r = compile_text("""
+            models:
+              j:
+                sql: |
+                  SELECT o.order_id, p.paid FROM orders o
+                  JOIN payments FOR SYSTEM_TIME AS OF o.ts AS p ON o.order_id = p.order_id
+            sinks:
+              o: {from: j, connection: print}
+            """)
+        self.assertIn("PD340", codes(r))
+
+    def test_contract_mismatch(self):
+        r = one_model("SELECT order_id AS k, amount FROM orders", sink_mode="append",
+                      extra="    columns: {k: STRING, amt: 'DECIMAL(10, 2)'}\n")
+        self.assertIn("PD310", codes(r))
+
+    def test_contract_casts_unknown_types(self):
+        r = one_model("SELECT order_id AS k, amount * 2 AS doubled FROM orders", sink_mode="append",
+                      extra="    columns: {k: STRING NOT NULL, doubled: 'DECIMAL(12, 2)'}\n")
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        self.assertIn("CAST(`doubled` AS DECIMAL(12, 2)) AS `doubled`", r.lowered.sql)
+
+    def test_uninferable_type_needs_contract(self):
+        r = one_model("SELECT order_id AS k, amount * 2 AS doubled FROM orders", sink_mode="append")
+        d = next(x for x in r.diagnostics.items if x.code == "PD408")
+        self.assertIn("doubled", d.message)
+
+    def test_expectation_unknown_column(self):
+        r = one_model("SELECT order_id AS k, amount FROM orders", sink_mode="append",
+                      extra="    expectations:\n      - {name: pos, check: amout > 0, on_violation: drop}\n")
+        d = next(x for x in r.diagnostics.items if x.code == "PD320")
+        self.assertIn("amount", d.hint)
+
+    def test_quarantine_needs_destination(self):
+        r = one_model("SELECT order_id AS k, amount FROM orders", sink_mode="append",
+                      extra="    expectations:\n      - {name: pos, check: amount > 0, on_violation: quarantine}\n")
+        self.assertIn("PD322", codes(r))
+
+    def test_group_key_proves_upsert_key(self):
+        r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id")
+        self.assertNotIn("PD410", codes(r))
+        self.assertEqual(r.checked.pipeline.relations["m"].upsert_key, ["k"])
+        r = one_model("SELECT customer_id AS k, tier FROM customers", pk="k")
+        self.assertNotIn("PD410", codes(r))  # CDC primary key passes through the rename
+        r = one_model("SELECT customer_id, tier AS k, COUNT(*) AS n FROM customers GROUP BY customer_id, tier")
+        self.assertIn("PD410", codes(r))
+
+    def test_upsert_requires_pk_in_output(self):
+        r = one_model("SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id", pk="cust")
+        self.assertIn("PD406", codes(r))
+
+    def test_unused_source_warns(self):
+        r = one_model("SELECT order_id AS k FROM orders", sink_mode="append")
+        self.assertTrue(r.ok)
+        self.assertEqual(sorted(d.node for d in r.diagnostics.items if d.code == "PD501"), ["customers", "payments"])
+
+    def test_connector_property_validation(self):
+        r = compile_text("""
+            sinks:
+              o: {from: orders, connection: bus, topik: x}
+            """)
+        self.assertIn("PD210", codes(r))  # unknown property, with suggestion
+        self.assertIn("PD209", codes(r))  # missing topic
+        self.assertTrue(any("did you mean 'topic'" in d.message for d in r.diagnostics.items))
+
+    def test_star_and_cte(self):
+        r = compile_text("""
+            models:
+              m:
+                sql: |
+                  WITH big AS (SELECT * FROM orders WHERE amount > 100)
+                  SELECT * FROM big
+            sinks:
+              o: {from: m, connection: print}
+            """)
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        rel = r.checked.pipeline.relations["m"]
+        self.assertEqual(rel.inputs, ["orders"])
+        self.assertEqual([c.name for c in rel.columns], ["order_id", "customer_id", "amount", "ts"])
+        self.assertEqual(rel.rowtime, {"ts"})
+
+    def test_subquery_dedup_inference(self):
+        r = one_model("""
+            SELECT order_id AS k, amount, rn FROM (
+              SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY ts DESC) AS rn FROM orders
+            ) t WHERE rn = 1""")
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        cols = {c.name: c.type.text for c in r.checked.pipeline.relations["m"].columns}
+        self.assertEqual(cols, {"k": "STRING NOT NULL", "amount": "DECIMAL(10, 2)", "rn": "BIGINT NOT NULL"})
+        self.assertEqual(r.checked.pipeline.relations["m"].changelog, "updating")
+
+
+if __name__ == "__main__":
+    unittest.main()

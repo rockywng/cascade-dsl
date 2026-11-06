@@ -1,0 +1,135 @@
+# Orders analytics: enrich orders with CDC customer data, compute per-minute
+# revenue by segment, and maintain customer lifetime value.
+pipeline: orders_analytics
+description: Enriched orders, per-minute revenue and customer LTV
+owner: data-eng
+
+defaults:
+  # Applied as table.exec.state.ttl. Required whenever a model keeps
+  # unbounded state (regular joins, non-windowed aggregates, dedup).
+  state_ttl: 30d
+
+flink:
+  config:
+    table.exec.mini-batch.enabled: "true"
+    table.exec.mini-batch.allow-latency: 2s
+    table.exec.mini-batch.size: "5000"
+
+# ${var:...} values come from `vars`, overridden per environment (--env).
+vars:
+  kafka_bootstrap: localhost:9092
+  warehouse: s3://dev-lake/warehouse
+environments:
+  prod:
+    vars:
+      kafka_bootstrap: ${secret:kafka/prod/bootstrap}
+      warehouse: s3://prod-lake/warehouse
+
+connections:
+  events:
+    type: kafka
+    properties:
+      bootstrap_servers: ${var:kafka_bootstrap}
+  crm_db:
+    type: postgres-cdc
+    properties:
+      hostname: crm.internal
+      port: 5432
+      database: crm
+      username: flink_cdc
+      password: ${secret:crm/password}
+  lake:
+    type: iceberg
+    properties:
+      catalog_type: rest
+      uri: https://catalog.internal
+      warehouse: ${var:warehouse}
+
+sources:
+  orders:
+    connection: events
+    topic: orders.v1
+    format: json
+    startup: earliest
+    columns:
+      order_id: STRING NOT NULL
+      customer_id: STRING
+      amount: DECIMAL(12, 2)
+      currency: STRING
+      order_ts: TIMESTAMP(3)
+    event_time:
+      column: order_ts
+      max_out_of_orderness: 5s
+
+  customers:
+    connection: crm_db
+    table: public.customers
+    columns:
+      customer_id: STRING NOT NULL
+      name: STRING
+      segment: STRING
+      updated_at: TIMESTAMP(3)
+    primary_key: [customer_id]
+    event_time:
+      column: updated_at
+      max_out_of_orderness: 1s
+
+models:
+  clean_orders:
+    description: Orders that pass basic quality checks
+    sql: |
+      SELECT order_id, customer_id, amount, UPPER(currency) AS currency, order_ts
+      FROM orders
+    columns:
+      order_id: STRING NOT NULL
+      customer_id: STRING
+      amount: DECIMAL(12, 2)
+      currency: STRING
+      order_ts: TIMESTAMP(3)
+    expectations:
+      - name: has_order_id
+        check: order_id IS NOT NULL
+        on_violation: fail
+      - name: positive_amount
+        check: amount > 0
+        on_violation: drop
+      - name: known_currency
+        check: currency IN ('USD', 'EUR', 'GBP')
+        on_violation: quarantine
+
+  orders_enriched:
+    sql_file: models/orders_enriched.sql
+
+  revenue_per_minute:
+    sql_file: models/revenue_per_minute.sql
+
+  customer_ltv:
+    description: Running lifetime value per customer (updating result)
+    sql: |
+      SELECT customer_id,
+             SUM(amount) AS lifetime_value,
+             COUNT(*) AS order_count,
+             MAX(order_ts) AS last_order_ts
+      FROM clean_orders
+      GROUP BY customer_id
+
+sinks:
+  revenue_to_lake:
+    from: revenue_per_minute
+    connection: lake
+    table: analytics.revenue_per_minute
+    mode: append
+
+  ltv_to_kafka:
+    from: customer_ltv
+    connection: events
+    topic: customer_ltv.v1
+    format: json
+    mode: upsert
+    primary_key: [customer_id]
+
+# Where `on_violation: quarantine` rows go (one topic per model).
+quarantine:
+  connection: events
+  topic: "{pipeline}.{model}.quarantine"
+  format: json

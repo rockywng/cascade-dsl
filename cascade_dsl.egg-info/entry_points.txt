@@ -1,2 +1,0 @@
-[console_scripts]
-cascade = cascade_dsl.cli:main

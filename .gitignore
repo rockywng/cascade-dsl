@@ -3,3 +3,4 @@ runtime/target/
 __pycache__/
 *.pyc
 .cascade/
+*.egg-info/

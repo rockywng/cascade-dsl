@@ -126,6 +126,21 @@ HISTORY_TYPES = {
 }
 
 
+def _closure(start: int, edges) -> set[int]:
+    seen, stack = set(), [start]
+    while stack:
+        for x in edges[stack.pop()]:
+            if x not in seen:
+                seen.add(x)
+                stack.append(x)
+    return seen
+
+
+def _table_name(node: dict) -> str:
+    ident = node.get("scanTableSource", {}).get("table", {}).get("identifier", "")
+    return ident.replace("`", "").split(".")[-1] or str(node["id"])
+
+
 def is_stateful(node: dict) -> bool:
     return "state" in node or node["type"].startswith(STATEFUL_TYPES)
 
@@ -149,8 +164,10 @@ class PinReport:
     exact: list[tuple[str, str]] = field(default_factory=list)  # (new label, old label)
     drift: list[tuple[str, str]] = field(default_factory=list)
     new_stateful: list[str] = field(default_factory=list)
-    # new operators that need pre-upgrade input to be correct: (label, why)
-    needs_history: list[tuple[str, str]] = field(default_factory=list)
+    # new operators that need pre-upgrade input but sit behind restored sources:
+    # (label, why, sinks it feeds, restored sources upstream)
+    needs_history: list[tuple] = field(default_factory=list)
+    suggest_backfill: list[str] = field(default_factory=list)  # models to mark `backfill: true`
     dropped_stateful: list[str] = field(default_factory=list)
     # replaced sink operators without declared state (most sinks keep none; a transactional
     # exactly-once writer does, and would lose its pending transactions)
@@ -210,10 +227,23 @@ def pin_uids(old: dict, new: dict, allow_drift: bool = True, tag: str | None = N
             conf[UID_KEY] = f"{tag}-<id>_<transformation>"
             if is_stateful(node):
                 report.new_stateful.append(_label(node))
-                why = history_warning(node)
-                if why and old_nodes:  # a first deployment has no "before"
-                    report.needs_history.append((_label(node), why))
         node["configuration"] = conf
+    # A new operator that needs history only misses it if one of its sources resumes from the
+    # savepoint. Behind new sources (e.g. a backfill copy) it reads from their startup position.
+    if old_nodes:  # a first deployment has no "before"
+        _, new_inputs, _ = _graph(new)
+        new_sinks = _sinks_reached(new)
+        for node in new["nodes"]:
+            i = node["id"]
+            why = history_warning(node)
+            if i in assignment or not why:
+                continue
+            ancestors = _closure(i, new_inputs)
+            restored = sorted(_table_name(new_nodes[a]) for a in ancestors
+                              if a in assignment and new_nodes[a]["type"].startswith("stream-exec-table-source-scan"))
+            if restored:
+                sinks = sorted({x.replace("`", "").split(".")[-1] for x in new_sinks[i]})
+                report.needs_history.append((_label(node), why, sinks, restored))
     for o in sorted(old_nodes):
         n = old_nodes[o]
         if o in matched_old or not is_stateful(n):
@@ -254,6 +284,9 @@ def compile_plan(path: str, flink_home: str, out: str, env: str | None = None, l
         pinned, report = pin_uids(old, new)
         with open(out, "w") as f:
             json.dump(pinned, f, indent=2)
+        p = r.checked.pipeline
+        report.suggest_backfill = sorted({p.sinks[k].from_ for _, _, sinks, _ in report.needs_history
+                                          for k in sinks if k in p.sinks})
     return r, report, plan_setup(stmts)
 
 

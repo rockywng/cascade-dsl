@@ -50,7 +50,10 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
         if st.kind == "source":
             updating = p.relations[st.name].changelog == "updating"
             if mode == "test":
-                out.append(_fixture_source(st, updating, workdir, (fixtures or {}).get(st.name), c, watermarks))
+                rows = (fixtures or {}).get(st.name)
+                if rows is None and p.sources[st.name].copy_of:  # backfill copies replay the same input
+                    rows = (fixtures or {}).get(p.sources[st.name].copy_of)
+                out.append(_fixture_source(st, updating, workdir, rows, c, watermarks))
                 continue
             out.append(st.with_options(_source_options(st, updating, mode, workdir, rows_per_second, c)))
         elif st.kind in ("sink", "quarantine"):

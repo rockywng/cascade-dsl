@@ -44,6 +44,8 @@ def _suggest(name, candidates) -> str | None:
 def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     d = diags or Diagnostics()
     c = Checked(p, d)
+    from . import backfill
+    backfill.apply(p, d)
     _check_namespace(c)
     _check_functions(c)
     _check_connections(c)
@@ -67,7 +69,7 @@ def _check_namespace(c: Checked):
                 d.error("CD101", f"name '{name}' is used by both a {seen[name]} and a {kind}", node.loc,
                         hint="sources, models and sinks share one namespace", node=name)
             seen[name] = kind
-            if "__" in name:
+            if "__" in name and getattr(node, "copy_of", None) is None:
                 d.error("CD101", f"name '{name}' must not contain '__' (reserved for generated objects)",
                         node.loc, node=name)
 

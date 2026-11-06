@@ -49,6 +49,7 @@ class Source:
     options: dict  # raw Flink WITH-option passthrough
     description: str | None = None
     loc: Location | None = None
+    copy_of: str | None = None  # generated backfill copy of this source
 
 
 @dataclass
@@ -104,7 +105,9 @@ class Model:
     allow_unbounded_state: bool = False
     description: str | None = None
     scaling: Scaling | None = None  # per-model parallelism bounds (min/max only)
+    backfill: bool = False  # read own copies of the sources from the beginning (see backfill.py)
     loc: Location | None = None
+    copy_of: str | None = None  # generated backfill copy of this model
 
 
 @dataclass

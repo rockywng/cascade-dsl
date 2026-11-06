@@ -33,6 +33,7 @@ class Scenario:
     restores: bool  # does a strict restore succeed?
     restores_with_loss: bool | None = None  # with ignore-unclaimed-state (state_loss cases)
     codes: list = field(default_factory=list)  # change codes check-upgrade must report
+    needs_history: bool = False  # must the plan report flag new operators that miss pre-upgrade input?
 
     def apply(self, root: str):
         for rel, old, new in self.edits:
@@ -60,20 +61,28 @@ SCENARIOS = [
                "    sql: SELECT currency, COUNT(*) AS n FROM clean_orders GROUP BY currency\n"
                "\nsinks:\n  currency_counts:\n    from: orders_per_currency\n    connection: print\n"
                "    mode: upsert\n    primary_key: [currency]\n"),
-    ], "warning", True, codes=["STATE_NEW", "SINK_ADDED"]),
+    ], "warning", True, codes=["STATE_NEW", "SINK_ADDED"], needs_history=True),
+    Scenario("add_backfilled_model", [
+        (YAML, "\nsinks:\n", "\n  orders_per_currency:\n    backfill: true\n"
+               "    sql: SELECT currency, COUNT(*) AS n FROM clean_orders GROUP BY currency\n"
+               "\nsinks:\n  currency_counts:\n    from: orders_per_currency\n    connection: print\n"
+               "    mode: upsert\n    primary_key: [currency]\n"),
+    ], "warning", True, codes=["STATE_NEW", "SINK_ADDED"], needs_history=False),
     Scenario("upstream_filter_change", [
         (YAML, "      FROM orders\n", "      FROM orders\n      WHERE customer_id IS NOT NULL\n"),
     ], "warning", True, codes=["SEMANTIC_DRIFT"]),
     Scenario("change_aggregation", [
         (YAML, "             MAX(order_ts) AS last_order_ts\n",
                "             MAX(order_ts) AS last_order_ts,\n             MIN(order_ts) AS first_order_ts\n"),
-    ], "state_loss", False, restores_with_loss=True, codes=["STATE_INCOMPATIBLE", "SINK_SCHEMA_CHANGED"]),
+    ], "state_loss", False, restores_with_loss=True, codes=["STATE_INCOMPATIBLE", "SINK_SCHEMA_CHANGED"],
+       needs_history=True),  # the replacement aggregate restarts empty
     Scenario("change_group_key", [
         (YAML, "      GROUP BY customer_id\n", "      GROUP BY customer_id, currency\n"),
         (YAML, "      SELECT customer_id,\n             SUM(amount)",
                "      SELECT customer_id, currency,\n             SUM(amount)"),
         (YAML, "    primary_key: [customer_id]\n\n# Where", "    primary_key: [customer_id, currency]\n\n# Where"),
-    ], "breaking", False, restores_with_loss=True, codes=["STATE_INCOMPATIBLE", "SINK_SEMANTICS_CHANGED"]),
+    ], "breaking", False, restores_with_loss=True, codes=["STATE_INCOMPATIBLE", "SINK_SEMANTICS_CHANGED"],
+       needs_history=True),
     Scenario("remove_model_and_sink", [
         (YAML, "  revenue_per_minute:\n    sql_file: models/revenue_per_minute.sql\n\n", ""),
         (YAML, "  revenue_to_lake:\n    from: revenue_per_minute\n    connection: lake\n"
@@ -99,5 +108,5 @@ SCENARIOS = [
     ], "ok", True),
     Scenario("disable_minibatch", [
         (YAML, '    table.exec.mini-batch.enabled: "true"\n', '    table.exec.mini-batch.enabled: "false"\n'),
-    ], "state_loss", False, restores_with_loss=True, codes=["PLANNER_CONFIG_CHANGED"]),
+    ], "state_loss", False, restores_with_loss=True, codes=["PLANNER_CONFIG_CHANGED"], needs_history=True),
 ]

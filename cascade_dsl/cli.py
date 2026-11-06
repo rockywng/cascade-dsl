@@ -177,8 +177,11 @@ def _print_pin_report(report) -> None:
     if report.needs_history:
         print("  WARNING: new operators that need data from before the upgrade (results will be incomplete "
               "until they have seen it; backfill or replay their inputs):")
-        for label, why in report.needs_history:
-            print(f"    {label}: {why}")
+        for label, why, sinks, restored in report.needs_history:
+            print(f"    {label} (reads restored {', '.join(restored)}; feeds {', '.join(sinks) or '?'}): {why}")
+        if report.suggest_backfill:
+            print("  fix: build the new state from history with `backfill: true` on "
+                  + ", ".join(f"model '{m}'" for m in report.suggest_backfill))
 
 
 def cmd_plan(args) -> int:

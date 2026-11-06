@@ -27,7 +27,8 @@ TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "en
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict"}
-MODEL_KEYS = {"sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling"}
+MODEL_KEYS = {"sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling",
+              "backfill"}
 DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
                "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
                "jars", "pod_template"}
@@ -492,6 +493,7 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
         columns=_load_columns(m["columns"], ctx, m, "columns", what) if "columns" in m else None,
         expectations=expectations,
         allow_unbounded_state=bool(m.get("allow_unbounded_state", False)),
+        backfill=bool(m.get("backfill", False)),
         description=m.get("description"),
         scaling=_load_scaling(ctx.require_mapping(m["scaling"], f"{what}.scaling", m, "scaling"), ctx,
                               {"min", "max"}, f"{what}.scaling") if m.get("scaling") is not None else None,

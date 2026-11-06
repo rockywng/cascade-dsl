@@ -87,7 +87,17 @@ class StatefulDetectionTest(unittest.TestCase):
         _, report = pin_uids(OLD, new, tag="v2")
         self.assertIn("stream-exec-temporal-join_1#5 #5", report.new_stateful)
         self.assertEqual([x[0] for x in report.needs_history], ["stream-exec-temporal-join_1#5 #5"])
+        self.assertEqual(report.needs_history[0][3], ["orders"])  # behind the restored source
         self.assertIn("lookups miss", report.needs_history[0][1])
+
+    def test_new_join_behind_new_sources_reads_from_the_start(self):
+        # a backfill copy: the new operator's only source is new too, so nothing is missing
+        src2 = node(10, "stream-exec-table-source-scan_2", scanTableSource={"table": {"identifier": "orders__bf_m"}})
+        tj = node(11, "stream-exec-temporal-join_1")
+        new = plan([SRC, CALC, AGG, SINK, src2, tj], [(1, 2), (2, 3), (3, 4), (10, 11)])
+        _, report = pin_uids(OLD, new, tag="v2")
+        self.assertIn("stream-exec-temporal-join_1#11 #11", report.new_stateful)
+        self.assertEqual(report.needs_history, [])
 
     def test_first_deployment_needs_no_history(self):
         _, report = pin_uids({"nodes": [], "edges": []}, OLD, tag="v1")

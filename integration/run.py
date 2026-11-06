@@ -43,6 +43,7 @@ class Failed(Exception):
 
 
 LAST_REPORT = {"text": ""}  # output of the last `cascade plan`
+TOPICS = ("orders", "revenue", "customer_ltv", "orders_per_segment", "orders_per_customer", "orders_per_segment_bf")
 
 
 # --- shell helpers ------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def start():
     os.chmod(data, 0o777)  # the Flink containers run as uid 9999
     os.makedirs(os.path.join(WORK, "jobs"), exist_ok=True)
     compose("up", "-d", "--wait", "kafka", "postgres", timeout=600)
-    for topic in ("orders", "revenue", "customer_ltv", "orders_per_segment"):
+    for topic in TOPICS:
         kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--create", "--if-not-exists",
               "--topic", topic, "--partitions", "1", "--replication-factor", "1")
     compose("up", "-d", "jobmanager", "taskmanager")
@@ -230,7 +231,7 @@ def package(version: str, project: str, previous: str | None = None) -> str:
     ok(f"{version}: plan.json + setup.sql from the generated ConfigMap (secret stays a placeholder)")
     if previous:
         for line in report.splitlines():
-            if "UID" in line or "operator" in line.lower() or "stateful" in line.lower():
+            if any(w in line for w in ("UID", "operator", "stateful", "reads restored", "fix:", "dropped")):
                 print("      " + line.strip())
     return fd["spec"]["job"]["args"]
 
@@ -350,7 +351,7 @@ def check_upgrade_report():
     """v2's new model makes the planner build a second TemporalJoin, which starts empty while the CDC
     source resumes from its saved position: `cascade plan` must say so."""
     text = LAST_REPORT["text"]
-    if "TemporalJoin" not in text or "lookups miss" not in text:
+    if "TemporalJoin" not in text or "lookups miss" not in text or "backfill: true` on model 'orders_per_segment'" not in text:
         raise Failed("cascade plan did not warn about the new, empty TemporalJoin:\n" + text)
     ok("cascade plan warned: the new TemporalJoin starts empty and will miss unchanged customers")
 
@@ -390,6 +391,90 @@ def phase_upgrade(job_id: str):
     check_after_upgrade()
 
 
+def write_v3() -> str:
+    """v3 combines upgrade kinds: two backfilled models, a rescale (1 -> 2) and a longer state TTL."""
+    src = os.path.join(WORK, "pipeline-v2", "pipeline.yaml")
+    dst_dir = os.path.join(WORK, "pipeline-v3")
+    shutil.rmtree(dst_dir, ignore_errors=True)
+    os.makedirs(dst_dir)
+    with open(src) as f:
+        text = f.read()
+    text = text.replace("defaults: {state_ttl: 1d}", "defaults: {state_ttl: 2d}")
+    text = text.replace("scaling: {max_parallelism: 120, parallelism: 1}",
+                        "scaling: {max_parallelism: 120, parallelism: 2}")
+    text = text.replace("\nsinks:\n", """
+  orders_per_customer:
+    backfill: true
+    sql: SELECT customer_id, COUNT(*) AS orders FROM clean_orders GROUP BY customer_id
+
+  orders_per_segment_bf:
+    backfill: true
+    sql: |
+      SELECT segment, COUNT(*) AS orders FROM orders_enriched GROUP BY segment
+
+sinks:
+  customer_counts:
+    from: orders_per_customer
+    connection: bus
+    topic: orders_per_customer
+    mode: upsert
+    primary_key: [customer_id]
+  segment_counts_bf:
+    from: orders_per_segment_bf
+    connection: bus
+    topic: orders_per_segment_bf
+    mode: upsert
+    primary_key: [segment]
+""")
+    with open(os.path.join(dst_dir, "pipeline.yaml"), "w") as f:
+        f.write(text)
+    return os.path.relpath(dst_dir, REPO)
+
+
+def check_v3_report():
+    text = LAST_REPORT["text"]
+    v3 = run([sys.executable, "-m", "cascade_dsl", "validate", os.path.relpath(os.path.join(WORK, "pipeline-v3"), REPO)],
+             check=False, env={"PYTHONPATH": REPO})  # diagnostics go to stderr
+    if "CD372" not in v3:
+        raise Failed("expected the CD372 warning about backfilling a CDC temporal join:\n" + v3)
+    ok("cascade validate warns (CD372) that the backfilled CDC temporal join can race the snapshot")
+    if "WARNING: new operators" in text:
+        raise Failed("backfilled models should not need pre-upgrade input:\n" + text)
+    if "state dropped" in text:
+        raise Failed("v3 should keep every operator's state:\n" + text)
+    ok("cascade plan: every v2 operator keeps its UID; the backfilled models need no pre-upgrade input")
+
+
+def check_after_v3():
+    produce("orders", [order("o8", "c3", 50.00, "10:06:00")])
+    expect("LTV continues across the rescale to parallelism 2", ltv_table,
+           {"c1": (115.0, 3), "c2": (23.0, 3), "c3": (50.0, 1)}, timeout=180)
+    # Kafka-only backfill is exact: every order since the beginning (o3 fails the expectation)
+    per_customer = lambda: {k["customer_id"]: v["orders"] for k, v in consume("orders_per_customer", keys=True) if v}  # noqa
+    expect("backfilled model counts every historical order", per_customer, {"c1": 3, "c2": 3, "c3": 1})
+    # The backfilled temporal join replays history through a CDC snapshot. With the pipeline's idle
+    # timeout, orders can be joined before the snapshot arrives (CD372), so the segment split depends
+    # on timing (observed: compose 2 unknown / 4 enterprise, kind 5 / 1). Every order is counted
+    # exactly once either way; o8 waits for the watermark.
+    def total():  # final value per key (the upsert topic carries every update)
+        final = {k["segment"]: (v["orders"] if v else 0) for k, v in consume("orders_per_segment_bf", keys=True)}
+        return sum(final.values())
+    expect("backfilled temporal join counts every historical order once", total, 6)
+
+
+def phase_v3(job_id: str):
+    step("v3: two backfilled models, rescale 1 -> 2, state TTL 1d -> 2d")
+    v3 = write_v3()
+    args = package("v3", v3, previous="v2")
+    check_v3_report()
+    out = flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", job_id)
+    m = re.search(r"Savepoint completed\. Path: (\S+)", out)
+    if not m:
+        raise Failed("stop-with-savepoint failed:\n" + out[-2000:])
+    submit("v3", args, savepoint=m.group(1))
+    check_after_v3()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="leave the stack running")
@@ -401,6 +486,7 @@ def main():
         start()
         phase_v1()
         phase_upgrade(running_jobs()[0])
+        phase_v3(running_jobs()[0])
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0
     except Failed as e:

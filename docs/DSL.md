@@ -281,7 +281,52 @@ its normalized SQL and its input schemas. Comments, whitespace and keyword case 
 | `ok` | savepoint restores fully | 0 |
 | `warning` | restores; e.g. upstream logic changed under a stateful model (`SEMANTIC_DRIFT`), new stateful nodes, added sink columns | 0 |
 | `state_loss` | some operator state is discarded (`STATE_INCOMPATIBLE`, `STATE_DROPPED`); needs `--allow-state-loss` | 3 |
-| `breaking` | sink contract broken (removed/retyped columns, changed key or mode) | 1 |
+| `breaking` | sink contract broken (removed/retyped columns, changed key or mode), or max parallelism changed | 1 |
+
+State identities don't depend on names, so renaming a model or one of its inputs is reported as
+`RENAMED` and keeps its state. Changing the TTL duration keeps state. Turning TTL on or off is
+`STATE_TTL_TOGGLED`. Changing options that re-plan stateful operators is `PLANNER_CONFIG_CHANGED`:
+mini-batch, aggregation phase strategy, distinct-aggregate split, upsert materialization, and so on.
+
+[`tests/test_upgrade_matrix.py`](../tests/test_upgrade_matrix.py) runs 15 kinds of upgrade through
+`check-upgrade`, the plan pin report, and real strict and lossy savepoint restores. It requires
+all of them to agree.
+
+### Adding a stateful model to a running pipeline: `backfill`
+
+A new stateful model starts empty, but its sources resume from the savepoint. So it only sees
+input that arrives after the upgrade. Its counts start at zero, and a join has no rows to match.
+The planner can also give the new model its own copy of an *existing* operator, such as a temporal
+join, which starts empty too. `cascade plan --previous` names every such operator, the restored
+sources it reads, and the model to fix.
+
+```yaml
+models:
+  orders_per_customer:
+    backfill: true
+    sql: SELECT customer_id, COUNT(*) AS orders FROM clean_orders GROUP BY customer_id
+```
+
+With `backfill: true`, the model and everything upstream of it are compiled over dedicated copies
+of their sources (`<source>__bf_<model>`), read from the beginning:
+- **Kafka** from the earliest offset, with its own consumer group.
+- **CDC** with a fresh snapshot and its own replication slot.
+- **JDBC and datagen** sources aren't copied. They're lookup tables or generators, with nothing to
+  replay.
+
+Upstream models are recomputed with their expectations; quarantine becomes drop, so rows aren't
+quarantined twice. The rest of the job keeps its state, and the new branch catches up from history
+to live (CD370 lists what is copied).
+
+- **Keep the flag.** The copies stay part of the job. Removing `backfill` later is a
+  state-incompatible change.
+- **History is limited** to what the sources still hold, such as Kafka retention.
+- **A CDC snapshot holds only each row's current version.** So a backfilled *event-time* temporal
+  join finds no version for events older than a row's last change.
+- **Idle timeouts make temporal-join backfills timing-dependent (CD372).** With
+  `table.exec.source.idle-timeout` set, the replayed fact history (available at once) can be joined
+  before the CDC snapshot arrives, and then finds no version. The integration runs saw different
+  splits under compose and kind. Rows arriving after the snapshot are joined correctly.
 
 ## Python API
 

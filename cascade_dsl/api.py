@@ -215,7 +215,7 @@ class Pipeline:
 
     def model(self, fn=None, *, name: str | None = None, columns: dict | None = None,
               expectations: list | None = None, allow_unbounded_state: bool = False,
-              description: str | None = None, scaling: dict | None = None):
+              description: str | None = None, scaling: dict | None = None, backfill: bool = False):
         """Decorator. The function's parameters name its inputs (sources or models); it returns SQL
         (use the parameters in an f-string) or a builder query."""
         line = _caller_line()
@@ -236,11 +236,12 @@ class Pipeline:
     def sql_model(self, name: str, sql: str | None = None, *, sql_file: str | None = None,
                   columns: dict | None = None, expectations: list | None = None,
                   allow_unbounded_state: bool = False, description: str | None = None,
-                  scaling: dict | None = None) -> Relation:
+                  scaling: dict | None = None, backfill: bool = False) -> Relation:
         """A model given as SQL text (or a .sql file) referencing tables by name."""
         self._models[name] = _ModelDef(name, None, sql, sql_file, [], {
             "columns": columns, "expectations": expectations, "description": description,
-            "allow_unbounded_state": allow_unbounded_state or None, "scaling": scaling}, _caller_line())
+            "allow_unbounded_state": allow_unbounded_state or None, "scaling": scaling,
+            "backfill": backfill or None}, _caller_line())
         return Relation(self, name)
 
     def sink(self, name: str, from_, connection, *, mode: str = "append", primary_key=None,

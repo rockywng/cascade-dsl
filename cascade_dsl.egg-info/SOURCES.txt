@@ -4,6 +4,7 @@ cascade_dsl/__init__.py
 cascade_dsl/__main__.py
 cascade_dsl/analyze.py
 cascade_dsl/api.py
+cascade_dsl/backfill.py
 cascade_dsl/builder.py
 cascade_dsl/cli.py
 cascade_dsl/compiler.py
@@ -32,6 +33,7 @@ cascade_dsl.egg-info/dependency_links.txt
 cascade_dsl.egg-info/entry_points.txt
 cascade_dsl.egg-info/requires.txt
 cascade_dsl.egg-info/top_level.txt
+tests/test_backfill.py
 tests/test_compiler.py
 tests/test_deploy.py
 tests/test_flink_tools.py
@@ -41,3 +43,4 @@ tests/test_scaling.py
 tests/test_tooling_units.py
 tests/test_udfs.py
 tests/test_upgrade.py
+tests/test_upgrade_matrix.py

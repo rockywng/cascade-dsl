@@ -180,9 +180,15 @@ and tests can target them as `<model>.quarantined`.
 
 [integration/](integration/) runs a pipeline against real Kafka, Postgres CDC and JDBC on Flink
 2.3.0. It runs once as a docker-compose session cluster and once through the Flink Kubernetes
-Operator on kind, using exactly what `cascade plan` and `cascade deploy` produce. Each run upgrades
-v1 to v2 through a savepoint and checks keyed state, Kafka offsets and the CDC position from
-outside the job. It has already found five bugs, listed in its README.
+Operator on kind, using exactly what `cascade plan` and `cascade deploy` produce. Each run
+upgrades v1 → v2 → v3 through savepoints, including a rescale, a TTL change and backfilled
+models. It checks keyed state, Kafka offsets and the CDC position from outside the job. Its README
+lists the bugs it found.
+
+**Adding stateful models to a running job.** A new stateful model starts empty while its sources
+resume from the savepoint, so it would only ever see new data. `cascade plan` flags this, and
+`backfill: true` fixes it by giving the model its own copies of its sources, read from the
+beginning.
 
 ## Tests of the compiler itself
 
@@ -190,12 +196,15 @@ outside the job. It has already found five bugs, listed in its README.
 PYTHONPATH=.:tests python3 -m unittest discover -s tests
 ```
 
-There are 106 tests. 89 are pure Python and run in about a second. With `FLINK_HOME` set and the
-jars built, 17 more run against real Flink:
+There are 118 tests. 100 are pure Python and run in about a second. With `FLINK_HOME` set and the
+jars built, 18 more run against real Flink:
 - changelog inference for 13 SQL patterns, checked against the planner
 - the example test suites
 - `infer`
 - plan pinning, and the restore test with and without pinning
+- the upgrade matrix: 15 kinds of upgrade, where `check-upgrade`, the plan report and real
+  savepoint restores must agree
+- `backfill: true` models on fixture data
 - operator mapping
 - lookup joins, sink targets and `ON CONFLICT`
 - the deployment runner

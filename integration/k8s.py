@@ -59,7 +59,7 @@ def cluster():
                                                        "kafka:9092", "--create", "--if-not-exists", "--topic",
                                                        "orders") + it.kafka(
         "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--list"), timeout=120, every=3)
-    for topic in ("revenue", "customer_ltv", "orders_per_segment"):
+    for topic in it.TOPICS[1:]:
         it.kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--create", "--if-not-exists",
                  "--topic", topic, "--partitions", "1", "--replication-factor", "1")
     it.wait_for("Postgres seed", lambda: it.psql("SELECT count(*) FROM customers") == [["2"]], timeout=120)
@@ -152,6 +152,19 @@ def phase_upgrade(v1_job: str):
     it.check_after_upgrade()
 
 
+def phase_v3(v2_job: str):
+    step("v3: two backfilled models, rescale 1 -> 2, state TTL 1d -> 2d, through the operator")
+    v3 = it.write_v3()
+    apply_version("v3", v3, previous="v2")
+    it.check_v3_report()
+    job = wait_running(previous_job=v2_job, timeout=600)
+    par = deployment()["spec"]["job"]["parallelism"]
+    if par != 2:
+        raise Failed(f"FlinkDeployment parallelism is {par}, expected 2")
+    ok(f"operator upgraded to v3 at parallelism 2: job {job[:8]} RUNNING")
+    it.check_after_v3()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="leave the kind cluster running")
@@ -170,6 +183,7 @@ def main():
         cluster()
         v1 = phase_v1()
         phase_upgrade(v1)
+        phase_v3(job_state()[1])
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0
     except (Failed, RuntimeError) as e:

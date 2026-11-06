@@ -57,6 +57,10 @@ class RestoreMatrixTest(unittest.TestCase):
                     self.assertEqual(report.restorable, sc.restores,
                                      f"pin report predicted restorable={report.restorable}: "
                                      f"dropped {report.dropped_stateful}")
+                self.assertEqual(bool(report.needs_history), sc.needs_history,
+                                 f"needs_history: {report.needs_history}")
+                for _, _, sinks, _ in report.needs_history:  # sinks resolve to pipeline sinks
+                    self.assertTrue(sinks and all("." not in x and "`" not in x for x in sinks), sinks)
                 if not sc.restores and sc.restores_with_loss is not None:
                     lossy = restore_test(v1, v2, FLINK, seconds=4, allow_state_loss=True)
                     self.assertEqual(bool(lossy.get("restored")), sc.restores_with_loss,

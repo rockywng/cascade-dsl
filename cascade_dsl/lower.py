@@ -283,6 +283,7 @@ def _manifest(c: Checked, sql: str) -> dict:
         input_schemas = [h(_cols(p.relations[i].columns)) for i in rel.inputs]
         node = {
             "kind": "source" if is_source else "model",
+            "backfill_copy_of": (p.sources.get(n) or p.models.get(n)).copy_of,
             "inputs": rel.inputs,
             "changelog": rel.changelog,
             "columns": _cols(rel.columns),

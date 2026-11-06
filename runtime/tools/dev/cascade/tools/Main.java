@@ -113,6 +113,11 @@ public final class Main {
         conf.setString("restart-strategy.type", "none");
         conf.setString("rest.port", "0");
         conf.setString("table.local-time-zone", "UTC");
+        String python = System.getenv("CASCADE_PYTHON");
+        if (python != null && !python.isEmpty()) {
+            conf.setString("python.executable", python);
+            conf.setString("python.client.executable", python);
+        }
         if (extra != null) {
             conf.addAll(extra);
         }

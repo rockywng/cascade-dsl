@@ -43,4 +43,7 @@ def compile_pipeline(path: str, env: str | None = None, emit: bool = True, use_l
     checked = check(pipeline, diags)
     if diags.has_errors or not emit:
         return Result(diags, checked)
-    return Result(diags, checked, lower(checked))
+    lowered = lower(checked)
+    from .udfs import write_python_dir
+    write_python_dir(checked.pipeline)
+    return Result(diags, checked, lowered)

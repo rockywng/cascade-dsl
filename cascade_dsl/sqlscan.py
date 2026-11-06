@@ -404,6 +404,7 @@ class Scope:
     by_alias: dict[str, RelationInfo]
     rowtime_aliases: set[str]  # aliases whose time attributes survive the query's joins
     window_rel: RelationInfo | None = None
+    functions: dict = field(default_factory=dict)  # user function name (upper) -> return SqlType
 
     def lookup(self, qualifier: str | None, col: str) -> tuple[OutputColumn | None, bool, bool]:
         """Return (column, is_rowtime, ambiguous)."""
@@ -515,6 +516,8 @@ def _infer_expr(expr: list[Tok], scope: Scope) -> tuple[SqlType | None, bool, st
                 if t is not None:
                     return t, False, None
             return None, False, None
+        if fn in scope.functions:
+            return scope.functions[fn], False, None
         if fn in ("CURRENT_TIMESTAMP", "NOW", "LOCALTIMESTAMP"):
             return parse_type("TIMESTAMP_LTZ(3)"), False, None
         if fn in ("TO_TIMESTAMP",):
@@ -568,15 +571,17 @@ def _within(pos: int, spans) -> bool:
     return any(s <= pos < e for _, s, e in spans)
 
 
-def infer_relation(sql: str, rels: dict[str, RelationInfo]) -> tuple[list[OutputColumn] | None, set[str]]:
-    """Infer (output columns, time attributes) of a query, recursing into CTEs and FROM subqueries."""
+def infer_relation(sql: str, rels: dict[str, RelationInfo],
+                   functions: dict | None = None) -> tuple[list[OutputColumn] | None, set[str]]:
+    """Infer (output columns, time attributes) of a query, recursing into CTEs and FROM subqueries.
+    `functions` maps user function names (upper case) to their return types."""
     try:
         _toks, a = analyze_sql(sql)
     except SqlSyntaxError:
         return None, set()
     local = dict(rels)
     for name, s, e in a.ctes:
-        cols, rt = infer_relation(sql[s:e], local)
+        cols, rt = infer_relation(sql[s:e], local, functions)
         local[name] = RelationInfo(columns=cols, rowtime=rt)
     spans = a.ctes + a.subqueries
     outer_refs = [r for r in a.scope_refs if not _within(r.pos, spans)]
@@ -585,7 +590,7 @@ def infer_relation(sql: str, rels: dict[str, RelationInfo]) -> tuple[list[Output
         if r.name in local and not r.in_window_tvf:
             by_alias[r.alias or r.name] = local[r.name]
     for alias, s, e in a.subqueries:
-        cols, rt = infer_relation(sql[s:e], local)
+        cols, rt = infer_relation(sql[s:e], local, functions)
         by_alias[alias] = RelationInfo(columns=cols, rowtime=rt)
     kinds = {op.kind for op in a.ops}
     if "regular_join" in kinds:
@@ -600,4 +605,4 @@ def infer_relation(sql: str, rels: dict[str, RelationInfo]) -> tuple[list[Output
             window_rel = window_relation(local[table])
             by_alias.setdefault(table, local[table])
     grouped = bool(kinds & {"group_agg", "global_agg", "window_agg"})
-    return infer_output(a.select_items, Scope(by_alias, rt_aliases, window_rel), grouped)
+    return infer_output(a.select_items, Scope(by_alias, rt_aliases, window_rel, dict(functions or {})), grouped)

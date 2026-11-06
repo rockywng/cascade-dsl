@@ -97,6 +97,23 @@ class Connection:
 
 
 @dataclass
+class SqlFunction:
+    """A registered UDF. Formats as its name in f-strings; calling it renders a call expression:
+    churn_score("amount", "country") -> "churn_score(amount, country)"."""
+
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __format__(self, spec) -> str:
+        return self.name
+
+    def __call__(self, *args) -> str:
+        return f"{self.name}({', '.join(str(a) for a in args)})"
+
+
+@dataclass
 class Relation:
     """A source or model. Formats as its table name inside SQL f-strings; also starts builder chains."""
 
@@ -149,6 +166,7 @@ class Pipeline:
         self._models: dict[str, _ModelDef] = {}
         self._sinks: dict[str, tuple[dict, int]] = {}
         self._quarantine: tuple[dict, int] | None = None
+        self._functions: dict[str, tuple[dict, int]] = {}
 
     # -- declarations -------------------------------------------------------------------
     def var(self, name: str) -> str:
@@ -157,6 +175,31 @@ class Pipeline:
     def connection(self, name: str, spec: ConnectorSpec) -> Connection:
         self._connections[name] = (spec, _caller_line())
         return Connection(name)
+
+    def java_function(self, name: str, class_name: str, *, jar: str | None = None, returns: str | None = None,
+                      deterministic: bool = True, description: str | None = None) -> SqlFunction:
+        """A Java ScalarFunction; `jar` is relative to the project (or omit it if the class is on the
+        runtime image's classpath). `returns` lets the compiler type the column statically."""
+        self._functions[name] = ({"language": "java", "class": class_name, "jar": jar, "returns": returns,
+                                  "deterministic": deterministic if not deterministic else None,
+                                  "description": description}, _caller_line())
+        return SqlFunction(name)
+
+    def python_function(self, fn, *, returns: str, name: str | None = None, deterministic: bool = True,
+                        description: str | None = None) -> SqlFunction:
+        """A plain Python function from a module of the project (not pipeline.py itself), run by PyFlink
+        workers. Pass the function object, or "module_file.py:function"."""
+        if callable(fn):
+            file = inspect.getsourcefile(fn)
+            func = fn.__name__
+            description = description or (inspect.getdoc(fn) or None)
+        else:
+            file, _, func = str(fn).partition(":")
+        fname = name or func
+        self._functions[fname] = ({"language": "python", "file": file, "function": func, "returns": returns,
+                                   "deterministic": deterministic if not deterministic else None,
+                                   "description": description}, _caller_line())
+        return SqlFunction(fname)
 
     def source(self, name: str, connection, *, columns: dict, format: str | None = None,
                event_time=None, primary_key=None, processing_time: str | None = None,
@@ -229,6 +272,15 @@ class Pipeline:
         if self.environments:
             doc["environments"] = _ld({k: _ld({"vars": _ld(v.get("vars", v), self._line)}, self._line)
                                        for k, v in self.environments.items()}, self._line)
+        if self._functions:
+            base = os.path.dirname(os.path.abspath(file)) if file != "<python>" else os.getcwd()
+            fdefs = {}
+            for n, (spec, line) in self._functions.items():
+                spec = dict(spec)
+                if spec.get("file") and os.path.isabs(spec["file"]):
+                    spec["file"] = os.path.relpath(spec["file"], base)
+                fdefs[n] = _ld(spec, line)
+            doc["functions"] = _ld(fdefs, self._line)
         doc["connections"] = _ld({n: _ld({"type": spec.type, "properties": _ld(spec.properties, line)}, line)
                                   for n, (spec, line) in self._connections.items()}, self._line)
         doc["sources"] = _ld({n: _nested(spec, line) for n, (spec, line) in self._sources.items()}, self._line)
@@ -278,7 +330,10 @@ class Pipeline:
         c = check(p, diags)
         if diags.has_errors or not emit:
             return Result(diags, c)
-        return Result(diags, c, lower(c))
+        from .udfs import write_python_dir
+        lowered = lower(c)
+        write_python_dir(p)
+        return Result(diags, c, lowered)
 
     def validate(self, env: str | None = None) -> list[str]:
         return [d.format() for d in self.compile(env, emit=False).diagnostics.items]

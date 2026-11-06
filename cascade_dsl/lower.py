@@ -127,6 +127,8 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
         stmts.append(Stmt("function", EXPECT_FN, f"CREATE TEMPORARY SYSTEM FUNCTION IF NOT EXISTS {EXPECT_FN} "
                                                  f"AS {lit(EXPECT_CLASS)} LANGUAGE JAVA;"))
 
+    _lower_functions(p, stmts)
+
     for s in p.sources.values():
         extra = []
         if s.processing_time:
@@ -160,6 +162,29 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
     if not partial:
         lowered.manifest = _manifest(c, lowered.sql)
     return lowered
+
+
+def _lower_functions(p: Pipeline, stmts: list[Stmt]):
+    import os
+    from .udfs import SHIM_MODULE, python_dir, python_functions
+    if python_functions(p):
+        d = python_dir(p)
+        stmts.append(Stmt("set", "python.files", f"SET 'python.files' = {lit(d)};", options={"python.files": d}))
+    for f in p.functions.values():
+        head = f"CREATE TEMPORARY SYSTEM FUNCTION IF NOT EXISTS {q(f.name)} AS "
+        if f.language == "java":
+            using = ""
+            opts = {}
+            if f.jar:
+                jar = os.path.normpath(os.path.join(p.root_dir, f.jar))
+                using = f" USING JAR {lit(jar)}"
+                opts = {"jar": jar}
+            stmts.append(Stmt("function", f.name, f"{head}{lit(f.class_name)} LANGUAGE JAVA{using};",
+                              comment=f"function: {f.name}" + (f" -- {f.description}" if f.description else ""),
+                              options=opts))
+        else:
+            stmts.append(Stmt("function", f.name, f"{head}{lit(SHIM_MODULE + '.' + f.name)} LANGUAGE PYTHON;",
+                              comment=f"function: {f.name} ({f.file}:{f.function})", options={"python": True}))
 
 
 def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
@@ -318,6 +343,9 @@ def _manifest(c: Checked, sql: str) -> dict:
                                           if SECRET_RE.match(v) or "${secret:" in v}),
         "artifacts": sorted(artifacts),
         "runtime_functions": runtime_fns,
+        "functions": {f.name: {"language": f.language, "class": f.class_name, "jar": f.jar, "file": f.file,
+                               "function": f.function, "returns": f.returns.text if f.returns else None,
+                               "deterministic": f.deterministic} for f in p.functions.values()},
     }
 
 

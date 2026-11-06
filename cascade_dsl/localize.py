@@ -41,7 +41,12 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
     """`capture` = (sink name, file): in test mode keep that sink, recording what it receives."""
     p = c.pipeline
     out: list[Stmt] = []
+    py = _python_executable() if any(f.language == "python" for f in p.functions.values()) else None
     for st in lowered.statements:
+        if py and st.kind == "set" and st.name == "python.files":
+            # local runs: PyFlink workers use an interpreter that has pyflink installed
+            for key in ("python.executable", "python.client.executable"):
+                out.append(Stmt("set", key, f"SET '{key}' = '{py}';", options={key: py}))
         if st.kind == "source":
             updating = p.relations[st.name].changelog == "updating"
             if mode == "test":
@@ -61,6 +66,11 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
         else:
             out.append(st)
     return out
+
+
+def _python_executable() -> str | None:
+    from .jvm import python_executable
+    return python_executable()
 
 
 def _source_options(st: Stmt, updating: bool, mode: str, workdir: str, rps: int, c: Checked) -> dict:

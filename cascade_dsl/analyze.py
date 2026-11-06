@@ -45,6 +45,7 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     d = diags or Diagnostics()
     c = Checked(p, d)
     _check_namespace(c)
+    _check_functions(c)
     _check_connections(c)
     _check_sources(c)
     _check_models(c)
@@ -238,7 +239,8 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
                 d.error("CD330", f"model '{name}': DESCRIPTOR({col}) is not a time attribute of '{table}'",
                         _sql_loc(m, pos), node=name,
                         hint=f"time attributes of '{table}': {', '.join(sorted(base.rowtime))}")
-    columns, rowtime = infer_relation(m.sql, rels)
+    columns, rowtime = infer_relation(m.sql, rels, {f.name.upper(): f.returns for f in p.functions.values()
+                                                    if f.returns is not None})
     columns, rowtime = _apply_lock(c, name, inputs, columns, rowtime, kinds)
     c.inferred[name] = columns
 
@@ -341,6 +343,11 @@ def model_fingerprint(p: Pipeline, name: str, inputs: list[str],
         cols = input_columns.get(i)
         ins.append((i, [(col.name, col.type.with_nullable(True).text if col.type else None) for col in cols or []]))
     contract = [(col.name, col.type.text) for col in m.columns] if m.columns else None
+    sql_up = m.sql.upper()
+    fns = sorted((f.name, f.language, f.class_name, f.file, f.function, f.returns.text if f.returns else None)
+                 for f in p.functions.values() if f.name.upper() in sql_up)
+    if fns:
+        return h(normalize_sql(m.sql), contract, ins, fns)
     return h(normalize_sql(m.sql), contract, ins)
 
 
@@ -395,6 +402,44 @@ def _check_expectations(c: Checked, m, columns, changelog):
             if columns is None or any(col.type is None for col in columns):
                 d.error("CD324", f"model '{m.name}': quarantine needs every output column type to be known",
                         e.loc, hint="declare a `columns:` contract on the model", node=m.name)
+
+
+# --- functions --------------------------------------------------------------------------
+
+BUILTIN_FUNCTIONS = {"UPPER", "LOWER", "TRIM", "CONCAT", "SUBSTRING", "COALESCE", "ABS", "ROUND", "FLOOR", "CEIL",
+                     "COUNT", "SUM", "MIN", "MAX", "AVG", "CAST", "IF", "NULLIF", "REPLACE", "REGEXP_REPLACE",
+                     "REGEXP_EXTRACT", "DATE_FORMAT", "TO_TIMESTAMP", "NOW", "MD5", "SHA256", "SPLIT_INDEX",
+                     "JSON_VALUE", "JSON_QUERY", "HASH_CODE", "LENGTH", "POSITION", "LPAD", "RPAD", "INITCAP"}
+
+
+def _check_functions(c: Checked):
+    import os
+    from .udfs import SHIM_MODULE, check_python_module
+    p, d = c.pipeline, c.diagnostics
+    modules: dict[str, str] = {}
+    for f in p.functions.values():
+        if f.name.upper() in BUILTIN_FUNCTIONS or f.name.upper() in {"CASCADE_ASSERT", "CASCADE_EXPECT"}:
+            d.warning("CD162", f"function '{f.name}' shadows the built-in function {f.name.upper()}", f.loc,
+                      hint="rename it; temporary system functions take precedence over built-ins everywhere")
+        if f.language == "java":
+            if f.jar and not os.path.exists(os.path.join(p.root_dir, f.jar)):
+                d.warning("CD164", f"function '{f.name}': jar '{f.jar}' does not exist (yet)", f.loc,
+                          hint="build it before running tests, verify or deploy")
+            continue
+        path = os.path.join(p.root_dir, f.file or "")
+        if not f.file or not f.file.endswith(".py") or not os.path.isfile(path):
+            d.error("CD160", f"function '{f.name}': Python module '{f.file}' not found in the project", f.loc,
+                    hint="`file` is a .py module relative to the project directory")
+            continue
+        problem = check_python_module(path, f.function)
+        if problem:
+            d.error("CD161", f"function '{f.name}': {f.file} {problem}", f.loc)
+        if f.module == SHIM_MODULE:
+            d.error("CD163", f"function '{f.name}': module name '{SHIM_MODULE}' is reserved", f.loc)
+        elif modules.get(f.module, f.file) != f.file:
+            d.error("CD163", f"function '{f.name}': modules {modules[f.module]} and {f.file} have the same name "
+                    f"'{f.module}'; Python workers can import only one", f.loc)
+        modules[f.module] = f.file
 
 
 # --- sinks / quarantine / pipeline -----------------------------------------------------

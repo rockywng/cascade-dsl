@@ -1,0 +1,13 @@
+tests:
+  - name: emails_are_masked_and_customers_scored
+    target: scored_customers
+    given:
+      activity:
+        - {customer_id: c1, email: jane@example.com, days_inactive: 60, orders_90d: 0, ts: "2026-01-01 10:00:00"}
+        - {customer_id: c2, email: bob@example.org, days_inactive: 2, orders_90d: 5, ts: "2026-01-01 10:00:01"}
+        - {customer_id: c3, email: null, days_inactive: null, orders_90d: 1, ts: "2026-01-01 10:00:02"}
+    expect:
+      rows:
+        - {customer_id: c1, email_masked: "j***@example.com", churn: 0.9427}
+        - {customer_id: c2, email_masked: "b***@example.org", churn: 0.0078}
+        - {customer_id: c3, email_masked: null, churn: null}

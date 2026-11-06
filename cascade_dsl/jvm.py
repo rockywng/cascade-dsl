@@ -1,6 +1,7 @@
 """Driver for runtime/target/cascade-tools.jar (local Flink in an embedded MiniCluster)."""
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -34,6 +35,15 @@ def find_flink_home(explicit: str | None = None) -> str | None:
         if cand and os.path.exists(os.path.join(cand, "bin", "sql-client.sh")):
             return cand
     return None
+
+
+def python_executable() -> str | None:
+    """Interpreter for PyFlink workers: $CASCADE_PYTHON, or this one if it has pyflink installed."""
+    if os.environ.get("CASCADE_PYTHON"):
+        return os.environ["CASCADE_PYTHON"]
+    import importlib.util
+    import sys
+    return sys.executable if importlib.util.find_spec("pyflink") else None
 
 
 def runtime_jar() -> str | None:
@@ -78,12 +88,19 @@ class Tools:
 
     def _run(self, args: list[str], timeout: int) -> None:
         java = self._java()
-        cp = os.pathsep.join([self.tools_jar, runtime_jar(), os.path.join(self.flink_home, "lib", "*")])
+        cp = [self.tools_jar, runtime_jar(), os.path.join(self.flink_home, "lib", "*")]
+        # Python UDF support lives in opt/ in the Flink distribution
+        cp += sorted(glob.glob(os.path.join(self.flink_home, "opt", "flink-python*.jar")))[:1]
+        cp = os.pathsep.join(cp)
         cmd = [java, *self._java_opts(),
                f"-Dlog4j.configurationFile={os.path.join(REPO, 'runtime', 'tools', 'log4j2.properties')}",
                "-cp", cp, "dev.cascade.tools.Main", *args]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            env = dict(os.environ)
+            py = python_executable()
+            if py:
+                env["CASCADE_PYTHON"] = py
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
             raise ToolsError(f"cascade-tools timed out after {timeout}s")
         if proc.returncode != 0:

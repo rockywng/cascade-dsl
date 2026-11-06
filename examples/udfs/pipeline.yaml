@@ -1,0 +1,54 @@
+# User-defined functions: a Java ScalarFunction from a project jar, and a plain Python function
+# (no PyFlink imports; cascade wraps it). Build the jar with udfs/build.sh first.
+pipeline: customer_scoring
+owner: data-science
+defaults: {state_ttl: 7d}
+scaling: {max_parallelism: 360, parallelism: 1, max: 12}
+
+functions:
+  mask_email:
+    language: java
+    class: com.acme.udf.MaskEmail
+    jar: udfs/acme-udfs.jar
+    returns: STRING
+    description: Keeps the first character and the domain of an email address
+  churn_risk:
+    language: python
+    file: udfs/scoring.py
+    returns: DOUBLE
+
+connections:
+  events:
+    type: kafka
+    properties:
+      bootstrap_servers: localhost:9092
+
+sources:
+  activity:
+    connection: events
+    topic: customer_activity
+    format: json
+    columns:
+      customer_id: STRING NOT NULL
+      email: STRING
+      days_inactive: INT
+      orders_90d: INT
+      ts: TIMESTAMP(3)
+    event_time: {column: ts, max_out_of_orderness: 5s}
+
+models:
+  scored_customers:
+    description: Churn risk per activity event, with the email masked before it leaves the job
+    sql: |
+      SELECT customer_id,
+             mask_email(email) AS email_masked,
+             churn_risk(days_inactive, orders_90d) AS churn,
+             ts
+      FROM activity
+
+sinks:
+  scores:
+    from: scored_customers
+    connection: events
+    topic: customer_scores
+    format: json

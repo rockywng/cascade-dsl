@@ -13,7 +13,7 @@ import re
 import yaml
 
 from .diagnostics import CompileError, Diagnostics, Location
-from .ir import (Column, Connection, EventTime, Expectation, Model, Pipeline, Quarantine,
+from .ir import (Column, Connection, EventTime, Expectation, Function, Model, Pipeline, Quarantine,
                  Scaling, Sink, Source)
 from .types import TypeParseError, parse_type
 
@@ -23,7 +23,7 @@ DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h|d)\s*$")
 UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "environments",
-            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy"}
+            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions"}
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict"}
@@ -250,6 +250,14 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         scaling = _load_scaling(subst(ctx.require_mapping(doc["scaling"], "scaling", doc, "scaling"), doc, "scaling"),
                                 ctx, SCALING_KEYS, "scaling")
 
+    functions = {}
+    for fname, fdef in ctx.require_mapping(doc.get("functions"), "functions", doc, "functions").items():
+        ctx.check_name(fname, "function", doc["functions"])
+        fdef = subst(ctx.require_mapping(fdef, f"function '{fname}'", doc["functions"], fname), doc["functions"], fname)
+        fn = _load_function(fname, fdef, ctx)
+        if fn is not None:
+            functions[fname] = fn
+
     deploy = None
     if doc.get("deploy") is not None:
         deploy = _load_deploy(subst(ctx.require_mapping(doc["deploy"], "deploy", doc, "deploy"), doc, "deploy"), ctx)
@@ -262,7 +270,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         description=doc.get("description"), owner=doc.get("owner"),
         state_ttl_ms=state_ttl_ms, flink_config=flink_config,
         connections=connections, sources=sources, models=models, sinks=sinks,
-        quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, loc=ctx.loc(doc),
+        quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, functions=functions, loc=ctx.loc(doc),
     )
     return p, diags
 
@@ -279,6 +287,39 @@ def _resolve_vars(doc, env, ctx: _Ctx) -> dict:
         ctx.check_keys(e, {"vars"}, f"environment '{env}'")
         variables.update(ctx.require_mapping(e.get("vars"), "vars", e, "vars"))
     return variables
+
+
+def _load_function(name, f, ctx: _Ctx) -> Function | None:
+    what = f"function '{name}'"
+    lang = f.get("language")
+    if lang not in ("java", "python"):
+        ctx.diags.error("CD014", f"{what}: language must be java or python", ctx.loc(f, "language") if "language" in f
+                        else ctx.loc(f))
+        return None
+    allowed = {"language", "returns", "deterministic", "description"} | (
+        {"class", "jar"} if lang == "java" else {"file", "function"})
+    ctx.check_keys(f, allowed, what)
+    returns = None
+    if f.get("returns") is not None:
+        try:
+            returns = parse_type(f["returns"])
+        except TypeParseError as e:
+            ctx.diags.error("CD010", f"{what}: bad return type: {e}", ctx.loc(f, "returns"))
+    fn = Function(name=name, language=lang, returns=returns, deterministic=bool(f.get("deterministic", True)),
+                  description=f.get("description"), loc=ctx.loc(f))
+    if lang == "java":
+        if not f.get("class"):
+            ctx.diags.error("CD005", f"{what} is missing 'class' (the fully qualified ScalarFunction class)",
+                            ctx.loc(f))
+        fn.class_name, fn.jar = f.get("class"), f.get("jar")
+    else:
+        if not f.get("file"):
+            ctx.diags.error("CD005", f"{what} is missing 'file' (a .py module in the project)", ctx.loc(f))
+        if returns is None:
+            ctx.diags.error("CD005", f"{what}: Python functions need `returns` (the Flink SQL result type)",
+                            ctx.loc(f))
+        fn.file, fn.function = f.get("file"), f.get("function") or name
+    return fn
 
 
 def _load_deploy(d, ctx: _Ctx) -> dict:

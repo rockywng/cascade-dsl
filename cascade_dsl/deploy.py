@@ -26,10 +26,14 @@ from . import __version__
 from .compiler import Result
 from .jvm import script
 from .lower import Stmt
+from .udfs import python_files, python_functions
 
 RUNNER = "dev.cascade.runner.SqlRunner"
 JOB_DIR = "/opt/cascade/job"
 RUNTIME_JAR = "/opt/flink/usrlib/cascade-runtime.jar"
+USRLIB = "/opt/flink/usrlib"
+PYTHON_DIR = "/opt/cascade/python"
+PYFLINK_PYTHON = "/opt/pyflink/bin/python"
 DEFAULT_FLINK = "2.3.0"
 SECRET_RE = re.compile(r"\$\{secret:([^}]+)\}")
 
@@ -103,7 +107,7 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     secret_name = cfg.get("secrets") or f"{name}-secrets"
 
     os.makedirs(out, exist_ok=True)
-    setup = [st for st in lowered.statements if st.kind != "insert"]
+    setup = [_in_image(st) for st in lowered.statements if st.kind != "insert"]
     files = {"setup.sql": _header(r, "setup") + script(setup)}
     if plan_dir:
         plan_path = os.path.join(plan_dir, "plan.json")
@@ -132,10 +136,17 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
 
     configmap = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(f"{name}-job"), "data": files}
     deployment = _flink_deployment(r, name, meta(name), image, args, secret_name, cfg)
+    resources = ["configmap.yaml", "flinkdeployment.yaml"]
+    if python_functions(p):
+        py_cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(f"{name}-python"),
+                 "data": python_files(p)}
+        with open(os.path.join(out, "python-configmap.yaml"), "w") as f:
+            f.write(_dump(py_cm))
+        resources.insert(1, "python-configmap.yaml")
     secret = {"apiVersion": "v1", "kind": "Secret", "metadata": meta(secret_name), "type": "Opaque",
               "stringData": {secret_key(s): "" for s in secrets}}
     kustomization = {"apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization",
-                     "resources": ["configmap.yaml", "flinkdeployment.yaml"]}
+                     "resources": resources}
 
     def write(fname, text):
         with open(os.path.join(out, fname), "w") as f:
@@ -149,6 +160,22 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     write("kustomization.yaml", _dump(kustomization))
     write("Dockerfile", dockerfile(r, cfg))
     return {"name": name, "mode": mode, "secrets": secrets, "secret_name": secret_name, "out": out}
+
+
+def _in_image(st: Stmt) -> Stmt:
+    """Rewrite local paths in setup statements to where the image / pod has the files."""
+    if st.kind == "function" and st.options.get("jar"):
+        jar = st.options["jar"]
+        target = f"{USRLIB}/{os.path.basename(jar)}"
+        return Stmt(st.kind, st.name, st.sql.replace(_sql_lit(jar), _sql_lit(target)), st.comment,
+                    options={"jar": target})
+    if st.kind == "set" and st.name == "python.files":
+        return Stmt("set", st.name, f"SET 'python.files' = '{PYTHON_DIR}';", options={st.name: PYTHON_DIR})
+    return st
+
+
+def _sql_lit(v: str) -> str:
+    return "'" + v.replace("'", "''") + "'"
 
 
 def _header(r: Result, what: str) -> str:
@@ -210,6 +237,9 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
         if sc.max_lag_ms:
             # catch up within the lag budget after a rescale
             conf["job.autoscaler.catch-up.duration"] = f"{max(sc.max_lag_ms // 1000, 1)}s"
+    if python_functions(p):
+        conf["python.executable"] = PYFLINK_PYTHON
+        conf["python.client.executable"] = PYFLINK_PYTHON
     conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
 
     jm = cfg.get("jobmanager") or {}
@@ -217,6 +247,10 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
            for s in sorted(p.secrets)]
     container = {"name": "flink-main-container",
                  "volumeMounts": [{"name": "cascade-job", "mountPath": JOB_DIR, "readOnly": True}]}
+    volumes = [{"name": "cascade-job", "configMap": {"name": f"{name}-job"}}]
+    if python_functions(p):
+        container["volumeMounts"].append({"name": "cascade-python", "mountPath": PYTHON_DIR, "readOnly": True})
+        volumes.append({"name": "cascade-python", "configMap": {"name": f"{name}-python"}})
     if env:
         container["env"] = env
     annotations = {"cascade.dev/compiler": f"cascade {__version__}",
@@ -241,7 +275,7 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
             "taskManager": {"resource": {"memory": _memory(tm.get("memory", "4g")), "cpu": float(tm.get("cpu", 1))}},
             "podTemplate": {"spec": {
                 "containers": [container],
-                "volumes": [{"name": "cascade-job", "configMap": {"name": f"{name}-job"}}],
+                "volumes": volumes,
             }},
             "job": {
                 "jarURI": f"local://{RUNTIME_JAR}",
@@ -272,8 +306,20 @@ def dockerfile(r: Result, cfg: dict) -> str:
         url = (f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}/${{{arg}}}/"
                f"{artifact}-${{{arg}}}.jar")
         lines.append(f'RUN test -n "${{{arg}}}" && wget -q -P /opt/flink/lib "{url}"')
+    p = r.checked.pipeline
+    if python_functions(p):
+        lines += ["", "# Python UDFs: PyFlink in its own virtualenv, Python support on Flink's classpath",
+                  "RUN apt-get update -y && apt-get install -y --no-install-recommends python3 python3-venv \\",
+                  "    && rm -rf /var/lib/apt/lists/*",
+                  f"RUN python3 -m venv /opt/pyflink && /opt/pyflink/bin/pip install --no-cache-dir "
+                  f"apache-flink=={flink}",
+                  "RUN cp /opt/flink/opt/flink-python-*.jar /opt/flink/lib/"]
     lines += ["", f"COPY runtime/target/cascade-runtime.jar {RUNTIME_JAR}"]
+    project = os.path.relpath(p.root_dir)
+    for f in p.functions.values():
+        if f.language == "java" and f.jar:
+            lines.append(f"COPY {os.path.join(project, f.jar)} {USRLIB}/{os.path.basename(f.jar)}")
     for jar in cfg.get("jars") or []:
-        lines.append(f"COPY {jar} /opt/flink/usrlib/{os.path.basename(str(jar))}")
+        lines.append(f"COPY {jar} {USRLIB}/{os.path.basename(str(jar))}")
     return "\n".join(lines) + "\n"
 

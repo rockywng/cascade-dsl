@@ -60,6 +60,27 @@ class Expectation:
 
 
 @dataclass
+class Function:
+    """A user-defined scalar function (Java class in a jar, or a plain Python function)."""
+
+    name: str
+    language: Literal["java", "python"]
+    class_name: str | None = None  # java
+    jar: str | None = None  # java: path relative to the project
+    file: str | None = None  # python: module file relative to the project
+    function: str | None = None  # python: function name in the module
+    returns: SqlType | None = None
+    deterministic: bool = True
+    description: str | None = None
+    loc: Location | None = None
+
+    @property
+    def module(self) -> str | None:
+        import os
+        return os.path.splitext(os.path.basename(self.file))[0] if self.file else None
+
+
+@dataclass
 class Scaling:
     """Parallelism settings. The platform autoscaler reads them from the manifest."""
 
@@ -159,6 +180,7 @@ class Pipeline:
     quarantine: Quarantine | None
     secrets: set[str] = field(default_factory=set)
     scaling: Scaling | None = None
+    functions: dict[str, Function] = field(default_factory=dict)
     deploy: dict | None = None  # deployment settings (image, resources, checkpoints, ...), vars resolved
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     relations: dict[str, RelationInfo] = field(default_factory=dict)

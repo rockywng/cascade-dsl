@@ -69,6 +69,10 @@ def run_verify(c: Checked, lowered, flink_home: str, timeout: int = 180) -> Veri
         jar = jvm.runtime_jar()
         if jar:
             cmd[2:2] = ["-j", jar]
+        if any(f.language == "python" for f in c.pipeline.functions.values()):
+            import glob
+            for py_jar in sorted(glob.glob(os.path.join(flink_home, "opt", "flink-python*.jar")))[:1]:
+                cmd[2:2] = ["-j", py_jar]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:

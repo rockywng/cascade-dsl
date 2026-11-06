@@ -60,8 +60,10 @@ jobs:
           tar xzf /tmp/flink.tgz -C ~
       - name: Python dependencies (PyFlink for Python UDF tests)
         run: pip install pyyaml "apache-flink==${FLINK_VERSION}"
-      - name: Build JVM runtime and tools
-        run: FLINK_HOME=~/flink-${FLINK_VERSION} runtime/build.sh
+      - name: Build JVM runtime and tools, and the example UDF jar
+        run: |
+          FLINK_HOME=~/flink-${FLINK_VERSION} runtime/build.sh
+          FLINK_HOME=~/flink-${FLINK_VERSION} examples/udfs/udfs/build.sh
       - name: All tests, including real Flink jobs
         run: |
           export FLINK_HOME=~/flink-${FLINK_VERSION}

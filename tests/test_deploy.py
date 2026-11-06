@@ -73,8 +73,8 @@ class DeployTest(unittest.TestCase):
                 y["metadata"]["annotations"].pop("cascade.dev/sql-sha256")
             if name == "configmap.yaml":
                 for k in x["data"]:  # headers name the source file
-                    x["data"][k] = x["data"][k].split("\n", 1)[1]
-                    y["data"][k] = y["data"][k].split("\n", 1)[1]
+                    x["data"][k] = " ".join(x["data"][k].split("\n", 1)[1].split())  # SQL indentation differs
+                    y["data"][k] = " ".join(y["data"][k].split("\n", 1)[1].split())
             self.assertEqual(x, y, name)
         shutil.rmtree(a)
 

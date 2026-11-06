@@ -182,8 +182,9 @@ class Pipeline:
             opts = {"columns": columns, "expectations": expectations, "description": description or
                     (inspect.getdoc(f) or None),
                     "allow_unbounded_state": allow_unbounded_state or None, "scaling": scaling}
+            # co_firstlineno is the first decorator's line on every Python version
             self._models[mname] = _ModelDef(mname, f, None, None, params, opts,
-                                            line or f.__code__.co_firstlineno)
+                                            f.__code__.co_firstlineno if hasattr(f, "__code__") else line)
             return Relation(self, mname)
 
         return register(fn) if fn is not None else register

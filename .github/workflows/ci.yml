@@ -53,8 +53,11 @@ jobs:
       - name: Download Flink
         if: steps.flink-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL "https://archive.apache.org/dist/flink/flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-scala_2.12.tgz" \
-            | tar xz -C ~
+          f="flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-scala_2.12.tgz"
+          for url in "https://dlcdn.apache.org/flink/$f" "https://archive.apache.org/dist/flink/$f"; do
+            curl -fsSL --retry 5 --retry-all-errors -o /tmp/flink.tgz "$url" && break
+          done
+          tar xzf /tmp/flink.tgz -C ~
       - name: Python dependencies (PyFlink for Python UDF tests)
         run: pip install pyyaml "apache-flink==${FLINK_VERSION}"
       - name: Build JVM runtime and tools

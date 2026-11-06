@@ -112,6 +112,7 @@ public final class Main {
         conf.setString("parallelism.default", "1");
         conf.setString("restart-strategy.type", "none");
         conf.setString("rest.port", "0");
+        conf.setString("table.local-time-zone", "UTC");
         if (extra != null) {
             conf.addAll(extra);
         }
@@ -210,9 +211,13 @@ public final class Main {
                 String query =
                         new String(Files.readAllBytes(test.toPath().resolve("query.sql")), StandardCharsets.UTF_8)
                                 .trim();
+                Path capture = test.toPath().resolve("capture.txt");
                 Future<List<Object>> rows =
                         pool.submit(
                                 () -> {
+                                    if (Files.exists(capture)) {
+                                        return runInsert(tEnv, query, capture, holder, r);
+                                    }
                                     TableResult result = tEnv.executeSql(query);
                                     holder[0] = result;
                                     r.put("columns", columns(result.getResolvedSchema()));
@@ -249,6 +254,30 @@ public final class Main {
         return out;
     }
 
+    /** Sink-level test: run the INSERT to completion; the fixture sink recorded what it received. */
+    private static List<Object> runInsert(
+            TableEnvironment tEnv, String insert, Path capture, TableResult[] holder, Map<String, Object> r)
+            throws Exception {
+        List<String> spec = Files.readAllLines(capture, StandardCharsets.UTF_8);
+        String table = spec.get(0).trim();
+        Path file = Paths.get(spec.get(1).trim());
+        r.put("columns", columns(tEnv.from("`" + table + "`").getResolvedSchema()));
+        TableResult result = tEnv.executeSql(insert.endsWith(";") ? insert.substring(0, insert.length() - 1) : insert);
+        holder[0] = result;
+        result.await();
+        List<Object> collected = new ArrayList<>();
+        if (Files.exists(file)) {
+            org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper();
+            for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                if (!line.trim().isEmpty()) {
+                    collected.add(mapper.readValue(line, Map.class));
+                }
+            }
+        }
+        return collected;
+    }
+
     private static void cancel(TableResult r) {
         try {
             if (r != null && r.getJobClient().isPresent()) {
@@ -259,7 +288,7 @@ public final class Main {
         }
     }
 
-    private static Object encode(Object v) {
+    static Object encode(Object v) {
         if (v == null || v instanceof Boolean || v instanceof Integer || v instanceof Long
                 || v instanceof Short || v instanceof Byte || v instanceof String) {
             return v;

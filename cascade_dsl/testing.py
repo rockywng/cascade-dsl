@@ -4,7 +4,7 @@ Test files live in the project's tests/ directory (*.yaml):
 
     tests:
       - name: ltv_sums_amounts_per_customer
-        target: customer_ltv              # a model, or <model>.quarantined
+        target: customer_ltv              # a model, <model>.quarantined, or a sink
         given:                            # rows per source; unlisted sources are empty
           orders:
             - {order_id: o1, customer_id: c1, amount: 10.00, currency: usd, order_ts: "2026-01-01 10:00:00"}
@@ -15,8 +15,17 @@ Test files live in the project's tests/ directory (*.yaml):
             - {customer_id: c1, lifetime_value: 10.00}   # only listed columns are compared
           # or: error: positive_amount    (the job must fail, message containing this text)
         ordered: false                    # default: compare as a multiset
+        watermarks: per_row               # per_row (default) | manual | end_of_input
 
-Sources are bounded, so event time advances to the end of input and every window fires.
+Sources are bounded: at the end of input event time jumps to +inf and every window fires.
+Before that, watermarks are deterministic: with `per_row`, each event-time source emits its
+declared strategy (max event time - max_out_of_orderness) after every row, so rows older than
+that are late, exactly as in production. `{_watermark: "2026-01-01 10:05:00"}` in a source's rows
+emits one explicitly (the only ones with `manual`).
+
+A sink target runs the real INSERT (including the sink's upsert materialization and ON CONFLICT
+policy) into a capture table; upsert sinks are compared as the final table by primary key, i.e.
+what the external system would hold.
 """
 from __future__ import annotations
 
@@ -34,7 +43,7 @@ from .compiler import compile_pipeline
 from .diagnostics import Location
 from .jvm import Tools
 from .loader import _Loader
-from .localize import FixtureError, localize
+from .localize import WATERMARK_MODES, FixtureError, localize
 
 
 @dataclass
@@ -46,6 +55,7 @@ class TestCase:
     error: str | None
     ordered: bool
     loc: Location
+    watermarks: str = "per_row"
 
 
 @dataclass
@@ -72,17 +82,20 @@ def discover(root: str, pattern: str | None = None) -> list[TestCase]:
             loc = Location(rel, getattr(t, "line", None))
             if not isinstance(t, dict) or "name" not in t or "target" not in t:
                 raise TestSpecError(f"{loc}: each test needs `name` and `target`")
-            unknown = set(t) - {"name", "target", "given", "expect", "ordered", "description"}
+            unknown = set(t) - {"name", "target", "given", "expect", "ordered", "description", "watermarks"}
             if unknown:
                 raise TestSpecError(f"{loc}: unknown key(s) {sorted(unknown)} in test '{t['name']}'")
             exp = t.get("expect") or {}
             if not isinstance(exp, dict) or not ({"rows", "error", "empty"} & set(exp)):
                 raise TestSpecError(f"{loc}: test '{t['name']}' needs expect.rows, expect.empty or expect.error")
             rows = [] if exp.get("empty") else exp.get("rows")
+            wm = t.get("watermarks", "per_row")
+            if wm not in WATERMARK_MODES:
+                raise TestSpecError(f"{loc}: watermarks must be one of {', '.join(WATERMARK_MODES)}")
             if pattern and pattern not in t["name"]:
                 continue
             cases.append(TestCase(t["name"], t["target"], dict(t.get("given") or {}), rows,
-                                  exp.get("error"), bool(t.get("ordered", False)), loc))
+                                  exp.get("error"), bool(t.get("ordered", False)), loc, wm))
     return cases
 
 
@@ -102,17 +115,27 @@ def run(path: str, flink_home: str, env: str | None = None, pattern: str | None 
             if problem:
                 results.append(TestResult(case, False, problem))
                 continue
+            tdir = os.path.join(work, f"t{i}")
+            capture = (case.target, os.path.join(tdir, "captured.jsonl")) if case.target in p.sinks else None
             try:
-                stmts = localize(r.lowered, c, "test", os.path.join(work, f"t{i}"), fixtures=case.given)
+                stmts = localize(r.lowered, c, "test", tdir, fixtures=case.given, watermarks=case.watermarks,
+                                 capture=capture)
             except FixtureError as e:
                 results.append(TestResult(case, False, f"bad fixture: {e}"))
                 continue
-            view = case.target.replace(".quarantined", "__quarantined")
-            runnable.append((case, stmts, f"SELECT * FROM `{view}`"))
+            if capture:
+                insert = next(st for st in stmts if st.kind == "insert" and st.name == case.target)
+                setup = [st for st in stmts if st.kind != "insert"]
+                runnable.append((case, setup, insert.render(), capture))
+            else:
+                view = case.target.replace(".quarantined", "__quarantined")
+                runnable.append((case, stmts, f"SELECT * FROM `{view}`", None))
         if runnable:
-            outputs = Tools(flink_home).run_tests([(cs.name, st, qy) for cs, st, qy in runnable])
-            for (case, _, _), out in zip(runnable, outputs):
-                results.append(_evaluate(case, out))
+            outputs = Tools(flink_home).run_tests([(cs.name, st, qy, cap) for cs, st, qy, cap in runnable])
+            for (case, _, _, _), out in zip(runnable, outputs):
+                sink = p.sinks.get(case.target)
+                key = sink.primary_key if sink is not None and sink.mode == "upsert" else None
+                results.append(_evaluate(case, out, key))
     order = {id(cs): i for i, cs in enumerate(cases)}
     results.sort(key=lambda x: order[id(x.case)])
     return r, results
@@ -124,8 +147,8 @@ def _validate_case(case: TestCase, p) -> str | None:
         m = target[: -len(".quarantined")]
         if m not in p.models or not any(e.on_violation == "quarantine" for e in p.models[m].expectations):
             return f"target '{target}': '{m}' is not a model with quarantine expectations"
-    elif target not in p.models and target not in p.sources:
-        return f"unknown target '{target}'"
+    elif target not in p.models and target not in p.sources and target not in p.sinks:
+        return f"unknown target '{target}' (expected a model, <model>.quarantined or a sink)"
     for src in case.given:
         if src not in p.sources:
             return f"`given` names '{src}', which is not a source"
@@ -136,8 +159,20 @@ def _validate_case(case: TestCase, p) -> str | None:
 
 # --- evaluation ---------------------------------------------------------------------------
 
-def _materialize(rows: list[dict]) -> list[tuple]:
-    """Apply a changelog (+I, -U, +U, -D) and return the final rows."""
+def _materialize(rows: list[dict], key: list[int] | None = None) -> list[tuple]:
+    """Apply a changelog (+I, -U, +U, -D) and return the final rows. With `key` (column positions
+    of an upsert sink's primary key), +I/+U replace the row with that key and -D deletes it, the way
+    an external upsert table applies them."""
+    if key is not None:
+        table: dict = {}
+        for r in rows:
+            values = tuple(_freeze(v) for v in r["values"])
+            k = tuple(values[i] for i in key)
+            if r["kind"] in ("+I", "+U"):
+                table[k] = values
+            elif r["kind"] == "-D":
+                table.pop(k, None)
+        return list(table.values())
     state: Counter = Counter()
     for r in rows:
         values = tuple(_freeze(v) for v in r["values"])
@@ -189,7 +224,7 @@ def normalize(value, flink_type: str):
     return _freeze(value)
 
 
-def _evaluate(case: TestCase, out: dict) -> TestResult:
+def _evaluate(case: TestCase, out: dict, key: list[str] | None = None) -> TestResult:
     millis = out.get("millis", 0)
     if out.get("error"):
         if case.error is not None:
@@ -205,7 +240,7 @@ def _evaluate(case: TestCase, out: dict) -> TestResult:
     columns = [(col["name"], col["type"]) for col in out["columns"]]
     types = dict(columns)
     names = [n for n, _ in columns]
-    final = _materialize(out["rows"])
+    final = _materialize(out["rows"], [names.index(k) for k in key] if key else None)
     actual_dicts = [dict(zip(names, row)) for row in final]
 
     compare_cols = []

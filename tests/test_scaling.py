@@ -5,7 +5,7 @@ import unittest
 from cascade_dsl.compiler import compile_pipeline
 from cascade_dsl.upgrade import diff_manifests
 
-from helpers import compile_text
+from helpers import BASE, compile_text, project
 
 AGG = """
 defaults: {state_ttl: 1d}
@@ -106,6 +106,31 @@ class ScalingUpgradeTest(unittest.TestCase):
         verdict, _ = diff_manifests(self.manifest("{max_parallelism: 720, parallelism: 2}"),
                                     self.manifest("{max_parallelism: 720, parallelism: 8}"))
         self.assertEqual(verdict, "ok")
+
+
+class OnConflictWatermarkTest(unittest.TestCase):
+    """ON CONFLICT DO ERROR / NOTHING resolve conflicts on watermarks: every scanned source needs one."""
+
+    RAW = ("  payments_raw:\n    connection: bus\n    topic: p\n"
+           "    columns: {order_id: STRING, paid: \"DECIMAL(10, 2)\"}\n")
+
+    def compile(self, payments: str, policy: str):
+        body = BASE.replace("  customers:\n", self.RAW + "  customers:\n", 1) + f"""
+defaults: {{state_ttl: 1d}}
+models:
+  m:
+    sql: SELECT o.order_id, o.customer_id, SUM(p.paid) AS paid FROM orders AS o JOIN {payments} AS p
+         ON o.order_id = p.order_id GROUP BY o.order_id, o.customer_id
+sinks:
+  out: {{from: m, connection: print, mode: upsert, primary_key: [customer_id], on_conflict: {policy}}}
+"""
+        return codes(compile_pipeline(project(body, base=False)))
+
+    def test_sources_need_event_time(self):
+        self.assertNotIn("CD412", self.compile("payments", "error"))
+        self.assertIn("CD412", self.compile("payments_raw", "error"))
+        self.assertIn("CD412", self.compile("payments_raw", "nothing"))
+        self.assertNotIn("CD412", self.compile("payments_raw", "deduplicate"))
 
 
 class ScalingExamplesTest(unittest.TestCase):

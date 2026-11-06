@@ -9,6 +9,7 @@ Diagnostic code ranges:
 from __future__ import annotations
 
 import difflib
+import re
 from dataclasses import dataclass, field
 
 from .connectors import CATALOG, ConnectorSpec, LowerCtx, build_options
@@ -429,6 +430,14 @@ def _check_sinks(c: Checked):
                          "(e.g. a window aggregation instead of a running GROUP BY)")
         if k.on_conflict and k.mode != "upsert":
             d.error("CD411", f"sink '{k.name}': on_conflict only applies to upsert sinks", k.loc, node=k.name)
+        if k.on_conflict in ("error", "nothing") and k.from_ in p.relation_names():
+            missing = [s for s in sorted(_upstream_sources(p, k.from_))
+                       if p.sources[s].event_time is None and not _lookup_only(c, s)]
+            if missing:
+                d.error("CD412", f"sink '{k.name}': ON CONFLICT DO {k.on_conflict.upper()} needs every source it "
+                        f"reads to define event time, but {', '.join(missing)} do(es) not", k.loc, node=k.name,
+                        hint="Flink resolves conflicts when the watermark advances; declare `event_time` on those "
+                             "sources or use `on_conflict: deduplicate`")
         if k.mode == "upsert" and rel.changelog == "updating" and not k.on_conflict and k.primary_key:
             key = rel.upsert_key
             if key is None or sorted(x.lower() for x in key) != sorted(x.lower() for x in k.primary_key):
@@ -451,6 +460,28 @@ def _check_sinks(c: Checked):
             if key.lower() not in names:
                 d.error("CD406", f"sink '{k.name}' primary_key column '{key}' is not an output column of "
                         f"'{k.from_}'", k.loc, hint=_suggest(key, [col.name for col in rel.columns]), node=k.name)
+
+
+def _upstream_sources(p: Pipeline, name: str) -> set[str]:
+    out, stack, seen = set(), [name], set()
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        if n in p.sources:
+            out.add(n)
+        elif p.relations.get(n):
+            stack.extend(p.relations[n].inputs)
+    return out
+
+
+def _lookup_only(c: Checked, source: str) -> bool:
+    """A source used only as the dimension side of FOR SYSTEM_TIME AS OF (a lookup join)."""
+    pat = re.compile(r"\b" + re.escape(source) + r"\b\s+FOR\s+SYSTEM_TIME\s+AS\s+OF", re.IGNORECASE)
+    uses = [m for m in c.pipeline.models.values() if re.search(r"\b" + re.escape(source) + r"\b", m.sql)]
+    return bool(uses) and all(pat.search(m.sql) for m in uses) and \
+        c.pipeline.sources[source].event_time is None
 
 
 def _updating_reason(p: Pipeline, name: str) -> str:

@@ -103,12 +103,12 @@ class Tools:
             self._run(["describe", path, out], timeout)
             return self._read(out)
 
-    def run_tests(self, cases: list[tuple[str, list[Stmt], str]], per_test_timeout: int = 60,
-                  timeout: int = 900) -> list[dict]:
-        """cases: (name, setup statements, query). Returns one result dict per case, in order."""
+    def run_tests(self, cases: list[tuple], per_test_timeout: int = 60, timeout: int = 900) -> list[dict]:
+        """cases: (name, setup statements, query[, (sink table, capture file)]). A capture runs the
+        query (an INSERT) to completion and returns what the sink received. One result per case."""
         with tempfile.TemporaryDirectory(prefix="cascade-tests-") as d:
             index = {}
-            for i, (name, stmts, query) in enumerate(cases):
+            for i, (name, stmts, query, *rest) in enumerate(cases):
                 td = os.path.join(d, "tests", f"{i:04d}")
                 os.makedirs(td)
                 index[f"{i:04d}"] = name
@@ -116,6 +116,9 @@ class Tools:
                     f.write(script(stmts))
                 with open(os.path.join(td, "query.sql"), "w") as f:
                     f.write(query)
+                if rest and rest[0]:
+                    with open(os.path.join(td, "capture.txt"), "w") as f:
+                        f.write(f"{rest[0][0]}\n{rest[0][1]}\n")
             out = os.path.join(d, "out.json")
             self._run(["run", os.path.join(d, "tests"), out, str(per_test_timeout)], timeout)
             results = self._read(out)["results"]

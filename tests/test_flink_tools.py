@@ -71,6 +71,125 @@ class RunnerTest(unittest.TestCase):
         shutil.rmtree(d)
 
 
+LOOKUP = """
+pipeline: lookups
+defaults: {state_ttl: 1d}
+scaling: {max_parallelism: 360}
+connections:
+  bus: {type: kafka, properties: {bootstrap_servers: "b:9092"}}
+  crm: {type: jdbc, properties: {url: "jdbc:postgresql://crm/app", password: "${secret:crm/pw}"}}
+sources:
+  orders:
+    connection: bus
+    topic: orders
+    columns: {order_id: STRING NOT NULL, customer_id: STRING, amount: "DECIMAL(10, 2)"}
+    processing_time: proc_time
+  customers:
+    connection: crm
+    table: customers
+    columns: {customer_id: STRING NOT NULL, tier: STRING}
+    primary_key: [customer_id]
+models:
+  enriched:
+    sql: |
+      SELECT o.order_id, o.customer_id, COALESCE(c.tier, 'none') AS tier, o.amount
+      FROM orders AS o
+      LEFT JOIN customers FOR SYSTEM_TIME AS OF o.proc_time AS c
+        ON o.customer_id = c.customer_id
+  spend:
+    sql: SELECT customer_id, SUM(amount) AS total FROM enriched GROUP BY customer_id
+sinks:
+  enriched_out: {from: enriched, connection: print}
+  spend_by_tier:
+    from: spend
+    connection: print
+    mode: upsert
+    primary_key: [customer_id]
+"""
+
+
+@unittest.skipUnless(READY, "set FLINK_HOME and run runtime/build.sh")
+class FixtureConnectorTest(unittest.TestCase):
+    """Lookup joins served from fixture rows, and sinks as test targets."""
+
+    def test_lookup_join_and_sink_targets(self):
+        d = project(LOOKUP, base=False, files={"tests/t.yaml": """
+            tests:
+              - name: lookup_uses_the_table_rows
+                target: enriched
+                given:
+                  customers:
+                    - {customer_id: c1, tier: gold}
+                    - {customer_id: c2, tier: silver}
+                  orders:
+                    - {order_id: o1, customer_id: c1, amount: 10}
+                    - {order_id: o2, customer_id: c3, amount: 5}
+                expect:
+                  rows:
+                    - {order_id: o1, tier: gold}
+                    - {order_id: o2, tier: none}
+              - name: upsert_sink_final_table
+                target: spend_by_tier
+                given:
+                  orders:
+                    - {order_id: o1, customer_id: c1, amount: 10}
+                    - {order_id: o2, customer_id: c1, amount: 5}
+                    - {order_id: o3, customer_id: c2, amount: 1}
+                expect:
+                  rows:
+                    - {customer_id: c1, total: 15}
+                    - {customer_id: c2, total: 1}
+              - name: append_sink_target
+                target: enriched_out
+                given:
+                  orders: [{order_id: o1, customer_id: c1, amount: 10}]
+                expect:
+                  rows: [{order_id: o1, tier: none}]
+            """})
+        r, results = testing.run(d, FLINK)
+        self.assertIsNotNone(results, [x.format() for x in r.diagnostics.errors])
+        for t in results:
+            self.assertTrue(t.passed, f"{t.case.name}: {t.message}")
+        shutil.rmtree(d)
+
+    def test_on_conflict_policies(self):
+        # upsert key (order_id, customer_id) differs from the sink key (customer_id): two orders of one
+        # customer conflict. ERROR fails the job; NOTHING keeps the first row.
+        def proj(policy):
+            return project(f"""
+                defaults: {{state_ttl: 1d}}
+                models:
+                  m:
+                    sql: |
+                      SELECT order_id, customer_id, SUM(amount) AS total
+                      FROM orders GROUP BY order_id, customer_id
+                sinks:
+                  by_customer:
+                    from: m
+                    connection: print
+                    mode: upsert
+                    primary_key: [customer_id]
+                    on_conflict: {policy}
+                """, files={"tests/t.yaml": """
+                tests:
+                  - name: conflict
+                    target: by_customer
+                    given:
+                      orders:
+                        - {order_id: o1, customer_id: c1, amount: 10, ts: "2026-01-01 10:00:00"}
+                        - {order_id: o2, customer_id: c1, amount: 5, ts: "2026-01-01 10:01:00"}
+                    expect:
+                      """ + ("{error: Primary key constraint violation}" if policy == "error" else
+                             "{rows: [{customer_id: c1, total: 10}]}")})
+        for policy in ("error", "nothing"):
+            with self.subTest(policy=policy):
+                d = proj(policy)
+                r, results = testing.run(d, FLINK)
+                self.assertIsNotNone(results, [x.format() for x in r.diagnostics.errors])
+                self.assertTrue(results[0].passed, results[0].message)
+                shutil.rmtree(d)
+
+
 @unittest.skipUnless(READY, "set FLINK_HOME and run runtime/build.sh")
 class InferTest(unittest.TestCase):
     def test_infer_resolves_untyped_expressions(self):

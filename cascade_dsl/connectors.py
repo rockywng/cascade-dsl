@@ -40,6 +40,8 @@ class ConnectorSpec:
     source_changelog: str = "append"  # append | updating | by_format
     source_requires_pk: bool = False
     artifact: str | None = None
+    # connection properties -> extra Maven coordinates (e.g. JDBC dialect module and driver)
+    extra_artifacts: Callable | None = None
     doc: str = ""
     # (role, mode, fmt, options, ctx) -> mutate options; return list of (code, message) problems
     finish: Callable | None = None
@@ -208,8 +210,28 @@ register(ConnectorSpec(
     source={"table": Prop("table-name", required=True)},
     sink={"table": Prop("table-name", required=True),
           "buffer_rows": Prop("sink.buffer-flush.max-rows")},
-    sink_modes={"append", "upsert"}, artifact="org.apache.flink:flink-connector-jdbc",
+    # Flink 2.x splits JDBC into a core module plus one module per database; the driver is separate
+    sink_modes={"append", "upsert"}, artifact="org.apache.flink:flink-connector-jdbc-core",
+    extra_artifacts=lambda props: _jdbc_artifacts(str(props.get("url", ""))),
 ))
+
+JDBC_DIALECTS = {  # url prefix -> (Flink dialect module, driver coordinate)
+    "jdbc:postgresql:": ("postgres", "org.postgresql:postgresql"),
+    "jdbc:mysql:": ("mysql", "com.mysql:mysql-connector-j"),
+    "jdbc:oracle:": ("oracle", "com.oracle.database.jdbc:ojdbc11"),
+    "jdbc:sqlserver:": ("sqlserver", "com.microsoft.sqlserver:mssql-jdbc"),
+    "jdbc:db2:": ("db2", "com.ibm.db2:jcc"),
+}
+
+
+def _jdbc_artifacts(url: str) -> list[str]:
+    for prefix, (dialect, driver) in JDBC_DIALECTS.items():
+        if url.startswith(prefix):
+            # the 4.x modules are thin jars: their lineage support needs the OpenLineage clients at runtime
+            return [f"org.apache.flink:flink-connector-jdbc-{dialect}", driver,
+                    "io.openlineage:openlineage-java", "io.openlineage:openlineage-sql-java"]
+    return []
+
 
 register(ConnectorSpec(
     type="filesystem", roles={"source", "sink"},

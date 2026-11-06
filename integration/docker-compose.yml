@@ -1,0 +1,79 @@
+# Real systems for the integration run (integration/run.py). The Flink image is built from the
+# Dockerfile that `cascade deploy` generates, so the image recipe is under test too.
+name: cascade-it
+
+services:
+  kafka:
+    image: apache/kafka:4.3.2
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms256m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8"]
+    environment:
+      POSTGRES_USER: flink
+      POSTGRES_PASSWORD: flinkpw
+      POSTGRES_DB: shop
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flink -d shop"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  jobmanager:
+    image: cascade-it:latest
+    build:
+      context: ..
+      dockerfile: integration/.work/Dockerfile
+      args:
+        FLINK_SQL_CONNECTOR_KAFKA_VERSION: 5.0.0-2.2
+        FLINK_SQL_CONNECTOR_POSTGRES_CDC_VERSION: 3.7.0-2.2
+        FLINK_CONNECTOR_JDBC_CORE_VERSION: 4.1.0-2.2
+        FLINK_CONNECTOR_JDBC_POSTGRES_VERSION: 4.1.0-2.2
+        POSTGRESQL_VERSION: 42.7.14
+        OPENLINEAGE_JAVA_VERSION: 1.32.0
+        OPENLINEAGE_SQL_JAVA_VERSION: 1.32.0
+    command: jobmanager
+    ports: ["8081:8081"]
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 1024m
+    volumes:
+      - ./.work/flink-data:/flink-data
+      - ./.work/jobs:/jobs:ro
+    depends_on:
+      kafka: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+
+  taskmanager:
+    image: cascade-it:latest
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+    volumes:
+      - ./.work/flink-data:/flink-data
+    depends_on: [jobmanager]

@@ -1,0 +1,94 @@
+# Integration pipeline: every connector here is real (Kafka, Postgres CDC, JDBC), run by
+# integration/run.py against the docker-compose stack. v2 (written by run.py) adds a model.
+pipeline: shop_it
+owner: platform
+defaults: {state_ttl: 1d}
+scaling: {max_parallelism: 120, parallelism: 1}
+
+flink:
+  config:
+    # the CDC source goes idle after its snapshot; don't let it hold back event time
+    table.exec.source.idle-timeout: 2s
+
+deploy:
+  image: cascade-it:latest
+  checkpoints: {interval: 5s, dir: "file:///flink-data/checkpoints"}
+  savepoints: file:///flink-data/savepoints
+
+connections:
+  bus:
+    type: kafka
+    properties: {bootstrap_servers: "kafka:9092"}
+  crm:
+    type: postgres-cdc
+    properties: {hostname: postgres, port: 5432, database: shop, username: flink, password: "${secret:crm/password}"}
+  warehouse:
+    type: jdbc
+    properties: {url: "jdbc:postgresql://postgres:5432/shop", username: flink, password: "${secret:crm/password}"}
+
+sources:
+  orders:
+    connection: bus
+    topic: orders
+    format: json
+    group_id: shop_it
+    startup: earliest
+    columns:
+      order_id: STRING NOT NULL
+      customer_id: STRING
+      amount: DECIMAL(10, 2)
+      order_ts: TIMESTAMP(3)
+    event_time: {column: order_ts, max_out_of_orderness: 2s}
+  customers:
+    connection: crm
+    table: public.customers
+    columns:
+      customer_id: STRING NOT NULL
+      segment: STRING
+      updated_at: TIMESTAMP(3)
+    primary_key: [customer_id]
+    event_time: updated_at
+
+models:
+  clean_orders:
+    sql: SELECT order_id, customer_id, amount, order_ts FROM orders
+    expectations:
+      - {name: positive_amount, check: amount > 0, on_violation: drop}
+
+  orders_enriched:
+    sql: |
+      SELECT o.order_id, o.customer_id, o.amount, o.order_ts,
+             COALESCE(c.segment, 'unknown') AS segment
+      FROM clean_orders AS o
+      LEFT JOIN customers FOR SYSTEM_TIME AS OF o.order_ts AS c
+        ON o.customer_id = c.customer_id
+
+  revenue_per_minute:
+    sql: |
+      SELECT window_start, window_end, segment, SUM(amount) AS revenue, COUNT(*) AS orders
+      FROM TABLE(TUMBLE(TABLE orders_enriched, DESCRIPTOR(order_ts), INTERVAL '1' MINUTE))
+      GROUP BY window_start, window_end, segment
+
+  customer_ltv:
+    sql: |
+      SELECT customer_id, SUM(amount) AS lifetime_value, COUNT(*) AS order_count
+      FROM clean_orders
+      GROUP BY customer_id
+
+sinks:
+  revenue_out:
+    from: revenue_per_minute
+    connection: bus
+    topic: revenue
+  ltv_topic:
+    from: customer_ltv
+    connection: bus
+    topic: customer_ltv
+    mode: upsert
+    primary_key: [customer_id]
+  ltv_table:
+    from: customer_ltv
+    connection: warehouse
+    table: customer_ltv
+    mode: upsert
+    primary_key: [customer_id]

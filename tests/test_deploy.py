@@ -76,15 +76,46 @@ class DeployTest(unittest.TestCase):
         build(compile_pipeline(os.path.join(EXAMPLES, "orders_py"), env="prod"), self.out)
         for name in ("flinkdeployment.yaml", "configmap.yaml"):
             x, y = load_all(a)[name], load_all(self.out)[name]
-            if name == "flinkdeployment.yaml":  # the SQL hash covers the header, which names the file
+            if name == "flinkdeployment.yaml":  # the hashes cover SQL comments and headers, which differ
                 x["metadata"]["annotations"].pop("cascade.dev/sql-sha256")
                 y["metadata"]["annotations"].pop("cascade.dev/sql-sha256")
+                x, y = (yaml.safe_load(re.sub(r"-job-[0-9a-f]{10}", "-job-X", yaml.safe_dump(d))) for d in (x, y))
+            if name == "configmap.yaml":
+                x["metadata"]["name"] = y["metadata"]["name"] = "X"
             if name == "configmap.yaml":
                 for k in x["data"]:  # headers name the source file
                     x["data"][k] = sql_text(x["data"][k])
                     y["data"][k] = sql_text(y["data"][k])
             self.assertEqual(x, y, name)
         shutil.rmtree(a)
+
+    def test_new_version_changes_the_pod_template(self):
+        """The operator upgrades (with a savepoint) only when the spec changes, and mounted ConfigMaps
+        change in place: so each version gets its own ConfigMap, referenced from the pod template."""
+        root = project("""
+            deploy: {image: "img:1"}
+            models:
+              m: {sql: SELECT order_id FROM orders}
+            sinks:
+              out: {from: m, connection: print}
+            """)
+        build(compile_pipeline(root), self.out)
+        v1 = load_all(self.out)
+        path = os.path.join(root, "pipeline.yaml")
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(text.replace("FROM orders}", "FROM orders WHERE amount > 0}"))  # no comma: flow YAML
+        v2_out = os.path.join(self.out, "v2")
+        build(compile_pipeline(root), v2_out)
+        v2 = load_all(v2_out)
+        names = [d["configmap.yaml"]["metadata"]["name"] for d in (v1, v2)]
+        self.assertNotEqual(names[0], names[1])
+        for d, cm in zip((v1, v2), names):
+            spec = d["flinkdeployment.yaml"]["spec"]["podTemplate"]
+            self.assertEqual(spec["spec"]["volumes"][0]["configMap"]["name"], cm)
+            self.assertEqual(spec["metadata"]["annotations"]["cascade.dev/job-config"], cm)
+        shutil.rmtree(root)
 
     def test_needs_an_image(self):
         r = compile_pipeline(os.path.join(EXAMPLES, "clickstream_py"))

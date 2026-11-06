@@ -134,12 +134,18 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     namespace = cfg.get("namespace")
     meta = lambda n: {"name": n, **({"namespace": namespace} if namespace else {}), "labels": labels}  # noqa: E731
 
-    configmap = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(f"{name}-job"), "data": files}
-    deployment = _flink_deployment(r, name, meta(name), image, args, secret_name, cfg)
+    # ConfigMaps are named after their content: a running job never sees the next version's files
+    # (Kubernetes updates mounted ConfigMaps in place), and a new version changes the pod template,
+    # which is what makes the operator perform a savepoint upgrade.
+    job_cm = f"{name}-job-{_content_hash(files)}"
+    py_files = python_files(p) if python_functions(p) else None
+    py_cm_name = f"{name}-python-{_content_hash(py_files)}" if py_files else None
+    configmap = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(job_cm), "data": files}
+    deployment = _flink_deployment(r, name, meta(name), image, args, secret_name, cfg, job_cm, py_cm_name)
     resources = ["configmap.yaml", "flinkdeployment.yaml"]
-    if python_functions(p):
-        py_cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(f"{name}-python"),
-                 "data": python_files(p)}
+    if py_files:
+        py_cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(py_cm_name),
+                 "data": py_files}
         with open(os.path.join(out, "python-configmap.yaml"), "w") as f:
             f.write(_dump(py_cm))
         resources.insert(1, "python-configmap.yaml")
@@ -202,8 +208,13 @@ def _check_plan_matches(plan: dict, stmts: list[Stmt]):
                           "recompile it with `cascade plan` for this version/environment")
 
 
+def _content_hash(files: dict) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:10]
+
+
 def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: list[str], secret_name: str,
-                      cfg: dict) -> dict:
+                      cfg: dict, job_cm: str, py_cm: str | None) -> dict:
     p = r.checked.pipeline
     sc = p.scaling
     conf: dict[str, str] = {}
@@ -247,10 +258,10 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
            for s in sorted(p.secrets)]
     container = {"name": "flink-main-container",
                  "volumeMounts": [{"name": "cascade-job", "mountPath": JOB_DIR, "readOnly": True}]}
-    volumes = [{"name": "cascade-job", "configMap": {"name": f"{name}-job"}}]
+    volumes = [{"name": "cascade-job", "configMap": {"name": job_cm}}]
     if python_functions(p):
         container["volumeMounts"].append({"name": "cascade-python", "mountPath": PYTHON_DIR, "readOnly": True})
-        volumes.append({"name": "cascade-python", "configMap": {"name": f"{name}-python"}})
+        volumes.append({"name": "cascade-python", "configMap": {"name": py_cm}})
     if env:
         container["env"] = env
     annotations = {"cascade.dev/compiler": f"cascade {__version__}",
@@ -273,10 +284,10 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
             "jobManager": {"replicas": int(jm.get("replicas", 1)),
                            "resource": {"memory": _memory(jm.get("memory", "2g")), "cpu": float(jm.get("cpu", 1))}},
             "taskManager": {"resource": {"memory": _memory(tm.get("memory", "4g")), "cpu": float(tm.get("cpu", 1))}},
-            "podTemplate": {"spec": {
-                "containers": [container],
-                "volumes": volumes,
-            }},
+            "podTemplate": {
+                "metadata": {"annotations": {"cascade.dev/job-config": job_cm}},
+                "spec": {"containers": [container], "volumes": volumes},
+            },
             "job": {
                 "jarURI": f"local://{RUNTIME_JAR}",
                 "entryClass": RUNNER,

@@ -313,6 +313,8 @@ def _manifest(c: Checked, sql: str) -> dict:
         spec = CATALOG.get(conn.type)
         if spec and spec.artifact:
             artifacts.add(spec.artifact)
+        if spec and spec.extra_artifacts:
+            artifacts.update(spec.extra_artifacts(conn.properties))
     scaling = None
     if p.scaling:
         sc = p.scaling

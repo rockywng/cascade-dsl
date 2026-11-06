@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 
 from . import __version__
-from .analyze import Checked
+from .analyze import Checked, aligned_parallelisms
 from .connectors import CATALOG, SECRET_RE
 from .ir import OutputColumn, Pipeline
 from .util import h, normalize_sql
@@ -111,6 +111,10 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
     settings = {"pipeline.name": p.name}
     if p.state_ttl_ms is not None:
         settings["table.exec.state.ttl"] = f"{p.state_ttl_ms} ms"
+    if p.scaling and p.scaling.max_parallelism:
+        settings["pipeline.max-parallelism"] = str(p.scaling.max_parallelism)
+    if p.scaling and p.scaling.parallelism:
+        settings["parallelism.default"] = str(p.scaling.parallelism)
     settings.update(p.flink_config)
     for k, v in settings.items():
         stmts.append(Stmt("set", k, f"SET {lit(k)} = {lit(v)};", options={k: v}))
@@ -284,6 +288,18 @@ def _manifest(c: Checked, sql: str) -> dict:
         spec = CATALOG.get(conn.type)
         if spec and spec.artifact:
             artifacts.add(spec.artifact)
+    scaling = None
+    if p.scaling:
+        sc = p.scaling
+        lo, hi = sc.min or 1, sc.max or sc.max_parallelism
+        scaling = {
+            "max_parallelism": sc.max_parallelism, "parallelism": sc.parallelism, "min": sc.min, "max": sc.max,
+            "target_utilization": sc.target_utilization, "max_lag_ms": sc.max_lag_ms, "autoscale": sc.autoscale,
+            "aligned_parallelisms": aligned_parallelisms(sc.max_parallelism, lo, hi)
+            if sc.max_parallelism and hi else None,
+            "models": {m.name: {"min": m.scaling.min, "max": m.scaling.max}
+                       for m in p.models.values() if m.scaling},
+        }
     runtime_fns = [cls for fn, cls in ((ASSERT_FN, ASSERT_CLASS), (EXPECT_FN, EXPECT_CLASS)) if f"{fn}(" in sql]
     return {
         "format_version": 1,
@@ -294,6 +310,7 @@ def _manifest(c: Checked, sql: str) -> dict:
         "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(),
         "flink_config": p.flink_config,
         "state_ttl_ms": p.state_ttl_ms,
+        "scaling": scaling,
         "nodes": nodes,
         "sinks": sinks,
         "secrets": sorted(p.secrets),

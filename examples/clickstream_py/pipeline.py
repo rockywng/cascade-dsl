@@ -5,7 +5,8 @@ happen within 30 minutes of a view to attribute revenue to URLs.
 """
 from cascade_dsl.api import Pipeline, count, count_distinct, expect, iceberg, kafka, sum_
 
-pipeline = p = Pipeline("clickstream", owner="growth", state_ttl="1d")
+pipeline = p = Pipeline("clickstream", owner="growth", state_ttl="1d",
+                        scaling={"max_parallelism": 360, "parallelism": 1, "max": 24})
 
 events = p.connection("events", kafka(bootstrap_servers="localhost:9092"))
 lake = p.connection("lake", iceberg(catalog_type="rest", uri="https://catalog.internal"))

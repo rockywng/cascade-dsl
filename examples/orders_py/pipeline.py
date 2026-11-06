@@ -9,6 +9,8 @@ pipeline = Pipeline(
     description="Enriched orders, per-minute revenue and customer LTV",
     owner="data-eng",
     state_ttl="30d",
+    scaling={"max_parallelism": 720, "parallelism": 2, "min": 1, "max": 48,
+             "target_utilization": 0.7, "max_lag": "1m"},
     flink_config={
         "table.exec.mini-batch.enabled": "true",
         "table.exec.mini-batch.allow-latency": "2s",
@@ -93,7 +95,7 @@ def revenue_per_minute(orders_enriched):
     """
 
 
-@p.model(description="Running lifetime value per customer (updating result)")
+@p.model(description="Running lifetime value per customer (updating result)", scaling={"min": 2})
 def customer_ltv(clean_orders):
     return f"""
       SELECT customer_id,

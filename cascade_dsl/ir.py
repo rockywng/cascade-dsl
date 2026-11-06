@@ -60,6 +60,20 @@ class Expectation:
 
 
 @dataclass
+class Scaling:
+    """Parallelism settings. The platform autoscaler reads them from the manifest."""
+
+    max_parallelism: int | None = None  # pipeline.max-parallelism: number of key groups, fixed for the state's life
+    parallelism: int | None = None  # initial parallelism
+    min: int | None = None
+    max: int | None = None
+    target_utilization: float | None = None  # busy-time fraction the autoscaler aims for
+    max_lag_ms: int | None = None  # SLO: source lag the autoscaler must keep below
+    autoscale: bool = True
+    loc: Location | None = None
+
+
+@dataclass
 class Model:
     name: str
     sql: str
@@ -68,6 +82,7 @@ class Model:
     expectations: list[Expectation]
     allow_unbounded_state: bool = False
     description: str | None = None
+    scaling: Scaling | None = None  # per-model parallelism bounds (min/max only)
     loc: Location | None = None
 
 
@@ -143,6 +158,7 @@ class Pipeline:
     sinks: dict[str, Sink]
     quarantine: Quarantine | None
     secrets: set[str] = field(default_factory=set)
+    scaling: Scaling | None = None
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     relations: dict[str, RelationInfo] = field(default_factory=dict)
     loc: Location | None = None

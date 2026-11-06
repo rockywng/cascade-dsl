@@ -9,6 +9,16 @@ defaults:
   # unbounded state (regular joins, non-windowed aggregates, dedup).
   state_ttl: 30d
 
+# Parallelism settings for the job and the autoscaler. max_parallelism (the number of key
+# groups) is fixed once the job has state: choose it with headroom and many divisors.
+scaling:
+  max_parallelism: 720
+  parallelism: 2
+  min: 1
+  max: 48
+  target_utilization: 0.7
+  max_lag: 1m
+
 flink:
   config:
     table.exec.mini-batch.enabled: "true"
@@ -105,6 +115,8 @@ models:
 
   customer_ltv:
     description: Running lifetime value per customer (updating result)
+    # the keyed aggregate holds the most state; keep it from scaling below 2
+    scaling: {min: 2}
     sql: |
       SELECT customer_id,
              SUM(amount) AS lifetime_value,

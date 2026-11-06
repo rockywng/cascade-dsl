@@ -91,5 +91,36 @@ def diff_manifests(old: dict, new: dict) -> tuple[str, list[Change]]:
         if name not in os_:
             changes.append(Change("warning", "SINK_ADDED", name, f"sink '{name}' is new"))
 
+    changes += _scaling_changes(old, new)
     verdict = max((c.level for c in changes), key=ORDER.get, default="ok")
     return verdict, sorted(changes, key=lambda c: -ORDER[c.level])
+
+
+def _default_max_parallelism(parallelism: int) -> int:
+    """Flink's derived max parallelism when none is configured."""
+    p = parallelism + parallelism // 2
+    rounded = 1 << max(p - 1, 0).bit_length()
+    return min(max(rounded, 128), 32768)
+
+
+def _scaling_changes(old: dict, new: dict) -> list[Change]:
+    keyed = any(n.get("kind") == "model" and n.get("stateful_ops") for n in old.get("nodes", {}).values())
+    if not keyed:
+        return []
+    o = (old.get("scaling") or {}).get("max_parallelism")
+    n = (new.get("scaling") or {}).get("max_parallelism")
+    if o == n:
+        return []
+    if o is not None and n is not None:
+        return [Change("breaking", "MAX_PARALLELISM_CHANGED", "scaling",
+                       f"max_parallelism {o} -> {n}: keyed state is split into {o} key groups in the savepoint "
+                       "and cannot be restored with a different number; keep the old value")]
+    if o is None:
+        p = (old.get("scaling") or {}).get("parallelism") or 1
+        return [Change("warning", "MAX_PARALLELISM_PINNED", "scaling",
+                       f"max_parallelism is now {n}, but the running job derived its own (likely "
+                       f"{_default_max_parallelism(p)} at parallelism {p}); restore fails unless they match. "
+                       "Check the savepoint's value before deploying")]
+    return [Change("warning", "MAX_PARALLELISM_UNSET", "scaling",
+                   f"max_parallelism is no longer set (was {o}); Flink keeps the savepoint's value on restore, "
+                   "but new deployments from scratch would derive a different one")]

@@ -137,6 +137,7 @@ class Pipeline:
     owner: str | None = None
     state_ttl: str | None = None
     flink_config: dict | None = None
+    scaling: dict | None = None  # max_parallelism, parallelism, min, max, target_utilization, max_lag, autoscale
     vars: dict = field(default_factory=dict)
     environments: dict = field(default_factory=dict)
 
@@ -170,7 +171,7 @@ class Pipeline:
 
     def model(self, fn=None, *, name: str | None = None, columns: dict | None = None,
               expectations: list | None = None, allow_unbounded_state: bool = False,
-              description: str | None = None):
+              description: str | None = None, scaling: dict | None = None):
         """Decorator. The function's parameters name its inputs (sources or models); it returns SQL
         (use the parameters in an f-string) or a builder query."""
         line = _caller_line()
@@ -180,7 +181,7 @@ class Pipeline:
             params = list(inspect.signature(f).parameters)
             opts = {"columns": columns, "expectations": expectations, "description": description or
                     (inspect.getdoc(f) or None),
-                    "allow_unbounded_state": allow_unbounded_state or None}
+                    "allow_unbounded_state": allow_unbounded_state or None, "scaling": scaling}
             self._models[mname] = _ModelDef(mname, f, None, None, params, opts,
                                             line or f.__code__.co_firstlineno)
             return Relation(self, mname)
@@ -189,11 +190,12 @@ class Pipeline:
 
     def sql_model(self, name: str, sql: str | None = None, *, sql_file: str | None = None,
                   columns: dict | None = None, expectations: list | None = None,
-                  allow_unbounded_state: bool = False, description: str | None = None) -> Relation:
+                  allow_unbounded_state: bool = False, description: str | None = None,
+                  scaling: dict | None = None) -> Relation:
         """A model given as SQL text (or a .sql file) referencing tables by name."""
         self._models[name] = _ModelDef(name, None, sql, sql_file, [], {
             "columns": columns, "expectations": expectations, "description": description,
-            "allow_unbounded_state": allow_unbounded_state or None}, _caller_line())
+            "allow_unbounded_state": allow_unbounded_state or None, "scaling": scaling}, _caller_line())
         return Relation(self, name)
 
     def sink(self, name: str, from_, connection, *, mode: str = "append", primary_key=None,
@@ -216,6 +218,8 @@ class Pipeline:
             doc["defaults"] = _ld({"state_ttl": self.state_ttl}, self._line)
         if self.flink_config:
             doc["flink"] = _ld({"config": _ld(self.flink_config, self._line)}, self._line)
+        if self.scaling:
+            doc["scaling"] = _ld(self.scaling, self._line)
         if self.vars:
             doc["vars"] = _ld(self.vars, self._line)
         if self.environments:

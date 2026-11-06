@@ -50,6 +50,7 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     _check_sinks(c)
     _check_quarantine(c)
     _check_pipeline(c)
+    _check_scaling(c)
     return c
 
 
@@ -506,3 +507,71 @@ def _check_pipeline(c: Checked):
         node = p.sources.get(n) or p.models.get(n)
         d.warning("CD501", f"{'source' if n in p.sources else 'model'} '{n}' does not feed any sink", node.loc,
                   hint="it will not be part of the deployed job", node=n)
+
+
+# --- scaling ----------------------------------------------------------------------------
+
+FLINK_MAX_PARALLELISM = 32768
+SCALING_OWNED = {"pipeline.max-parallelism": "max_parallelism", "parallelism.default": "parallelism"}
+
+
+def aligned_parallelisms(max_parallelism: int, lo: int, hi: int) -> list[int]:
+    """Parallelisms in [lo, hi] that split the key groups evenly (no subtask gets an extra group)."""
+    return [x for x in range(max(lo, 1), min(hi, max_parallelism) + 1) if max_parallelism % x == 0]
+
+
+def _check_scaling(c: Checked):
+    p, d = c.pipeline, c.diagnostics
+    sc = p.scaling
+    for key, field_name in SCALING_OWNED.items():
+        if key in p.flink_config:
+            d.error("CD521", f"set '{key}' through `scaling.{field_name}`, not flink.config", p.loc,
+                    hint="the scaling block is what the autoscaler and upgrade checks read")
+    keyed = [n for n in c.order if p.relations.get(n) and p.relations[n].stateful_ops]
+    if sc is None or sc.max_parallelism is None:
+        if keyed:
+            d.warning("CD520", f"pipeline keeps keyed state ({', '.join(keyed[:3])}"
+                      f"{', ...' if len(keyed) > 3 else ''}) but does not set `scaling.max_parallelism`",
+                      sc.loc if sc else p.loc,
+                      hint="max parallelism is fixed when the job first starts and caps how far it can ever "
+                           "scale; changing it later discards keyed state. Pick a number with many divisors "
+                           "that leaves headroom, e.g. 360 or 720")
+        if sc is None:
+            return
+    if sc.max_parallelism is not None and not 1 <= sc.max_parallelism <= FLINK_MAX_PARALLELISM:
+        d.error("CD521", f"scaling.max_parallelism must be between 1 and {FLINK_MAX_PARALLELISM}", sc.loc)
+        return
+    for key in ("parallelism", "min", "max"):
+        v = getattr(sc, key)
+        if v is not None and v < 1:
+            d.error("CD521", f"scaling.{key} must be at least 1", sc.loc)
+            return
+    lo = sc.min or 1
+    hi = sc.max or sc.max_parallelism or FLINK_MAX_PARALLELISM
+    if lo > hi:
+        d.error("CD521", f"scaling.min ({lo}) is greater than scaling.max ({hi})", sc.loc)
+    if sc.max_parallelism and sc.max and sc.max > sc.max_parallelism:
+        d.error("CD521", f"scaling.max ({sc.max}) exceeds scaling.max_parallelism ({sc.max_parallelism})", sc.loc,
+                hint="an operator can never run with more subtasks than key groups")
+    if sc.parallelism is not None and not lo <= sc.parallelism <= hi:
+        d.error("CD521", f"scaling.parallelism ({sc.parallelism}) is outside [{lo}, {hi}]", sc.loc)
+    if sc.target_utilization is not None and not 0 < sc.target_utilization <= 1:
+        d.error("CD521", "scaling.target_utilization must be in (0, 1]", sc.loc)
+    if sc.max_parallelism and sc.max and sc.max - lo >= 4 and not d.has_errors:
+        aligned = aligned_parallelisms(sc.max_parallelism, lo, sc.max)
+        if len(aligned) < 3:
+            d.warning("CD522", f"scaling.max_parallelism {sc.max_parallelism} divides evenly by only "
+                      f"{len(aligned)} parallelism(s) in [{lo}, {sc.max}] ({', '.join(map(str, aligned)) or 'none'}); "
+                      "other parallelisms give some subtasks one more key group than others", sc.loc,
+                      hint="highly composite values such as 120, 360, 720 or 2520 scale evenly")
+    for m in p.models.values():
+        ms = m.scaling
+        if ms is None:
+            continue
+        if ms.min is not None and ms.max is not None and ms.min > ms.max:
+            d.error("CD521", f"model '{m.name}': scaling.min is greater than scaling.max", ms.loc, node=m.name)
+        for key in ("min", "max"):
+            v = getattr(ms, key)
+            if v is not None and not lo <= v <= hi:
+                d.error("CD521", f"model '{m.name}': scaling.{key} ({v}) is outside the pipeline's range "
+                        f"[{lo}, {hi}]", ms.loc, node=m.name)

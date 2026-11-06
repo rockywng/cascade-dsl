@@ -212,31 +212,42 @@ public final class Main {
                         new String(Files.readAllBytes(test.toPath().resolve("query.sql")), StandardCharsets.UTF_8)
                                 .trim();
                 Path capture = test.toPath().resolve("capture.txt");
-                Future<List<Object>> rows =
-                        pool.submit(
-                                () -> {
-                                    if (Files.exists(capture)) {
-                                        return runInsert(tEnv, query, capture, holder, r);
-                                    }
-                                    TableResult result = tEnv.executeSql(query);
-                                    holder[0] = result;
-                                    r.put("columns", columns(result.getResolvedSchema()));
-                                    List<Object> collected = new ArrayList<>();
-                                    try (CloseableIterator<Row> it = result.collect()) {
-                                        while (it.hasNext()) {
-                                            Row row = it.next();
-                                            Map<String, Object> enc = new LinkedHashMap<>();
-                                            enc.put("kind", row.getKind().shortString());
-                                            List<Object> values = new ArrayList<>();
-                                            for (int i = 0; i < row.getArity(); i++) {
-                                                values.add(encode(row.getField(i)));
-                                            }
-                                            enc.put("values", values);
-                                            collected.add(enc);
-                                        }
-                                    }
-                                    return collected;
-                                });
+                // plan and submit on this thread (Calcite keeps planner metadata in thread-locals);
+                // only waiting for results happens on the pool, so it can time out
+                Future<List<Object>> rows;
+                if (Files.exists(capture)) {
+                    List<String> spec = Files.readAllLines(capture, StandardCharsets.UTF_8);
+                    Path file = Paths.get(spec.get(1).trim());
+                    r.put("columns", columns(tEnv.from("`" + spec.get(0).trim() + "`").getResolvedSchema()));
+                    TableResult result =
+                            tEnv.executeSql(query.endsWith(";") ? query.substring(0, query.length() - 1) : query);
+                    holder[0] = result;
+                    rows = pool.submit(() -> {
+                        result.await();
+                        return readCapture(file);
+                    });
+                } else {
+                    TableResult result = tEnv.executeSql(query);
+                    holder[0] = result;
+                    r.put("columns", columns(result.getResolvedSchema()));
+                    rows = pool.submit(() -> {
+                        List<Object> collected = new ArrayList<>();
+                        try (CloseableIterator<Row> it = result.collect()) {
+                            while (it.hasNext()) {
+                                Row row = it.next();
+                                Map<String, Object> enc = new LinkedHashMap<>();
+                                enc.put("kind", row.getKind().shortString());
+                                List<Object> values = new ArrayList<>();
+                                for (int i = 0; i < row.getArity(); i++) {
+                                    values.add(encode(row.getField(i)));
+                                }
+                                enc.put("values", values);
+                                collected.add(enc);
+                            }
+                        }
+                        return collected;
+                    });
+                }
                 r.put("rows", rows.get(timeoutSec, TimeUnit.SECONDS));
             } catch (java.util.concurrent.TimeoutException e) {
                 r.put("error", "timed out after " + timeoutSec + "s (is a source unbounded?)");
@@ -254,17 +265,8 @@ public final class Main {
         return out;
     }
 
-    /** Sink-level test: run the INSERT to completion; the fixture sink recorded what it received. */
-    private static List<Object> runInsert(
-            TableEnvironment tEnv, String insert, Path capture, TableResult[] holder, Map<String, Object> r)
-            throws Exception {
-        List<String> spec = Files.readAllLines(capture, StandardCharsets.UTF_8);
-        String table = spec.get(0).trim();
-        Path file = Paths.get(spec.get(1).trim());
-        r.put("columns", columns(tEnv.from("`" + table + "`").getResolvedSchema()));
-        TableResult result = tEnv.executeSql(insert.endsWith(";") ? insert.substring(0, insert.length() - 1) : insert);
-        holder[0] = result;
-        result.await();
+    /** Sink-level test: what the fixture sink recorded, one change per line. */
+    private static List<Object> readCapture(Path file) throws Exception {
         List<Object> collected = new ArrayList<>();
         if (Files.exists(file)) {
             org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper mapper =

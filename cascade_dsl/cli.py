@@ -176,24 +176,34 @@ def _print_pin_report(report) -> None:
 
 def cmd_plan(args) -> int:
     from .jvm import script
-    from .plans import PlanError, compile_plan
+    from .plans import PlanError, compile_plan, operator_map_for
     home = _flink(args)
     if home is None:
         return 2
     os.makedirs(args.out, exist_ok=True)
     plan = os.path.join(args.out, "plan.json")
     try:
-        _, report, setup = compile_plan(args.path, home, plan, args.env, local=args.local_connectors,
+        r, report, setup = compile_plan(args.path, home, plan, args.env, local=args.local_connectors,
                                         previous=args.previous)
+        ops = operator_map_for(r, setup, plan, home)
     except PlanError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     with open(os.path.join(args.out, "plan-setup.sql"), "w") as f:
         f.write("-- Run before: EXECUTE PLAN 'plan.json' (plans reference these by name)\n")
         f.write(script(setup))
+    with open(os.path.join(args.out, "operators.json"), "w") as f:
+        json.dump(ops, f, indent=2)
     if report is not None:
         _print_pin_report(report)
-    print(f"wrote {args.out}/plan.json and {args.out}/plan-setup.sql", file=sys.stderr)
+    print("vertices:", file=sys.stderr)
+    for v in ops["vertices"]:
+        what = ", ".join(v["sources"] + v["models"] + v["sinks"]) or "?"
+        print(f"  {v['id'][:8]}  x{v['parallelism']:<3} {what}", file=sys.stderr)
+    if ops["fused_away"]:
+        print(f"models with no operators of their own (fused into consumers): {', '.join(ops['fused_away'])}",
+              file=sys.stderr)
+    print(f"wrote {args.out}/plan.json, plan-setup.sql and operators.json", file=sys.stderr)
     return 0
 
 

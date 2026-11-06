@@ -1,6 +1,15 @@
 package dev.cascade.tools;
 
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.runtime.OperatorIDPair;
+import org.apache.flink.runtime.jobgraph.JobEdge;
+import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobVertex;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.graph.StreamGraph;
+import org.apache.flink.table.api.internal.TableEnvironmentImpl;
+import org.apache.flink.table.delegation.Planner;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.SavepointFormatType;
@@ -45,6 +54,7 @@ import java.util.regex.Pattern;
  *   compile-plan  script.sql out.json                COMPILE PLAN for the script's statement set
  *   restore-test  oldSetup old.json newSetup new.json spDir sec out
  *                                                    run old plan, savepoint, restore new plan
+ *   job-graph     setup.sql plan.json out.json       JobGraph vertices and operators of a plan
  *
  * Compiled plans reference temporary tables/functions by name only, so executing a plan first runs
  * its setup script (SET, CREATE FUNCTION, CREATE TEMPORARY TABLE) -- the same as a deployment.
@@ -81,6 +91,10 @@ public final class Main {
                 out = restoreTest(Paths.get(args[1]), args[2], Paths.get(args[3]), args[4], args[5],
                         Integer.parseInt(args[6]));
                 outPath = args[7];
+                break;
+            case "job-graph":
+                out = jobGraph(Paths.get(args[1]), args[2]);
+                outPath = args[3];
                 break;
             default:
                 System.err.println("unknown command " + args[0]);
@@ -356,6 +370,57 @@ public final class Main {
                     }
                 }
             }
+        }
+        return out;
+    }
+
+    /**
+     * Translates a compiled plan exactly like EXECUTE PLAN does and returns the resulting JobGraph:
+     * vertices (with the IDs Flink reports in metrics and REST) and the operators chained into each.
+     */
+    private static Map<String, Object> jobGraph(Path setupScript, String planPath) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        try {
+            TableEnvironment tEnv = newEnv(null);
+            setup(tEnv, statements(setupScript));
+            Planner planner = ((TableEnvironmentImpl) tEnv).getPlanner();
+            List<Transformation<?>> transformations =
+                    planner.translatePlan(planner.loadPlan(PlanReference.fromFile(planPath)));
+            Configuration conf = new Configuration();
+            conf.addAll((Configuration) tEnv.getConfig().getConfiguration());
+            StreamExecutionEnvironment env = new StreamExecutionEnvironment(conf);
+            env.configure(tEnv.getConfig().getConfiguration());
+            StreamGraph streamGraph = env.generateStreamGraph(transformations);
+            JobGraph jobGraph = streamGraph.getJobGraph();
+            List<Object> vertices = new ArrayList<>();
+            for (JobVertex v : jobGraph.getVerticesSortedTopologicallyFromSources()) {
+                Map<String, Object> vertex = new LinkedHashMap<>();
+                vertex.put("id", v.getID().toHexString());
+                vertex.put("name", v.getName());
+                vertex.put("parallelism", v.getParallelism());
+                vertex.put("max_parallelism", v.getMaxParallelism());
+                List<Object> inputs = new ArrayList<>();
+                for (JobEdge e : v.getInputs()) {
+                    inputs.add(e.getSource().getProducer().getID().toHexString());
+                }
+                vertex.put("inputs", inputs);
+                List<Object> operators = new ArrayList<>();
+                // getOperatorIDs lists the chain from tail to head
+                List<OperatorIDPair> ids = new ArrayList<>(v.getOperatorIDs());
+                java.util.Collections.reverse(ids);
+                for (OperatorIDPair id : ids) {
+                    Map<String, Object> op = new LinkedHashMap<>();
+                    op.put("id", id.getGeneratedOperatorID().toHexString());
+                    op.put("name", id.getUserDefinedOperatorName());
+                    op.put("uid", id.getUserDefinedOperatorUid());
+                    operators.add(op);
+                }
+                vertex.put("operators", operators);
+                vertices.add(vertex);
+            }
+            out.put("vertices", vertices);
+        } catch (Throwable t) {
+            out.put("error", errorMessage(t));
         }
         return out;
     }

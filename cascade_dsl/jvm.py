@@ -150,3 +150,12 @@ class Tools:
             return self._read(out)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def job_graph(self, setup: list[Stmt], plan: str, timeout: int = 180) -> dict:
+        with tempfile.TemporaryDirectory(prefix="cascade-jobgraph-") as d:
+            path = os.path.join(d, "setup.sql")
+            with open(path, "w") as f:
+                f.write(script(setup))
+            out = os.path.join(d, "out.json")
+            self._run(["job-graph", path, os.path.abspath(plan), out], timeout)
+            return self._read(out)

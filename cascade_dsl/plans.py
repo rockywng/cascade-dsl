@@ -207,6 +207,17 @@ def compile_plan(path: str, flink_home: str, out: str, env: str | None = None, l
     return r, report, plan_setup(stmts)
 
 
+def operator_map_for(r, setup, plan_path: str, flink_home: str) -> dict:
+    """operators.json for a compiled (and possibly pinned) plan: vertex IDs -> models."""
+    from .operators import operator_map
+    graph = Tools(flink_home).job_graph(setup, plan_path)
+    if graph.get("error"):
+        raise PlanError("Flink could not build the job graph:\n" + graph["error"])
+    with open(plan_path) as f:
+        plan = json.load(f)
+    return operator_map(plan, graph, r.checked)
+
+
 def restore_test(old_path: str, new_path: str, flink_home: str, env: str | None = None,
                  pin: bool = True, seconds: int = 8) -> dict:
     """Run the old version locally, take a savepoint, and restore the new version from it.

@@ -9,7 +9,7 @@ import unittest
 from cascade_dsl import testing
 from cascade_dsl.compiler import compile_pipeline
 from cascade_dsl.jvm import TARGET, find_flink_home
-from cascade_dsl.plans import UID_KEY, compile_plan, restore_test
+from cascade_dsl.plans import UID_KEY, compile_plan, operator_map_for, restore_test
 from cascade_dsl.schemas import infer
 from cascade_dsl.verify import run_verify
 
@@ -133,6 +133,43 @@ class PlanAndRestoreTest(unittest.TestCase):
         self.assertIn("Cannot map checkpoint/savepoint state", unpinned.get("error", ""))
         pinned = restore_test(os.path.join(EXAMPLES, "orders"), self.new, FLINK, pin=True, seconds=4)
         self.assertTrue(pinned["restored"], pinned.get("error"))
+
+
+@unittest.skipUnless(READY, "set FLINK_HOME and run runtime/build.sh")
+class OperatorMapTest(unittest.TestCase):
+    def ops(self, example):
+        d = tempfile.mkdtemp(prefix="cascade-ops-")
+        plan = os.path.join(d, "plan.json")
+        r, _, setup = compile_plan(os.path.join(EXAMPLES, example), FLINK, plan, local=True, workdir=d)
+        m = operator_map_for(r, setup, plan, FLINK)
+        shutil.rmtree(d)
+        return m
+
+    def by_operator(self, m):
+        return {op["name"].split("[")[0]: op for v in m["vertices"] for op in v["operators"]
+                if not op["name"].startswith(("Calc", "Exchange", "MiniBatch", "Watermark", "Source"))}
+
+    def test_orders(self):
+        m = self.ops("orders")
+        ops = self.by_operator(m)
+        self.assertEqual(ops["TemporalJoin"]["owner"], {"kind": "model", "name": "orders_enriched"})
+        self.assertEqual(ops["GlobalWindowAggregate"]["owner"]["name"], "revenue_per_minute")
+        self.assertEqual(ops["LocalWindowAggregate"]["owner"]["name"], "revenue_per_minute")
+        self.assertEqual(ops["GlobalGroupAggregate"]["owner"]["name"], "customer_ltv")
+        # clean_orders is stateless: its filter/projection is fused into Calcs feeding the join and the LTV
+        calcs = [op for v in m["vertices"] for op in v["operators"] if op["name"].startswith("Calc")]
+        self.assertTrue(any(op["models"] == ["clean_orders"] for op in calcs))
+        for name in ("clean_orders", "orders_enriched", "revenue_per_minute", "customer_ltv"):
+            self.assertTrue(m["models"][name]["vertices"], name)
+        self.assertEqual(m["fused_away"], [])
+        self.assertEqual(m["model_scaling"], {"customer_ltv": {"min": 2, "max": None}})
+        self.assertTrue(all(v["max_parallelism"] == 720 for v in m["vertices"]))
+
+    def test_clickstream(self):
+        ops = self.by_operator(self.ops("clickstream_py"))
+        self.assertEqual(ops["Deduplicate"]["owner"]["name"], "unique_views")
+        self.assertEqual(ops["IntervalJoin"]["owner"]["name"], "attributed_purchases")
+        self.assertEqual(ops["GroupAggregate"]["owner"]["name"], "revenue_by_url")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,8 @@ class DeployTest(unittest.TestCase):
         with open(os.path.join(self.out, "Dockerfile")) as f:
             dockerfile = f.read()
         self.assertIn("ARG FLINK_SQL_CONNECTOR_KAFKA_VERSION\n", dockerfile)
+        # Iceberg ships one runtime jar per Flink minor version
+        self.assertIn("/org/apache/iceberg/iceberg-flink-runtime-2.3/", dockerfile)
         self.assertIn("COPY runtime/target/cascade-runtime.jar", dockerfile)
 
     def test_python_example_matches(self):

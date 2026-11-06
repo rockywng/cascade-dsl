@@ -192,7 +192,8 @@ register(ConnectorSpec(
     },
     source={"table": Prop("__table", required=True, doc="database.table")},
     sink={"table": Prop("__table", required=True, doc="database.table")},
-    sink_modes={"append", "upsert"}, artifact="org.apache.iceberg:iceberg-flink-runtime",
+    sink_modes={"append", "upsert"}, # Iceberg publishes one runtime jar per Flink minor version, e.g. iceberg-flink-runtime-2.0
+    artifact="org.apache.iceberg:iceberg-flink-runtime-{flink_minor}",
     finish=_iceberg_finish,
 ))
 

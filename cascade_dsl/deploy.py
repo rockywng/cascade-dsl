@@ -297,7 +297,9 @@ def dockerfile(r: Result, cfg: dict) -> str:
              "# Build from the repository root after runtime/build.sh:",
              "#   docker build -f <this file> --build-arg ... -t <image> .",
              f"FROM flink:{flink}-scala_2.12-java17", ""]
+    flink_minor = ".".join(flink.split(".")[:2])
     for coord in r.lowered.manifest["artifacts"]:
+        coord = coord.format(flink_minor=flink_minor)
         group, artifact = coord.split(":")[:2]
         arg = re.sub(r"[^A-Z0-9]", "_", artifact.upper()) + "_VERSION"
         default = versions.get(coord)

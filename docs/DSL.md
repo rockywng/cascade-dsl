@@ -1,4 +1,4 @@
-# pipedsl language reference
+# cascade-dsl language reference
 
 A pipeline is one directory with a `pipeline.yaml` and, optionally, SQL files. It has
 four kinds of nodes that share one namespace:
@@ -30,7 +30,7 @@ flink:
     table.exec.mini-batch.enabled: "true"
 vars:                             # ${var:name} substitution in connections/sources/sinks
   warehouse: s3://dev-lake
-environments:                     # pipec compile --env prod
+environments:                     # cascade compile --env prod
   prod:
     vars: {warehouse: s3://prod-lake}
 connections: {...}
@@ -48,7 +48,7 @@ Durations: `500ms`, `5s`, `10m`, `1h`, `7d`.
 - `${secret:path}` is **never resolved by the compiler**. It is passed through to the generated SQL as
   a placeholder and listed in `manifest.json → secrets`; the platform agent injects it at deploy
   time. Properties marked as secrets (`password`, `sasl_jaas_config`) must use a `${secret:...}`
-  reference or compilation fails (PD201).
+  reference or compilation fails (CD201).
 
 ## Connections
 
@@ -60,7 +60,7 @@ connections:
       bootstrap_servers: ${var:kafka_bootstrap}
 ```
 
-`pipec connectors` lists every connector, its properties (required ones marked `*`), formats and sink
+`cascade connectors` lists every connector, its properties (required ones marked `*`), formats and sink
 modes. Zero-config connectors (`datagen`, `print`, `blackhole`) can be used directly as
 `connection: print` without declaring them.
 
@@ -79,7 +79,7 @@ modes. Zero-config connectors (`datagen`, `print`, `blackhole`) can be used dire
 sources:
   orders:
     connection: events
-    topic: orders.v1            # connector-specific keys (see `pipec connectors`)
+    topic: orders.v1            # connector-specific keys (see `cascade connectors`)
     format: json
     startup: earliest
     columns:                    # required; Flink SQL types
@@ -118,14 +118,14 @@ models:
 ```
 
 - A model is exactly one `SELECT` (CTEs allowed). Reference other sources and models by bare name.
-- **Columns contract.** When given, the names must match the query output in order (PD310).
+- **Columns contract.** When given, the names must match the query output in order (CD310).
   Expressions whose type the compiler can't infer, or that differ from the contract, are wrapped in
-  `CAST` in a generated `<model>__typed` view. Time attributes are never cast (PD311).
+  `CAST` in a generated `<model>__typed` view. Time attributes are never cast (CD311).
 - **Expectations** compile into the model view:
   - `drop`: the row is filtered out (`WHERE (check) IS TRUE`, so NULL counts as a violation).
   - `quarantine`: filtered out *and* written, with `_violated_expectation` and `_quarantined_at`,
     to the pipeline's `quarantine:` destination (append-only models only).
-  - `fail`: `PIPEDSL_ASSERT(...)` from the runtime jar throws `ExpectationViolation` and fails the
+  - `fail`: `CASCADE_ASSERT(...)` from the runtime jar throws `ExpectationViolation` and fails the
     task.
 
 ## Sinks
@@ -144,7 +144,7 @@ sinks:
 
 `on_conflict` lowers to Flink's `INSERT ... ON CONFLICT DO ...` (Flink ≥ 2.3). Flink requires it
 when it can't prove that the query's upsert key equals the sink's primary key. The compiler proves
-this statically for GROUP BY keys and pass-through CDC keys and warns otherwise (PD410). `pipec
+this statically for GROUP BY keys and pass-through CDC keys and warns otherwise (CD410). `cascade
 verify` gives the planner's answer.
 
 ## Quarantine
@@ -163,26 +163,26 @@ quarantine:
 **Changelog semantics.** Every relation is classified as `append` or `updating`. Updating comes
 from CDC sources and formats, non-windowed GROUP BY, outer/regular joins, keep-last dedup and global
 aggregates. Temporal joins don't propagate the versioned side's updates. Sending an updating
-relation to an `append` sink is an error (PD407) that explains which operator causes it.
+relation to an `append` sink is an error (CD407) that explains which operator causes it.
 
 **Time attributes.** Event-time columns are tracked through models. They survive projections,
 interval joins and the probe side of temporal joins. They're lost through regular joins and
-non-windowed aggregates. A window TVF over a relation without one is an error (PD330/PD331).
+non-windowed aggregates. A window TVF over a relation without one is an error (CD330/CD331).
 
 **State.** Each model's stateful operators are classified as bounded (windows, interval/temporal
 joins) or unbounded (GROUP BY, regular joins, dedup, DISTINCT, unbounded OVER). Unbounded state
 requires `defaults.state_ttl`, a `/*+ STATE_TTL(...) */` hint, or an explicit
-`allow_unbounded_state: true` (PD350).
+`allow_unbounded_state: true` (CD350).
 
 **Types.** Sink DDL needs concrete types, so the compiler infers output types through column
 references, `*`, CTEs, subqueries, CAST, aggregates and window functions. When it can't, it asks for
-a contract (PD408) instead of guessing.
+a contract (CD408) instead of guessing.
 
 ## Upgrades
 
 `manifest.json` gives every stateful node (sources and stateful models) a `state_id`, derived from
 its normalized SQL and its input schemas. Comments, whitespace and keyword case don't affect it.
-`pipec check-upgrade old/manifest.json .` classifies a change as:
+`cascade check-upgrade old/manifest.json .` classifies a change as:
 
 | verdict | meaning | exit code |
 |---|---|---|
@@ -195,13 +195,13 @@ its normalized SQL and its input schemas. Comments, whitespace and keyword case 
 
 | Range | Area |
 |---|---|
-| PD0xx | YAML structure, unknown keys (with suggestions), vars, types |
-| PD1xx | names, sources, event time, primary keys |
-| PD2xx | connectors, properties, formats, secrets |
-| PD30x–PD32x | model SQL, references, cycles, contracts, expectations |
-| PD33x–PD34x | windows and time attributes, temporal joins |
-| PD35x | state / TTL |
-| PD4xx | sinks: changelog compatibility, keys, types, ON CONFLICT |
-| PD5xx | pipeline-level (unused nodes, no sinks) |
+| CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
+| CD1xx | names, sources, event time, primary keys |
+| CD2xx | connectors, properties, formats, secrets |
+| CD30x–CD32x | model SQL, references, cycles, contracts, expectations |
+| CD33x–CD34x | windows and time attributes, temporal joins |
+| CD35x | state / TTL |
+| CD4xx | sinks: changelog compatibility, keys, types, ON CONFLICT |
+| CD5xx | pipeline-level (unused nodes, no sinks) |
 
-`pipec validate --json` emits machine-readable diagnostics for editors and CI.
+`cascade validate --json` emits machine-readable diagnostics for editors and CI.

@@ -2,8 +2,8 @@ import json
 import os
 import unittest
 
-from pipedsl.compiler import compile_pipeline
-from pipedsl.types import TypeParseError, parse_type
+from cascade_dsl.compiler import compile_pipeline
+from cascade_dsl.types import TypeParseError, parse_type
 
 from helpers import compile_text, one_model
 
@@ -48,7 +48,7 @@ class ExampleTest(unittest.TestCase):
         sql = compile_pipeline(EXAMPLE).lowered.sql
         self.assertIn("'connector' = 'upsert-kafka'", sql)
         self.assertIn("WATERMARK FOR `order_ts` AS `order_ts` - INTERVAL '5' SECOND", sql)
-        self.assertIn("PIPEDSL_ASSERT((order_id IS NOT NULL) IS TRUE", sql)
+        self.assertIn("CASCADE_ASSERT((order_id IS NOT NULL) IS TRUE", sql)
         self.assertIn("INSERT INTO `clean_orders__quarantine`", sql)
         self.assertIn("'slot.name' = 'orders_analytics_customers'", sql)
         self.assertNotIn("${var:", sql)
@@ -61,14 +61,14 @@ class ExampleTest(unittest.TestCase):
         self.assertIn("kafka/prod/bootstrap", r.lowered.manifest["secrets"])
 
     def test_unknown_env(self):
-        self.assertIn("PD007", codes(compile_pipeline(EXAMPLE, env="staging")))
+        self.assertIn("CD007", codes(compile_pipeline(EXAMPLE, env="staging")))
 
 
 class StructureTest(unittest.TestCase):
     def test_unknown_key_suggests(self):
         r = compile_text("modles: {}\n")
         d = r.diagnostics.items[0]
-        self.assertEqual(d.code, "PD001")
+        self.assertEqual(d.code, "CD001")
         self.assertIn("models", d.hint)
         with open(d.location.file) as f:  # line numbers point into pipeline.yaml
             self.assertTrue(f.read().splitlines()[d.location.line - 1].startswith("modles"))
@@ -76,7 +76,7 @@ class StructureTest(unittest.TestCase):
     def test_undefined_var(self):
         r = compile_text("pipeline: x\nconnections:\n  k: {type: kafka, properties: {bootstrap_servers: '${var:nope}'}}\n",
                          base=False)
-        self.assertIn("PD004", codes(r))
+        self.assertIn("CD004", codes(r))
 
     def test_literal_secret_rejected(self):
         r = compile_text("""
@@ -88,7 +88,7 @@ class StructureTest(unittest.TestCase):
             sinks:
               o: {from: t, connection: print, mode: upsert, primary_key: [id]}
             """, base=False)
-        self.assertIn("PD201", codes(r))
+        self.assertIn("CD201", codes(r))
 
     def test_bad_type(self):
         r = compile_text("""
@@ -98,7 +98,7 @@ class StructureTest(unittest.TestCase):
             sinks:
               o: {from: t, connection: print}
             """, base=False)
-        self.assertIn("PD010", codes(r))
+        self.assertIn("CD010", codes(r))
 
 
 class SemanticTest(unittest.TestCase):
@@ -109,12 +109,12 @@ class SemanticTest(unittest.TestCase):
 
     def test_unknown_table_suggests(self):
         r = one_model("SELECT order_id AS k FROM ordrs", sink_mode="append")
-        d = next(x for x in r.diagnostics.items if x.code == "PD302")
+        d = next(x for x in r.diagnostics.items if x.code == "CD302")
         self.assertIn("orders", d.hint)
 
     def test_sql_error_location(self):
         r = one_model("SELECT order_id AS k\nFROM orders\nWHERE (amount > 0", sink_mode="append")
-        d = next(x for x in r.diagnostics.items if x.code == "PD300")
+        d = next(x for x in r.diagnostics.items if x.code == "CD300")
         self.assertIsNotNone(d.location.line)
 
     def test_cycle(self):
@@ -126,30 +126,30 @@ class SemanticTest(unittest.TestCase):
             sinks:
               o: {from: a, connection: print}
             """)
-        self.assertIn("PD303", codes(r))
+        self.assertIn("CD303", codes(r))
 
     def test_append_sink_rejects_updates(self):
         r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id", sink_mode="append")
-        d = next(x for x in r.diagnostics.items if x.code == "PD407")
+        d = next(x for x in r.diagnostics.items if x.code == "CD407")
         self.assertIn("GROUP BY", d.message)
 
     def test_cdc_source_is_updating(self):
         r = one_model("SELECT customer_id AS k, tier FROM customers", sink_mode="append")
-        self.assertIn("PD407", codes(r))
+        self.assertIn("CD407", codes(r))
 
     def test_unbounded_state_needs_ttl(self):
         r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id", defaults="")
-        self.assertIn("PD350", codes(r))
+        self.assertIn("CD350", codes(r))
         r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id", defaults="",
                       extra="    allow_unbounded_state: true\n")
-        self.assertNotIn("PD350", codes(r))
+        self.assertNotIn("CD350", codes(r))
 
     def test_window_needs_time_attribute(self):
         r = one_model("""
             SELECT window_start AS k, COUNT(*) AS n
             FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(customer_id), INTERVAL '1' MINUTE))
             GROUP BY window_start, window_end""", sink_mode="append")
-        self.assertIn("PD330", codes(r))
+        self.assertIn("CD330", codes(r))
 
     def test_time_attribute_lost_after_regular_join(self):
         r = compile_text("""
@@ -165,7 +165,7 @@ class SemanticTest(unittest.TestCase):
             sinks:
               o: {from: w, connection: print}
             """)
-        self.assertIn("PD331", codes(r))
+        self.assertIn("CD331", codes(r))
 
     def test_interval_join_keeps_time_and_is_append(self):
         r = compile_text("""
@@ -191,12 +191,12 @@ class SemanticTest(unittest.TestCase):
             sinks:
               o: {from: j, connection: print}
             """)
-        self.assertIn("PD340", codes(r))
+        self.assertIn("CD340", codes(r))
 
     def test_contract_mismatch(self):
         r = one_model("SELECT order_id AS k, amount FROM orders", sink_mode="append",
                       extra="    columns: {k: STRING, amt: 'DECIMAL(10, 2)'}\n")
-        self.assertIn("PD310", codes(r))
+        self.assertIn("CD310", codes(r))
 
     def test_contract_casts_unknown_types(self):
         r = one_model("SELECT order_id AS k, amount * 2 AS doubled FROM orders", sink_mode="append",
@@ -206,45 +206,45 @@ class SemanticTest(unittest.TestCase):
 
     def test_uninferable_type_needs_contract(self):
         r = one_model("SELECT order_id AS k, amount * 2 AS doubled FROM orders", sink_mode="append")
-        d = next(x for x in r.diagnostics.items if x.code == "PD408")
+        d = next(x for x in r.diagnostics.items if x.code == "CD408")
         self.assertIn("doubled", d.message)
 
     def test_expectation_unknown_column(self):
         r = one_model("SELECT order_id AS k, amount FROM orders", sink_mode="append",
                       extra="    expectations:\n      - {name: pos, check: amout > 0, on_violation: drop}\n")
-        d = next(x for x in r.diagnostics.items if x.code == "PD320")
+        d = next(x for x in r.diagnostics.items if x.code == "CD320")
         self.assertIn("amount", d.hint)
 
     def test_quarantine_needs_destination(self):
         r = one_model("SELECT order_id AS k, amount FROM orders", sink_mode="append",
                       extra="    expectations:\n      - {name: pos, check: amount > 0, on_violation: quarantine}\n")
-        self.assertIn("PD322", codes(r))
+        self.assertIn("CD322", codes(r))
 
     def test_group_key_proves_upsert_key(self):
         r = one_model("SELECT customer_id AS k, COUNT(*) AS n FROM orders GROUP BY customer_id")
-        self.assertNotIn("PD410", codes(r))
+        self.assertNotIn("CD410", codes(r))
         self.assertEqual(r.checked.pipeline.relations["m"].upsert_key, ["k"])
         r = one_model("SELECT customer_id AS k, tier FROM customers", pk="k")
-        self.assertNotIn("PD410", codes(r))  # CDC primary key passes through the rename
+        self.assertNotIn("CD410", codes(r))  # CDC primary key passes through the rename
         r = one_model("SELECT customer_id, tier AS k, COUNT(*) AS n FROM customers GROUP BY customer_id, tier")
-        self.assertIn("PD410", codes(r))
+        self.assertIn("CD410", codes(r))
 
     def test_upsert_requires_pk_in_output(self):
         r = one_model("SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id", pk="cust")
-        self.assertIn("PD406", codes(r))
+        self.assertIn("CD406", codes(r))
 
     def test_unused_source_warns(self):
         r = one_model("SELECT order_id AS k FROM orders", sink_mode="append")
         self.assertTrue(r.ok)
-        self.assertEqual(sorted(d.node for d in r.diagnostics.items if d.code == "PD501"), ["customers", "payments"])
+        self.assertEqual(sorted(d.node for d in r.diagnostics.items if d.code == "CD501"), ["customers", "payments"])
 
     def test_connector_property_validation(self):
         r = compile_text("""
             sinks:
               o: {from: orders, connection: bus, topik: x}
             """)
-        self.assertIn("PD210", codes(r))  # unknown property, with suggestion
-        self.assertIn("PD209", codes(r))  # missing topic
+        self.assertIn("CD210", codes(r))  # unknown property, with suggestion
+        self.assertIn("CD209", codes(r))  # missing topic
         self.assertTrue(any("did you mean 'topic'" in d.message for d in r.diagnostics.items))
 
     def test_star_and_cte(self):

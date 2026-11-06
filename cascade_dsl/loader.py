@@ -87,7 +87,7 @@ class _Ctx:
             if k in allowed or extra_ok:
                 continue
             close = difflib.get_close_matches(str(k), sorted(allowed), n=1)
-            self.diags.error("PD001", f"unknown key '{k}' in {what}", self.loc(d, k),
+            self.diags.error("CD001", f"unknown key '{k}' in {what}", self.loc(d, k),
                              hint=f"did you mean '{close[0]}'?" if close else
                              f"allowed keys: {', '.join(sorted(allowed))}")
 
@@ -95,13 +95,13 @@ class _Ctx:
         if value is None:
             return LDict()
         if not isinstance(value, dict):
-            self.diags.error("PD002", f"{what} must be a mapping", self.loc(parent, key))
+            self.diags.error("CD002", f"{what} must be a mapping", self.loc(parent, key))
             return LDict()
         return value
 
     def check_name(self, name, what, parent):
         if not isinstance(name, str) or not NAME_RE.match(name):
-            self.diags.error("PD003", f"invalid {what} name '{name}'", self.loc(parent, name),
+            self.diags.error("CD003", f"invalid {what} name '{name}'", self.loc(parent, name),
                              hint="names must match [a-z_][a-z0-9_]* (lowercase snake_case)")
 
 
@@ -116,15 +116,15 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
         with open(file) as f:
             doc = yaml.load(f, Loader=_Loader)
     except FileNotFoundError:
-        diags.error("PD000", f"pipeline file not found: {file}")
+        diags.error("CD000", f"pipeline file not found: {file}")
         raise CompileError(diags)
     except yaml.YAMLError as e:
         mark = getattr(e, "problem_mark", None)
-        diags.error("PD000", f"invalid YAML: {getattr(e, 'problem', e)}",
+        diags.error("CD000", f"invalid YAML: {getattr(e, 'problem', e)}",
                     Location(rel_file, mark.line + 1 if mark else None))
         raise CompileError(diags)
     if not isinstance(doc, dict):
-        diags.error("PD000", "pipeline.yaml must be a mapping at the top level", Location(rel_file))
+        diags.error("CD000", "pipeline.yaml must be a mapping at the top level", Location(rel_file))
         raise CompileError(diags)
 
     ctx.check_keys(doc, TOP_KEYS, "pipeline")
@@ -140,7 +140,7 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
                     secrets.add(name)
                     return m.group(0)
                 if name not in variables:
-                    diags.error("PD004", f"undefined variable '{name}'", ctx.loc(where_d, where_k),
+                    diags.error("CD004", f"undefined variable '{name}'", ctx.loc(where_d, where_k),
                                 hint="define it under `vars:` (or the selected environment's vars)")
                     return m.group(0)
                 return str(variables[name])
@@ -163,7 +163,7 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
 
     name = doc.get("pipeline")
     if not name:
-        diags.error("PD005", "missing required key 'pipeline' (the pipeline name)", ctx.loc(doc))
+        diags.error("CD005", "missing required key 'pipeline' (the pipeline name)", ctx.loc(doc))
         name = "unnamed"
     else:
         ctx.check_name(name, "pipeline", doc)
@@ -175,7 +175,7 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
         try:
             state_ttl_ms = parse_duration_ms(defaults["state_ttl"])
         except ValueError as e:
-            diags.error("PD006", str(e), ctx.loc(defaults, "state_ttl"))
+            diags.error("CD006", str(e), ctx.loc(defaults, "state_ttl"))
 
     flink = ctx.require_mapping(doc.get("flink"), "flink", doc, "flink")
     ctx.check_keys(flink, {"config", "version"}, "flink")
@@ -188,7 +188,7 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
         c = ctx.require_mapping(c, f"connection '{cname}'", doc["connections"], cname)
         ctx.check_keys(c, {"type", "properties"}, f"connection '{cname}'")
         if "type" not in c:
-            diags.error("PD005", f"connection '{cname}' is missing 'type'", ctx.loc(c))
+            diags.error("CD005", f"connection '{cname}' is missing 'type'", ctx.loc(c))
         props = subst(ctx.require_mapping(c.get("properties"), "properties", c, "properties"), c, "properties")
         connections[cname] = Connection(cname, str(c.get("type", "")), props, ctx.loc(c))
 
@@ -214,7 +214,7 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
     if doc.get("quarantine") is not None:
         q = subst(ctx.require_mapping(doc["quarantine"], "quarantine", doc, "quarantine"), doc, "quarantine")
         if "connection" not in q:
-            diags.error("PD005", "quarantine is missing 'connection'", ctx.loc(q))
+            diags.error("CD005", "quarantine is missing 'connection'", ctx.loc(q))
         endpoint = {k: v for k, v in q.items() if k not in ("connection", "format")}
         quarantine = Quarantine(str(q.get("connection", "")), endpoint, q.get("format"), ctx.loc(q))
 
@@ -236,7 +236,7 @@ def _resolve_vars(doc, env, ctx: _Ctx) -> dict:
     envs = ctx.require_mapping(doc.get("environments"), "environments", doc, "environments")
     if env is not None:
         if env not in envs:
-            ctx.diags.error("PD007", f"unknown environment '{env}'", ctx.loc(doc, "environments"),
+            ctx.diags.error("CD007", f"unknown environment '{env}'", ctx.loc(doc, "environments"),
                             hint=f"defined environments: {', '.join(envs) or '(none)'}")
             raise CompileError(ctx.diags)
         e = ctx.require_mapping(envs[env], f"environment '{env}'", envs, env)
@@ -250,12 +250,12 @@ def _load_columns(raw, ctx: _Ctx, parent, key, what) -> list[Column]:
     raw = ctx.require_mapping(raw, f"{what} columns", parent, key)
     for cname, ctype in raw.items():
         if not isinstance(cname, str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cname):
-            ctx.diags.error("PD003", f"invalid column name '{cname}' in {what}", ctx.loc(raw, cname))
+            ctx.diags.error("CD003", f"invalid column name '{cname}' in {what}", ctx.loc(raw, cname))
             continue
         try:
             cols.append(Column(cname, parse_type(ctype), ctx.loc(raw, cname)))
         except TypeParseError as e:
-            ctx.diags.error("PD010", f"bad type for column '{cname}' in {what}: {e}", ctx.loc(raw, cname),
+            ctx.diags.error("CD010", f"bad type for column '{cname}' in {what}: {e}", ctx.loc(raw, cname),
                             hint="use Flink SQL types, e.g. STRING, BIGINT, DECIMAL(10, 2), TIMESTAMP(3)")
     return cols
 
@@ -267,16 +267,16 @@ def _str_list(value, ctx, parent, key, what) -> list[str]:
         return [value]
     if isinstance(value, list) and all(isinstance(v, str) for v in value):
         return list(value)
-    ctx.diags.error("PD002", f"{what} must be a list of column names", ctx.loc(parent, key))
+    ctx.diags.error("CD002", f"{what} must be a list of column names", ctx.loc(parent, key))
     return []
 
 
 def _load_source(name, s, ctx: _Ctx) -> Source:
     what = f"source '{name}'"
     if "connection" not in s:
-        ctx.diags.error("PD005", f"{what} is missing 'connection'", ctx.loc(s))
+        ctx.diags.error("CD005", f"{what} is missing 'connection'", ctx.loc(s))
     if "columns" not in s:
-        ctx.diags.error("PD005", f"{what} is missing 'columns'", ctx.loc(s),
+        ctx.diags.error("CD005", f"{what} is missing 'columns'", ctx.loc(s),
                         hint="sources must declare their schema; it becomes the table DDL")
     event_time = None
     et = s.get("event_time")
@@ -290,7 +290,7 @@ def _load_source(name, s, ctx: _Ctx) -> Source:
         try:
             delay = parse_duration_ms(et.get("max_out_of_orderness", "0s"))
         except ValueError as e:
-            ctx.diags.error("PD006", str(e), ctx.loc(et, "max_out_of_orderness"))
+            ctx.diags.error("CD006", str(e), ctx.loc(et, "max_out_of_orderness"))
             delay = 0
         event_time = EventTime(str(et.get("column", "")), delay, ctx.loc(et))
     endpoint = {k: v for k, v in s.items() if k not in SOURCE_COMMON}
@@ -310,7 +310,7 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
     ctx.check_keys(m, MODEL_KEYS, what)
     sql, sql_loc = "", None
     if ("sql" in m) == ("sql_file" in m):
-        ctx.diags.error("PD011", f"{what} must have exactly one of 'sql' or 'sql_file'", ctx.loc(m))
+        ctx.diags.error("CD011", f"{what} must have exactly one of 'sql' or 'sql_file'", ctx.loc(m))
     elif "sql" in m:
         sql = str(m["sql"])
         # block scalars start on the line after the key
@@ -322,12 +322,12 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
                 sql = f.read()
             sql_loc = Location(os.path.relpath(path), 1)
         except OSError:
-            ctx.diags.error("PD012", f"{what}: cannot read sql_file '{m['sql_file']}'", ctx.loc(m, "sql_file"))
+            ctx.diags.error("CD012", f"{what}: cannot read sql_file '{m['sql_file']}'", ctx.loc(m, "sql_file"))
 
     expectations = []
     raw_exp = m.get("expectations") or []
     if not isinstance(raw_exp, list):
-        ctx.diags.error("PD002", f"{what}.expectations must be a list", ctx.loc(m, "expectations"))
+        ctx.diags.error("CD002", f"{what}.expectations must be a list", ctx.loc(m, "expectations"))
         raw_exp = []
     seen = set()
     for e in raw_exp:
@@ -336,14 +336,14 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
         ename, check = e.get("name"), e.get("check")
         action = e.get("on_violation", "fail")
         if not ename or not check:
-            ctx.diags.error("PD005", "expectations need 'name' and 'check'", ctx.loc(e))
+            ctx.diags.error("CD005", "expectations need 'name' and 'check'", ctx.loc(e))
             continue
         ctx.check_name(ename, "expectation", e)
         if ename in seen:
-            ctx.diags.error("PD013", f"duplicate expectation '{ename}' in {what}", ctx.loc(e))
+            ctx.diags.error("CD013", f"duplicate expectation '{ename}' in {what}", ctx.loc(e))
         seen.add(ename)
         if action not in ("drop", "fail", "quarantine"):
-            ctx.diags.error("PD014", f"on_violation must be drop, fail or quarantine (got '{action}')",
+            ctx.diags.error("CD014", f"on_violation must be drop, fail or quarantine (got '{action}')",
                             ctx.loc(e, "on_violation"))
             continue
         expectations.append(Expectation(ename, str(check), action, ctx.loc(e)))
@@ -361,14 +361,14 @@ def _load_sink(name, k, ctx: _Ctx) -> Sink:
     what = f"sink '{name}'"
     for req in ("from", "connection"):
         if req not in k:
-            ctx.diags.error("PD005", f"{what} is missing '{req}'", ctx.loc(k))
+            ctx.diags.error("CD005", f"{what} is missing '{req}'", ctx.loc(k))
     mode = k.get("mode", "append")
     if mode not in ("append", "upsert"):
-        ctx.diags.error("PD014", f"{what}: mode must be 'append' or 'upsert' (got '{mode}')", ctx.loc(k, "mode"))
+        ctx.diags.error("CD014", f"{what}: mode must be 'append' or 'upsert' (got '{mode}')", ctx.loc(k, "mode"))
         mode = "append"
     on_conflict = k.get("on_conflict")
     if on_conflict is not None and on_conflict not in ("error", "nothing", "deduplicate"):
-        ctx.diags.error("PD014", f"{what}: on_conflict must be error, nothing or deduplicate (got '{on_conflict}')",
+        ctx.diags.error("CD014", f"{what}: on_conflict must be error, nothing or deduplicate (got '{on_conflict}')",
                         ctx.loc(k, "on_conflict"))
         on_conflict = None
     endpoint = {kk: v for kk, v in k.items() if kk not in SINK_COMMON}

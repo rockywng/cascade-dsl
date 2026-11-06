@@ -1,10 +1,10 @@
-package dev.pipedsl.runtime;
+package dev.cascade.runtime;
 
 import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.ScalarFunction;
 
 /**
- * Backs {@code on_violation: fail} expectations: PIPEDSL_ASSERT(condition, description).
+ * Backs {@code on_violation: fail} expectations: CASCADE_ASSERT(condition, description).
  *
  * <p>Returns TRUE when the condition holds and throws otherwise, which fails the task and lets
  * the job's restart strategy / alerting take over. Non-deterministic so the planner never

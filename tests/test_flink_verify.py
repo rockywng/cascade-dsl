@@ -2,8 +2,8 @@
 import os
 import unittest
 
-from pipedsl.compiler import compile_pipeline
-from pipedsl.verify import find_flink_home, run_verify
+from cascade_dsl.compiler import compile_pipeline
+from cascade_dsl.verify import find_flink_home, run_verify
 
 from helpers import compile_text, one_model
 
@@ -11,7 +11,7 @@ FLINK = find_flink_home()
 EXAMPLE = os.path.join(os.path.dirname(__file__), "..", "examples", "orders")
 
 # (name, sql, expected static changelog); updating cases whose key the compiler cannot prove
-# to equal the sink key are written with `on_conflict: error` (see PD410)
+# to equal the sink key are written with `on_conflict: error` (see CD410)
 CASES = [
     ("projection", "SELECT order_id AS k, amount FROM orders", "append"),
     ("running_agg", "SELECT customer_id AS k, SUM(amount) AS s FROM orders GROUP BY customer_id", "updating"),
@@ -58,7 +58,7 @@ class FlinkVerifyTest(unittest.TestCase):
         for name, sql, expected in CASES:
             with self.subTest(case=name):
                 r = one_model(sql, sink_mode="upsert")
-                if "PD410" in r.diagnostics.codes():
+                if "CD410" in r.diagnostics.codes():
                     r = one_model(sql, sink_mode="upsert", on_conflict="error")
                 self.assertTrue(r.lowered is not None, [d.format() for d in r.diagnostics.items])
                 static = r.checked.pipeline.relations["m"].changelog
@@ -74,7 +74,7 @@ class FlinkVerifyTest(unittest.TestCase):
     def test_on_conflict_required_by_planner(self):
         sql = "SELECT o.order_id AS k, p.paid FROM orders o LEFT JOIN payments p ON o.order_id = p.order_id"
         r = one_model(sql)
-        self.assertIn("PD410", r.diagnostics.codes())
+        self.assertIn("CD410", r.diagnostics.codes())
         v = run_verify(r.checked, r.lowered.sql, FLINK)
         self.assertIn("ON CONFLICT", v.error)
         r = one_model(sql, on_conflict="error")
@@ -96,7 +96,7 @@ class FlinkVerifyTest(unittest.TestCase):
             sinks:
               out: {from: m, connection: print}
             """)
-        self.assertIn("PD407", r.diagnostics.codes())
+        self.assertIn("CD407", r.diagnostics.codes())
 
 
 if __name__ == "__main__":

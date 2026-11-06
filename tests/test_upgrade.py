@@ -4,15 +4,15 @@ import shutil
 import tempfile
 import unittest
 
-from pipedsl.compiler import compile_pipeline
-from pipedsl.upgrade import diff_manifests
+from cascade_dsl.compiler import compile_pipeline
+from cascade_dsl.upgrade import diff_manifests
 
 EXAMPLE = os.path.join(os.path.dirname(__file__), "..", "examples", "orders")
 
 
 class UpgradeTest(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="pipedsl-upgrade-")
+        self.dir = tempfile.mkdtemp(prefix="cascade-upgrade-")
         shutil.copytree(EXAMPLE, self.dir, dirs_exist_ok=True)
         self.old = self._manifest()
 

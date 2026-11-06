@@ -2,7 +2,7 @@ import os
 import tempfile
 import textwrap
 
-from pipedsl.compiler import compile_pipeline
+from cascade_dsl.compiler import compile_pipeline
 
 BASE = """
 pipeline: test_pipe
@@ -50,7 +50,7 @@ sources:
 
 def project(yaml_text: str, files: dict | None = None, base: bool = True) -> str:
     """Write a temp project; `yaml_text` is appended to BASE unless base=False."""
-    d = tempfile.mkdtemp(prefix="pipedsl-test-")
+    d = tempfile.mkdtemp(prefix="cascade-test-")
     body = (BASE if base else "") + textwrap.dedent(yaml_text)
     with open(os.path.join(d, "pipeline.yaml"), "w") as f:
         f.write(body)

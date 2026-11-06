@@ -1,6 +1,6 @@
-# pipedsl
+# cascade-dsl
 
-A declarative pipeline DSL for Flink. You write YAML plus plain SQL `SELECT`s; `pipec` checks
+A declarative pipeline DSL for Flink. You write YAML plus plain SQL `SELECT`s; `cascade` checks
 the semantics that usually only surface in production (changelog modes, time attributes, unbounded
 state, key/upsert mismatches, savepoint compatibility). It then compiles the pipeline to a single
 Flink SQL job and a deployment manifest.
@@ -14,26 +14,27 @@ pipeline.yaml + models/*.sql
         ▼
 target/pipeline.sql   target/manifest.json (graph, schemas, state ids, secrets, artifacts)
         │
-        ├─ pipec verify         plan with the real Flink planner, cross-check static analysis
-        └─ pipec check-upgrade  savepoint compatibility vs. the running version
+        ├─ cascade verify         plan with the real Flink planner, cross-check static analysis
+        └─ cascade check-upgrade  savepoint compatibility vs. the running version
 ```
 
 Language reference: [docs/DSL.md](docs/DSL.md).
 
 ## Quick start
 
-Requires Python ≥ 3.10 and PyYAML.
+Requires Python ≥ 3.10 and PyYAML. `pip install -e .` installs the `cascade` command; the
+examples below use `python3 -m cascade_dsl`, which works without installing.
 
 ```bash
-python3 -m pipedsl validate examples/orders
+python3 -m cascade_dsl validate examples/orders
 ```
 
 ```bash
-python3 -m pipedsl compile examples/orders --env prod -o target
+python3 -m cascade_dsl compile examples/orders --env prod -o target
 ```
 
 ```bash
-python3 -m pipedsl graph examples/orders
+python3 -m cascade_dsl graph examples/orders
 ```
 
 Plan the generated SQL with a local Flink distribution. No cluster or connector jars are
@@ -45,13 +46,13 @@ FLINK_HOME=~/code/flink/build-target runtime/build.sh
 ```
 
 ```bash
-python3 -m pipedsl verify examples/orders --flink-home ~/code/flink/build-target
+python3 -m cascade_dsl verify examples/orders --flink-home ~/code/flink/build-target
 ```
 
 Check whether a change can restore from the running version's savepoint:
 
 ```bash
-python3 -m pipedsl check-upgrade deployed/manifest.json examples/orders
+python3 -m cascade_dsl check-upgrade deployed/manifest.json examples/orders
 ```
 
 ## Example
@@ -73,7 +74,7 @@ sinks:
 ```
 
 ```
-pipeline.yaml:120: error[PD407]: sink 'ltv_to_lake' is append-only but 'customer_ltv' produces
+pipeline.yaml:120: error[CD407]: sink 'ltv_to_lake' is append-only but 'customer_ltv' produces
 updates (non-windowed GROUP BY keeps one entry per key forever)
     hint: use `mode: upsert` with a primary_key, or make the query append-only (e.g. a window
     aggregation instead of a running GROUP BY)
@@ -93,14 +94,14 @@ inner/outer/interval/temporal joins, CDC, dedup and OVER.
 
 | Path | |
 |---|---|
-| `pipedsl/loader.py` | YAML → IR, structure validation, vars/env/secrets |
-| `pipedsl/sqlscan.py` | SQL tokenizer and static analysis (refs, stateful ops, inference) |
-| `pipedsl/analyze.py` | semantic checks and relation facts |
-| `pipedsl/connectors.py` | declarative connector catalog |
-| `pipedsl/lower.py` | Flink SQL + manifest generation |
-| `pipedsl/verify.py` | Flink planner cross-check |
-| `pipedsl/upgrade.py` | savepoint compatibility diff |
-| `runtime/` | Java UDFs used by generated SQL (`PIPEDSL_ASSERT`) |
+| `cascade_dsl/loader.py` | YAML → IR, structure validation, vars/env/secrets |
+| `cascade_dsl/sqlscan.py` | SQL tokenizer and static analysis (refs, stateful ops, inference) |
+| `cascade_dsl/analyze.py` | semantic checks and relation facts |
+| `cascade_dsl/connectors.py` | declarative connector catalog |
+| `cascade_dsl/lower.py` | Flink SQL + manifest generation |
+| `cascade_dsl/verify.py` | Flink planner cross-check |
+| `cascade_dsl/upgrade.py` | savepoint compatibility diff |
+| `runtime/` | Java UDFs used by generated SQL (`CASCADE_ASSERT`) |
 
 ## Known limits / next steps
 

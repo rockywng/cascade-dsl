@@ -67,13 +67,13 @@ def _kafka_finish(role, mode, fmt, opts, ctx: LowerCtx):
         opts["value.format"] = fmt or "json"
         opts.pop("sink.delivery-guarantee", None)
         if fmt in CDC_FORMATS:
-            problems.append(("PD214", f"format '{fmt}' cannot be used with upsert mode"))
+            problems.append(("CD214", f"format '{fmt}' cannot be used with upsert mode"))
     if role == "source":
         opts.setdefault("properties.group.id", f"{ctx.pipeline}.{ctx.node}")
     registry = opts.pop("__schema_registry_url", None)
     if fmt in ("avro-confluent", "debezium-avro-confluent"):
         if not registry:
-            problems.append(("PD213", f"format '{fmt}' needs connection property 'schema_registry_url'"))
+            problems.append(("CD213", f"format '{fmt}' needs connection property 'schema_registry_url'"))
         elif role == "sink" and mode == "upsert":
             opts[f"key.{fmt}.url"] = registry
             opts[f"value.{fmt}.url"] = registry
@@ -89,7 +89,7 @@ def _db_table_finish(db_key, table_key):
             return []
         parts = str(full).split(".")
         if len(parts) != 2:
-            return [("PD212", f"table must be '<{db_key.split('-')[0]}>.<table>' (got '{full}')")]
+            return [("CD212", f"table must be '<{db_key.split('-')[0]}>.<table>' (got '{full}')")]
         opts[db_key], opts[table_key] = parts
         return []
     return finish
@@ -243,17 +243,17 @@ def build_options(spec: ConnectorSpec, role: str, connection_props: dict, endpoi
             if key not in schema:
                 import difflib
                 close = difflib.get_close_matches(key, list(schema), n=1)
-                problems.append(("PD210", f"unknown {where} property '{key}' for connector '{spec.type}'"
+                problems.append(("CD210", f"unknown {where} property '{key}' for connector '{spec.type}'"
                                  + (f" (did you mean '{close[0]}'?)" if close else
                                     f"; supported: {', '.join(schema) or '(none)'}"), key))
                 continue
             p = schema[key]
             if p.secret and not SECRET_RE.match(str(value)):
-                problems.append(("PD201", f"'{key}' is a secret and must be a ${{secret:...}} reference, "
+                problems.append(("CD201", f"'{key}' is a secret and must be a ${{secret:...}} reference, "
                                  "not a literal value", key))
             if p.values is not None:
                 if str(value) not in p.values:
-                    problems.append(("PD211", f"invalid value '{value}' for '{key}'; expected one of "
+                    problems.append(("CD211", f"invalid value '{value}' for '{key}'; expected one of "
                                      + ", ".join(p.values), key))
                     continue
                 value = p.values[str(value)]
@@ -263,7 +263,7 @@ def build_options(spec: ConnectorSpec, role: str, connection_props: dict, endpoi
             if key in values:
                 continue
             if p.required:
-                problems.append(("PD209", f"missing required {where} property '{key}' for connector "
+                problems.append(("CD209", f"missing required {where} property '{key}' for connector "
                                  f"'{spec.type}'" + (f" ({p.doc})" if p.doc else ""), None))
             elif p.default is not None and p.flink_key:
                 opts[p.flink_key] = p.values[p.default] if p.values else p.default
@@ -274,11 +274,11 @@ def build_options(spec: ConnectorSpec, role: str, connection_props: dict, endpoi
     if spec.formats is not None:
         f = fmt or spec.default_format
         if f not in spec.formats:
-            problems.append(("PD212", f"format '{f}' is not supported by connector '{spec.type}'; "
+            problems.append(("CD212", f"format '{f}' is not supported by connector '{spec.type}'; "
                              f"supported: {', '.join(sorted(spec.formats))}", "format"))
         opts["format"] = f
     elif fmt:
-        problems.append(("PD212", f"connector '{spec.type}' does not take a 'format'", "format"))
+        problems.append(("CD212", f"connector '{spec.type}' does not take a 'format'", "format"))
 
     if spec.finish:
         for code, msg in spec.finish(role, mode, opts.get("format", fmt), opts, ctx):

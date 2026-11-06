@@ -1,4 +1,4 @@
-"""pipec — the pipedsl compiler CLI."""
+"""cascade — the cascade-dsl compiler CLI."""
 from __future__ import annotations
 
 import argparse
@@ -129,8 +129,8 @@ def cmd_connectors(args) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="pipec", description="Compile pipedsl pipelines to Flink SQL")
-    ap.add_argument("--version", action="version", version=f"pipec {__version__}")
+    ap = argparse.ArgumentParser(prog="cascade", description="Compile cascade-dsl pipelines to Flink SQL")
+    ap.add_argument("--version", action="version", version=f"cascade {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp):

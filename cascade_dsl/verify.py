@@ -70,18 +70,18 @@ def localize(sql: str, c: Checked, tmpdir: str) -> str:
     if not _runtime_jar():
         # no runtime jar built: plan with an equivalent filter instead of the assertion UDF
         out = re.sub(r"^CREATE TEMPORARY SYSTEM FUNCTION .*$", "", out, flags=re.MULTILINE)
-        out = re.sub(r"PIPEDSL_ASSERT\((.*?) IS TRUE, '(?:[^']|'')*'\)", r"\1 IS TRUE", out)
+        out = re.sub(r"CASCADE_ASSERT\((.*?) IS TRUE, '(?:[^']|'')*'\)", r"\1 IS TRUE", out)
     return out
 
 
 def _runtime_jar() -> str | None:
     jar = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "target",
-                       "pipedsl-runtime.jar")
+                       "cascade-runtime.jar")
     return jar if os.path.exists(jar) else None
 
 
 def run_verify(c: Checked, sql: str, flink_home: str, timeout: int = 180) -> VerifyResult:
-    with tempfile.TemporaryDirectory(prefix="pipec-verify-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="cascade-verify-") as tmp:
         script = os.path.join(tmp, "verify.sql")
         local_sql = localize(sql, c, tmp)
         with open(script, "w") as f:

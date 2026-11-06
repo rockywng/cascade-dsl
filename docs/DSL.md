@@ -25,6 +25,8 @@ description: ...
 owner: data-eng
 defaults:
   state_ttl: 30d                  # table.exec.state.ttl; see "State" below
+scaling:                          # parallelism and autoscaler bounds; see "Scaling" below
+  max_parallelism: 720
 flink:
   config:                         # passthrough SET statements
     table.exec.mini-batch.enabled: "true"
@@ -38,6 +40,8 @@ sources: {...}
 models: {...}
 sinks: {...}
 quarantine: {...}
+functions: {...}                  # user-defined functions; see "Functions" below
+deploy: {...}                     # Kubernetes deployment; see "Deployment" below
 ```
 
 Durations: `500ms`, `5s`, `10m`, `1h`, `7d`.
@@ -162,6 +166,90 @@ quarantine:
 
 ---
 
+## Functions
+
+User-defined scalar functions are declared once and then called by name in any model's SQL.
+
+```yaml
+functions:
+  mask_email:
+    language: java
+    class: com.acme.udf.MaskEmail     # a ScalarFunction
+    jar: udfs/acme-udfs.jar           # optional: relative to the project; otherwise on the image classpath
+    returns: STRING                   # optional for Java: lets the compiler type the column
+  churn_risk:
+    language: python
+    file: udfs/scoring.py             # a plain module in the project
+    function: churn_risk              # default: the key
+    returns: DOUBLE                   # required for Python
+    deterministic: true               # default
+```
+
+- **Java** lowers to `CREATE TEMPORARY SYSTEM FUNCTION ... LANGUAGE JAVA [USING JAR '...']`. A jar
+  that doesn't exist yet is a warning (CD164); build it before `test`, `verify` or `deploy`.
+- **Python** functions are plain Python: no PyFlink imports, so they can be unit-tested anywhere.
+  The compiler writes `.cascade/python/` with a copy of each module and a generated shim,
+  `cascade_udfs.py`, which wraps each function with PyFlink's `udf(...)` and the declared result
+  type. Modules must be single files; two modules with the same name are an error (CD163). The
+  compiler parses (never imports) each module to check that the function exists (CD161).
+- **Typing.** Declared `returns` types flow into schema inference, so sinks fed by UDF columns
+  don't need a contract. `cascade infer` gets exact types either way.
+- **Local runs** (`test`, `verify`, `infer`, `plan`) add Flink's `opt/flink-python` jar to the
+  classpath and run Python workers with `$CASCADE_PYTHON`, or the current interpreter if it has
+  `apache-flink` installed. The PyFlink version should match the Flink distribution.
+- **Built-in names.** A function that shadows a Flink built-in such as `upper` is a warning (CD162).
+
+In Python: `mask = p.java_function("mask_email", "com.acme.udf.MaskEmail", jar=..., returns="STRING")`
+and `churn = p.python_function(scoring.churn_risk, returns="DOUBLE")`. The handles render calls,
+for example `churn("days_inactive", "orders_90d")`, for f-strings and builder expressions. See
+[`examples/udfs`](../examples/udfs) and [`examples/udfs_py`](../examples/udfs_py).
+
+## Scaling
+
+```yaml
+scaling:
+  max_parallelism: 720      # pipeline.max-parallelism: number of key groups
+  parallelism: 2            # initial parallelism (parallelism.default)
+  min: 1                    # autoscaler bounds per operator
+  max: 48
+  target_utilization: 0.7   # busy-time fraction the autoscaler aims for
+  max_lag: 1m               # SLO: source lag to stay below
+  autoscale: true           # default
+models:
+  customer_ltv:
+    scaling: {min: 2}       # per-model bounds, within the pipeline's
+```
+
+**Max parallelism** is fixed when a job first starts with keyed state, and it caps how far the
+job can ever scale. Changing it later discards that state. So:
+- A pipeline with keyed state and no `max_parallelism` gets a warning (CD520).
+- Choose a value with many divisors, so that more parallelisms split the key groups evenly. With
+  few even splits in `[min, max]`, you get a warning (CD522).
+- `check-upgrade` reports a changed value as breaking (`MAX_PARALLELISM_CHANGED`). Pinning it for
+  the first time is a warning showing the value the running job most likely derived.
+
+The parallelism settings must come from `scaling`, not `flink.config` (CD521), so the autoscaler
+and the upgrade checks see them. The manifest's `scaling` section lists them, the per-model
+bounds, and `aligned_parallelisms` (the parallelisms that split key groups evenly).
+
+### Which operators belong to which model
+
+Flink inlines views, so a running job has no notion of "model". `cascade plan` therefore also
+writes `operators.json`. It holds the JobGraph built exactly the way `EXECUTE PLAN` builds it:
+- **Vertices** with the IDs used by Flink metrics and the REST API.
+- **Operators** of each vertex, each attributed to a source, model or sink.
+- **Per-model lists** of exec nodes, operators and vertices.
+
+The attribution works in three steps:
+1. Scans and sinks name their tables.
+2. Each model's stateful operators (aggregates, joins, dedup, ...) are matched to plan nodes of a
+   compatible type that read the same sources and feed the same sinks.
+3. Stateless operators (Calc, Exchange, local pre-aggregation) go to the stateless models fused
+   into them, or otherwise to the neighbouring model.
+
+Because of operator chaining, one vertex can run several models, and `vertices[].models` lists
+them. Models that have no operator of their own are listed under `fused_away`.
+
 ## What the compiler checks
 
 **Changelog semantics.** Every relation is classified as `append` or `updating`. Updating comes
@@ -234,6 +322,8 @@ p.sink("revenue_out", revenue, bus, topic="revenue")
   `max_`, `avg`, `lit`, `interval`. Generated aliases are backtick-quoted, because names like
   `views` are reserved words. Subquery aliases are deterministic (`q1`, `q2`, ...), so rebuilding
   never changes a model's state identity.
+- **Settings.** `Pipeline(..., scaling={...}, deploy={...})` and `@p.model(scaling={...})` take the
+  same keys as YAML. For functions, see "Functions".
 - **Errors.** Diagnostics point at `pipeline.py` lines. An exception while building a model is
   reported as CD304 rather than a traceback.
 - **In-process use.** `p.compile()` and `p.validate()` work in a notebook.
@@ -245,7 +335,7 @@ Test files are `tests/*.yaml` in the project. They work for YAML and Python proj
 ```yaml
 tests:
   - name: ltv_sums_amounts_per_customer
-    target: customer_ltv            # a model, or <model>.quarantined
+    target: customer_ltv            # a model, <model>.quarantined, or a sink
     given:                          # rows per source; unlisted sources are empty
       orders:
         - {order_id: o1, customer_id: c1, amount: 10.00, order_ts: "2026-01-01 10:00:00"}
@@ -257,15 +347,29 @@ tests:
       # empty: true                 # no rows
       # error: positive_amount      # the job must fail, mentioning this text
     ordered: false                  # default: multiset comparison
+    watermarks: per_row             # per_row (default) | manual | end_of_input
 ```
 
-`cascade test PATH [-k substring]` runs each test in a fresh local Flink (embedded MiniCluster)
-with the sources replaced by bounded files:
-- **Event time.** It advances to the end of input, so every window fires.
+`cascade test PATH [-k substring]` runs each test in a fresh local Flink (embedded MiniCluster).
+Sources are replaced by the tools jar's `cascade-fixture` connector, which replays the given rows
+in order:
+- **Watermarks are deterministic.** With `watermarks: per_row` (the default), each event-time
+  source emits its declared strategy (`max event time - max_out_of_orderness`) after every row.
+  Rows older than that are late, exactly as in production. A `{_watermark: "2026-01-01 10:05:00"}`
+  row emits a watermark explicitly. With `watermarks: manual`, explicit ones are the only ones.
+  `end_of_input` emits none until the end. At the end of input, event time jumps to +∞ and every
+  window fires. Interleaving *between* sources isn't controlled, so cross-source lateness, for
+  example in an interval join, can vary.
+- **Sinks as targets.** `target: <sink>` runs the real `INSERT`, including the sink's upsert
+  materialization and `ON CONFLICT` policy, into a capture table. For upsert sinks, the comparison
+  is with the final table by primary key, which is what the external system would hold. For
+  append sinks, it's every row received.
+- **Lookup joins.** A source used in `FOR SYSTEM_TIME AS OF proc_time` (e.g. a JDBC table) is
+  served from its fixture rows.
 - **Updating models.** These are compared by their final state: the produced changelog
   (`+I/-U/+U/-D`) is applied first.
 - **Values.** They're compared by Flink column type: decimals numerically, timestamps parsed, and
-  so on.
+  so on. Timestamps without an offset are UTC.
 - **Failures.** A failing test prints the missing and unexpected rows and points at the test's
   file and line.
 
@@ -294,6 +398,46 @@ compiler warns (CD361). Compilation itself never needs a JVM.
   `ignore-unclaimed-state=false`. It reports whether every piece of state mapped, and which
   operators start empty.
 
+## Deployment
+
+```yaml
+deploy:
+  image: ghcr.io/acme/cascade-orders:${var:image_tag}   # vars resolve per environment
+  namespace: data-pipelines
+  service_account: flink                                # default
+  flink_version: 2.3.0                                  # default; base image and operator version
+  jobmanager: {memory: 2g, cpu: 1}
+  taskmanager: {memory: 4g, cpu: 2, slots: 2}
+  checkpoints: {interval: 30s, dir: s3://state/checkpoints, mode: exactly_once}
+  savepoints: s3://state/savepoints
+  upgrade_mode: savepoint                               # savepoint | last-state | stateless
+  secrets: orders-secrets                               # Kubernetes Secret name (default <name>-secrets)
+  artifacts: {org.apache.flink:flink-sql-connector-kafka: <version>}   # connector versions for the image
+  jars: [libs/extra.jar]                                # more jars for /opt/flink/usrlib
+  flink_config: {}                                      # extra flinkConfiguration entries
+  labels: {team: data-eng}
+```
+
+`cascade deploy PATH --env prod -o deploy/ [--plan-dir out/] [--image IMG]` writes resources for
+the Flink Kubernetes Operator:
+
+| File | |
+|---|---|
+| `flinkdeployment.yaml` | `FlinkDeployment` that runs `dev.cascade.runner.SqlRunner` from the runtime jar. It carries the resources and checkpointing, and maps `scaling` to the operator autoscaler (`job.autoscaler.*`). The `max_lag` SLO and per-model bounds go in annotations for the platform's own autoscaler. |
+| `configmap.yaml` | The job: `setup.sql` plus `plan.json` with `--plan-dir`, whose operator UIDs are pinned and survive upgrades; otherwise `statements.sql`, planned at startup |
+| `python-configmap.yaml` | The Python UDF modules and shim, when there are any |
+| `secret.template.yaml` | The Secret the job expects: keys listed, values empty, never filled in by cascade |
+| `kustomization.yaml` | `kubectl apply -k`, or for GitOps |
+| `Dockerfile` | Runtime image: `flink:<version>`, the connector jars the manifest lists (one `ARG` per version), `cascade-runtime.jar`, UDF jars, and PyFlink when needed |
+| `operators.json` | Copied from `--plan-dir`: vertex → model mapping |
+
+**Secrets.** A secret `${secret:kafka/prod/bootstrap}` stays a placeholder everywhere on disk. The
+pod gets the env var `CASCADE_SECRET_KAFKA_PROD_BOOTSTRAP` from key `kafka.prod.bootstrap` of the
+Secret. At startup the runner substitutes the value into the SQL, escaped for a string literal,
+and fails listing every missing secret. Secrets aren't allowed in `deploy:` settings (CD530),
+since only the job's SQL is substituted. `SqlRunner ... --validate` plans the job without
+submitting it.
+
 ## Schema import
 
 `cascade import-schema --registry URL --subject SUBJECT [--version N] [--source NAME]` (or
@@ -306,13 +450,15 @@ It's a reviewable, explicit step, so compilation never depends on the registry.
 | Range | Area |
 |---|---|
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
-| CD1xx | names, sources, event time, primary keys |
+| CD1xx | names, sources, event time, primary keys; functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
 | CD2xx | connectors, properties, formats, secrets |
 | CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |
 | CD35x | state / TTL |
 | CD36x | schema lock (CD360 used, CD361 stale, CD362 Flink could not resolve a model) |
-| CD4xx | sinks: changelog compatibility, keys, types, ON CONFLICT |
-| CD5xx | pipeline-level (unused nodes, no sinks) |
+| CD4xx | sinks: changelog compatibility, keys, types, ON CONFLICT (CD412: DO ERROR / DO NOTHING need event time on every scanned source) |
+| CD50x | pipeline-level (unused nodes, no sinks) |
+| CD52x | scaling (CD520 no max parallelism with keyed state, CD521 invalid bounds, CD522 uneven key groups) |
+| CD53x | deployment (CD530 secret in deploy settings) |
 
 `cascade validate --json` emits machine-readable diagnostics for editors and CI.

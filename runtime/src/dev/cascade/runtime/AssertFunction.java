@@ -4,24 +4,30 @@ import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.ScalarFunction;
 
 /**
- * Backs {@code on_violation: fail} expectations: CASCADE_ASSERT(condition, description).
+ * Backs {@code on_violation: fail} expectations:
+ * CASCADE_ASSERT(condition, model, expectation, check).
  *
- * <p>Returns TRUE when the condition holds and throws otherwise, which fails the task and lets
- * the job's restart strategy / alerting take over. Non-deterministic so the planner never
+ * <p>Returns TRUE when the condition holds; otherwise counts the violation and throws, which fails
+ * the task so the restart strategy and alerting take over. Non-deterministic so the planner never
  * constant-folds or reorders it away.
  */
 public class AssertFunction extends ScalarFunction {
 
-    private transient String operator;
+    private transient ExpectationMetrics metrics;
+    private transient String pipeline;
 
     @Override
     public void open(FunctionContext context) {
-        operator = context.getJobParameter("pipeline.name", "pipeline");
+        metrics = new ExpectationMetrics(context.getMetricGroup());
+        pipeline = context.getJobParameter("pipeline.name", "pipeline");
     }
 
-    public Boolean eval(Boolean condition, String description) {
-        if (condition == null || !condition) {
-            throw new ExpectationViolation(operator + ": expectation failed: " + description);
+    public Boolean eval(Boolean condition, String model, String expectation, String check) {
+        boolean ok = condition != null && condition;
+        metrics.record(model, expectation, "fail", ok);
+        if (!ok) {
+            throw new ExpectationViolation(
+                    pipeline + ": expectation " + model + "." + expectation + " failed: " + check);
         }
         return Boolean.TRUE;
     }

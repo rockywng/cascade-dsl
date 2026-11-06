@@ -72,7 +72,7 @@ def cmd_verify(args) -> int:
         _print_diags(r, False, False)
         return 1
     print(f"planning with {home} ...", file=sys.stderr)
-    v = run_verify(r.checked, r.lowered.sql, home)
+    v = run_verify(r.checked, r.lowered, home)
     if v.error:
         print("error: Flink planner rejected the generated SQL:\n" + v.error, file=sys.stderr)
         return 1
@@ -112,6 +112,134 @@ def cmd_check_upgrade(args) -> int:
     return 0
 
 
+def _flink(args) -> str | None:
+    from .jvm import find_flink_home
+    home = find_flink_home(getattr(args, "flink_home", None))
+    if home is None:
+        print("error: Flink not found; pass --flink-home or set FLINK_HOME", file=sys.stderr)
+    return home
+
+
+def cmd_infer(args) -> int:
+    from .schemas import InferError, infer
+    home = _flink(args)
+    if home is None:
+        return 2
+    try:
+        doc, path = infer(args.path, home, args.env)
+    except InferError as e:
+        if e.result is not None:
+            _print_diags(e.result, False, False)
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    for name, entry in doc["models"].items():
+        cols = ", ".join(f"{c['name']} {c['type']}" for c in entry["columns"])
+        print(f"  {name}: {cols}")
+    print(f"wrote {path}", file=sys.stderr)
+    return 0
+
+
+def cmd_test(args) -> int:
+    from .testing import TestSpecError, run
+    home = _flink(args)
+    if home is None:
+        return 2
+    try:
+        r, results = run(args.path, home, args.env, args.k)
+    except TestSpecError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if results is None:
+        _print_diags(r, False, False)
+        return 1
+    failed = 0
+    for t in results:
+        status = "PASS" if t.passed else "FAIL"
+        failed += not t.passed
+        print(f"{status}  {t.case.name}  ({t.case.target}, {t.millis} ms)")
+        if not t.passed or args.verbose:
+            print("      " + t.message.replace("\n", "\n      ") + f"\n      at {t.case.loc}")
+    print(f"{len(results) - failed} passed, {failed} failed", file=sys.stderr)
+    return 1 if failed or not results else 0
+
+
+def _print_pin_report(report) -> None:
+    print(f"  operators keeping their UIDs: {len(report.exact)} identical"
+          + (f", {len(report.drift)} with changed upstream logic" if report.drift else ""))
+    for new, old in report.drift:
+        print(f"    kept despite upstream change: {new} (was {old})")
+    for x in report.new_stateful:
+        print(f"    new stateful operator (starts empty): {x}")
+    for x in report.dropped_stateful:
+        print(f"    state dropped (operator removed or changed): {x}")
+
+
+def cmd_plan(args) -> int:
+    from .jvm import script
+    from .plans import PlanError, compile_plan
+    home = _flink(args)
+    if home is None:
+        return 2
+    os.makedirs(args.out, exist_ok=True)
+    plan = os.path.join(args.out, "plan.json")
+    try:
+        _, report, setup = compile_plan(args.path, home, plan, args.env, local=args.local_connectors,
+                                        previous=args.previous)
+    except PlanError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    with open(os.path.join(args.out, "plan-setup.sql"), "w") as f:
+        f.write("-- Run before: EXECUTE PLAN 'plan.json' (plans reference these by name)\n")
+        f.write(script(setup))
+    if report is not None:
+        _print_pin_report(report)
+    print(f"wrote {args.out}/plan.json and {args.out}/plan-setup.sql", file=sys.stderr)
+    return 0
+
+
+def cmd_restore_test(args) -> int:
+    from .plans import PlanError, restore_test
+    home = _flink(args)
+    if home is None:
+        return 2
+    print(f"running {args.old} locally, taking a savepoint, restoring {args.new} "
+          f"({'with' if not args.no_pin else 'without'} UID pinning) ...", file=sys.stderr)
+    try:
+        res = restore_test(args.old, args.new, home, args.env, pin=not args.no_pin, seconds=args.seconds)
+    except PlanError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if res.get("report") is not None:
+        _print_pin_report(res["report"])
+    if res.get("restored"):
+        print("restore: OK (all savepoint state was mapped to the new job)")
+        return 0
+    err = res.get("error", "").strip().splitlines()
+    print("restore: FAILED\n  " + (err[-1].strip() if err else res.get("status", "?")))
+    return 1
+
+
+def cmd_import_schema(args) -> int:
+    from .registry import SchemaImportError, avro_columns, columns_yaml, fetch
+    try:
+        if args.avsc:
+            with open(args.avsc) as f:
+                text = f.read()
+        else:
+            if not (args.registry and args.subject):
+                print("error: pass --avsc FILE, or --registry URL and --subject NAME", file=sys.stderr)
+                return 2
+            kind, text = fetch(args.registry, args.subject, args.version)
+            if kind != "AVRO":
+                print(f"error: subject is {kind}; only AVRO schemas are supported", file=sys.stderr)
+                return 1
+        print(columns_yaml(avro_columns(text), args.source), end="")
+    except (SchemaImportError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_connectors(args) -> int:
     for spec in sorted(CATALOG.values(), key=lambda s: s.type):
         print(f"{spec.type}  [{', '.join(sorted(spec.roles))}]  {spec.doc}")
@@ -129,12 +257,12 @@ def cmd_connectors(args) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="cascade", description="Compile cascade-dsl pipelines to Flink SQL")
+    ap = argparse.ArgumentParser(prog="cascade", description="Compile, test and ship cascade-dsl pipelines on Flink")
     ap.add_argument("--version", action="version", version=f"cascade {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("path", help="project directory or pipeline.yaml")
+        sp.add_argument("path", help="project directory, pipeline.yaml or pipeline.py")
         sp.add_argument("--env", help="environment to resolve vars for (see `environments:`)")
 
     sp = sub.add_parser("validate", help="check a pipeline without generating output")
@@ -167,6 +295,44 @@ def main(argv=None) -> int:
     sp.add_argument("--env")
     sp.add_argument("--allow-state-loss", action="store_true")
     sp.set_defaults(fn=cmd_check_upgrade)
+
+    sp = sub.add_parser("infer", help="ask Flink for exact model schemas and write cascade.lock.json")
+    common(sp)
+    sp.add_argument("--flink-home")
+    sp.set_defaults(fn=cmd_infer)
+
+    sp = sub.add_parser("test", help="run tests/*.yaml against a local Flink")
+    common(sp)
+    sp.add_argument("--flink-home")
+    sp.add_argument("-k", help="only run tests whose name contains this text")
+    sp.add_argument("-v", "--verbose", action="store_true")
+    sp.set_defaults(fn=cmd_test)
+
+    sp = sub.add_parser("plan", help="compile the job to a Flink plan (EXECUTE PLAN), pinning UIDs to a previous plan")
+    common(sp)
+    sp.add_argument("--flink-home")
+    sp.add_argument("-o", "--out", default="target")
+    sp.add_argument("--previous", help="plan.json of the running version; unchanged operators keep their UIDs")
+    sp.add_argument("--local-connectors", action="store_true",
+                    help="use local stand-in connectors (when production connector jars are not on the classpath)")
+    sp.set_defaults(fn=cmd_plan)
+
+    sp = sub.add_parser("restore-test", help="run OLD locally, savepoint it, and restore NEW from the savepoint")
+    sp.add_argument("old", help="project of the running version")
+    sp.add_argument("new", help="project of the new version")
+    sp.add_argument("--env")
+    sp.add_argument("--flink-home")
+    sp.add_argument("--no-pin", action="store_true", help="do not pin UIDs (shows what an unpinned deploy does)")
+    sp.add_argument("--seconds", type=int, default=8, help="how long to run OLD before the savepoint")
+    sp.set_defaults(fn=cmd_restore_test)
+
+    sp = sub.add_parser("import-schema", help="generate source columns from a schema registry subject or .avsc")
+    sp.add_argument("--registry")
+    sp.add_argument("--subject")
+    sp.add_argument("--version", default="latest")
+    sp.add_argument("--avsc")
+    sp.add_argument("--source", help="wrap the columns in a source block with this name")
+    sp.set_defaults(fn=cmd_import_schema)
 
     sp = sub.add_parser("connectors", help="list available connectors and their properties")
     sp.set_defaults(fn=cmd_connectors)

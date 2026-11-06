@@ -16,7 +16,8 @@ from .diagnostics import Diagnostics, Location
 from .ir import OutputColumn, Pipeline, RelationInfo
 from .sqlscan import (Analysis, SqlSyntaxError, analyze_sql, infer_relation, line_of,
                       referenced_columns)
-from .types import parse_type
+from .types import TypeParseError, parse_type
+from .util import h, normalize_sql
 
 UNBOUNDED_KINDS = {"group_agg", "regular_join", "dedup", "distinct", "over_agg"}
 
@@ -155,6 +156,8 @@ def _check_sources(c: Checked):
 def _sql_loc(model, pos) -> Location | None:
     if model.sql_loc is None:
         return model.loc
+    if model.sql_loc.file.endswith(".py"):
+        return model.loc  # SQL built in Python: point at the model definition
     return Location(model.sql_loc.file, (model.sql_loc.line or 1) + line_of(model.sql, pos))
 
 
@@ -234,6 +237,7 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
                         _sql_loc(m, pos), node=name,
                         hint=f"time attributes of '{table}': {', '.join(sorted(base.rowtime))}")
     columns, rowtime = infer_relation(m.sql, rels)
+    columns, rowtime = _apply_lock(c, name, inputs, columns, rowtime, kinds)
     c.inferred[name] = columns
 
     # --- temporal joins need a versioned table
@@ -324,6 +328,44 @@ def _upsert_key(p: Pipeline, a: Analysis, inputs: list[str]) -> list[str] | None
         return None
     out = [renames.get(k.lower()) for k in keys]
     return None if any(x is None for x in out) else out
+
+
+def model_fingerprint(p: Pipeline, name: str, inputs: list[str],
+                      input_columns: dict[str, list[OutputColumn] | None]) -> str:
+    """Identity of a model's output schema: its SQL, contract and input schemas (base types)."""
+    m = p.models[name]
+    ins = []
+    for i in inputs:
+        cols = input_columns.get(i)
+        ins.append((i, [(col.name, col.type.with_nullable(True).text if col.type else None) for col in cols or []]))
+    contract = [(col.name, col.type.text) for col in m.columns] if m.columns else None
+    return h(normalize_sql(m.sql), contract, ins)
+
+
+def _apply_lock(c: Checked, name, inputs, columns, rowtime, kinds):
+    """Use exact Flink-derived types from cascade.lock.json when its fingerprint is current."""
+    p, d = c.pipeline, c.diagnostics
+    entry = (p.schema_lock or {}).get(name)
+    if entry is None:
+        return columns, rowtime
+    fp = model_fingerprint(p, name, inputs, {i: p.relations[i].columns for i in inputs if i in p.relations})
+    if entry.get("fingerprint") != fp:
+        d.warning("CD361", f"model '{name}': cascade.lock.json is stale (the model or its inputs changed)",
+                  p.models[name].loc, hint="re-run `cascade infer`", node=name)
+        return columns, rowtime
+    exact = []
+    for col in entry["columns"]:
+        try:
+            exact.append(OutputColumn(col["name"], parse_type(col["type"])))
+        except TypeParseError:
+            exact.append(OutputColumn(col["name"], None))
+    if columns is None:
+        # the validator reports pre-optimization time attributes; trust them only where no
+        # aggregation/regular join can have materialized them
+        trusted = not (kinds & {"group_agg", "global_agg", "window_agg", "regular_join"})
+        rowtime = {col["name"] for col in entry["columns"] if col.get("time_attribute") == "rowtime"} if trusted else set()
+    d.info("CD360", f"model '{name}': using exact schema from cascade.lock.json", p.models[name].loc, node=name)
+    return exact, rowtime
 
 
 def _check_expectations(c: Checked, m, columns, changelog):

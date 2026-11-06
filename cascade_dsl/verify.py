@@ -18,9 +18,11 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 
+from . import jvm
 from .analyze import Checked
+from .localize import localize
+from .lower import render_script
 
-TABLE_RE = re.compile(r"CREATE TEMPORARY TABLE `([^`]+)` \((.*?)\n\) WITH \((.*?)\n\);", re.DOTALL)
 PLANNER_OPS = {
     "GroupAggregate": "group_agg", "GlobalGroupAggregate": "group_agg", "LocalGroupAggregate": None,
     "WindowAggregate": "window_agg", "LocalWindowAggregate": None, "GlobalWindowAggregate": "window_agg",
@@ -42,52 +44,29 @@ class VerifyResult:
 
 
 def find_flink_home(explicit: str | None = None) -> str | None:
-    for cand in (explicit, os.environ.get("FLINK_HOME")):
-        if cand and os.path.exists(os.path.join(cand, "bin", "sql-client.sh")):
-            return cand
-    return None
+    return jvm.find_flink_home(explicit)
 
 
-def localize(sql: str, c: Checked, tmpdir: str) -> str:
-    """Rewrite connector WITH clauses to built-in stand-ins."""
-    p = c.pipeline
+_UDF_CALL = re.compile(r"CASCADE_(?:ASSERT|EXPECT)\((.*?) IS TRUE(?:, '(?:[^']|'')*'){3}\)")
 
-    def repl(m):
-        name, body = m.group(1), m.group(2)
-        if name in p.sources:
-            if p.relations[name].changelog == "updating":
-                path = os.path.join(tmpdir, name)
-                os.makedirs(path, exist_ok=True)
-                opts = f"  'connector' = 'filesystem',\n  'path' = '{path}',\n  'format' = 'debezium-json'"
-            else:
-                opts = "  'connector' = 'datagen'"
-        else:
-            opts = "  'connector' = 'blackhole'"
-        return f"CREATE TEMPORARY TABLE `{name}` ({body}\n) WITH (\n{opts}\n);"
 
-    out = TABLE_RE.sub(repl, sql)
-    out = out.replace("EXECUTE STATEMENT SET", "EXPLAIN CHANGELOG_MODE STATEMENT SET")
-    if not _runtime_jar():
-        # no runtime jar built: plan with an equivalent filter instead of the assertion UDF
+def localized_script(lowered, c: Checked, tmpdir: str) -> str:
+    stmts = localize(lowered, c, "plan", tmpdir)
+    out = render_script(stmts, lowered.header, statement_set="EXPLAIN CHANGELOG_MODE")
+    if not jvm.runtime_jar():
+        # runtime jar not built: plan with equivalent filters instead of the expectation UDFs
         out = re.sub(r"^CREATE TEMPORARY SYSTEM FUNCTION .*$", "", out, flags=re.MULTILINE)
-        out = re.sub(r"CASCADE_ASSERT\((.*?) IS TRUE, '(?:[^']|'')*'\)", r"\1 IS TRUE", out)
+        out = _UDF_CALL.sub(r"\1 IS TRUE", out)
     return out
 
 
-def _runtime_jar() -> str | None:
-    jar = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "target",
-                       "cascade-runtime.jar")
-    return jar if os.path.exists(jar) else None
-
-
-def run_verify(c: Checked, sql: str, flink_home: str, timeout: int = 180) -> VerifyResult:
+def run_verify(c: Checked, lowered, flink_home: str, timeout: int = 180) -> VerifyResult:
     with tempfile.TemporaryDirectory(prefix="cascade-verify-") as tmp:
         script = os.path.join(tmp, "verify.sql")
-        local_sql = localize(sql, c, tmp)
         with open(script, "w") as f:
-            f.write(local_sql)
+            f.write(localized_script(lowered, c, tmp))
         cmd = [os.path.join(flink_home, "bin", "sql-client.sh"), "embedded", "-f", script]
-        jar = _runtime_jar()
+        jar = jvm.runtime_jar()
         if jar:
             cmd[2:2] = ["-j", jar]
         try:
@@ -116,7 +95,7 @@ def _crosscheck(c: Checked, plan: str) -> VerifyResult:
             mode = re.search(r"changelogMode=\[([A-Z,]+)\]", lines[i + 1])
             if mode:
                 res.sink_modes[m.group(1)] = mode.group(1)
-    for m in re.finditer(r"^\s*(?:\+- |:- )?([A-Za-z]+)\(", physical, re.MULTILINE):
+    for m in re.finditer(r"^[\s:|+\-]*([A-Za-z]+)\(", physical, re.MULTILINE):
         op = PLANNER_OPS.get(m.group(1))
         if op:
             res.planner_ops.append(op)

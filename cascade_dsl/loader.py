@@ -58,6 +58,20 @@ def _construct_mapping(loader, node, deep=False):
 _Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
 
 
+def _ldict(value):
+    """Recursively convert plain dicts to LDict so line lookups work uniformly."""
+    if isinstance(value, dict):
+        d = LDict()
+        d.line = getattr(value, "line", 0)
+        d.key_lines = dict(getattr(value, "key_lines", {}) or {})
+        for k, v in value.items():
+            d[k] = _ldict(v)
+        return d
+    if isinstance(value, list):
+        return [_ldict(v) for v in value]
+    return value
+
+
 def parse_duration_ms(value) -> int:
     if isinstance(value, int):
         return value * 1000
@@ -78,7 +92,7 @@ class _Ctx:
         line = None
         if isinstance(d, LDict):
             line = d.key_lines.get(key, d.line) if key is not None else d.line
-        return Location(self.file, line)
+        return Location(self.file, line or None)
 
     def check_keys(self, d: dict, allowed: set, what: str, extra_ok: bool = False):
         if not isinstance(d, dict):
@@ -111,7 +125,6 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
     root = os.path.dirname(os.path.abspath(file))
     diags = Diagnostics()
     rel_file = os.path.relpath(file)
-    ctx = _Ctx(rel_file, diags)
     try:
         with open(file) as f:
             doc = yaml.load(f, Loader=_Loader)
@@ -126,7 +139,17 @@ def load_pipeline(path: str, env: str | None = None) -> tuple[Pipeline, Diagnost
     if not isinstance(doc, dict):
         diags.error("CD000", "pipeline.yaml must be a mapping at the top level", Location(rel_file))
         raise CompileError(diags)
+    return load_document(doc, rel_file, root, env, diags)
 
+
+def load_document(doc: dict, rel_file: str, root: str, env: str | None,
+                  diags: Diagnostics | None = None) -> tuple[Pipeline, Diagnostics]:
+    """Build the IR from an already-parsed document (YAML, or the Python API's equivalent).
+
+    Mappings may be LDict instances carrying source lines; plain dicts work too."""
+    diags = diags or Diagnostics()
+    ctx = _Ctx(rel_file, diags)
+    doc = _ldict(doc)
     ctx.check_keys(doc, TOP_KEYS, "pipeline")
     secrets: set[str] = set()
     variables = _resolve_vars(doc, env, ctx)
@@ -314,7 +337,8 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
     elif "sql" in m:
         sql = str(m["sql"])
         # block scalars start on the line after the key
-        sql_loc = Location(ctx.file, m.key_lines["sql"] + (1 if sql.endswith("\n") else 0))
+        line = m.key_lines.get("sql") or 0
+        sql_loc = Location(ctx.file, line + (1 if sql.endswith("\n") else 0)) if line else Location(ctx.file)
     else:
         path = os.path.join(root, str(m["sql_file"]))
         try:

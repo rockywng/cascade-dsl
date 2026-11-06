@@ -1,0 +1,55 @@
+tests:
+  - name: duplicate_views_are_collapsed
+    target: unique_views
+    given:
+      page_views:
+        - {view_id: v1, user_id: u1, url: /a, country: DE, view_ts: "2026-01-01 10:00:00"}
+        - {view_id: v1, user_id: u1, url: /a, country: DE, view_ts: "2026-01-01 10:00:02"}
+        - {view_id: v2, user_id: u2, url: /b, country: FR, view_ts: "2026-01-01 10:01:00"}
+        - {view_id: v3, user_id: null, url: /c, country: FR, view_ts: "2026-01-01 10:01:00"}
+    expect:
+      rows:
+        - {view_id: v1, view_ts: "2026-01-01 10:00:00"}
+        - {view_id: v2, view_ts: "2026-01-01 10:01:00"}
+
+  - name: purchases_within_30_minutes_are_attributed
+    target: attributed_purchases
+    given:
+      page_views:
+        - {view_id: v1, user_id: u1, url: /shoes, country: DE, view_ts: "2026-01-01 10:00:00"}
+      purchases:
+        - {purchase_id: p1, user_id: u1, amount: 50.00, purchase_ts: "2026-01-01 10:20:00"}
+        - {purchase_id: p2, user_id: u1, amount: 80.00, purchase_ts: "2026-01-01 11:00:00"}
+        - {purchase_id: p3, user_id: u2, amount: 10.00, purchase_ts: "2026-01-01 10:05:00"}
+    expect:
+      rows:
+        - {url: /shoes, purchase_id: p1, amount: 50.00}
+
+  - name: revenue_accumulates_per_url
+    target: revenue_by_url
+    given:
+      page_views:
+        - {view_id: v1, user_id: u1, url: /shoes, country: DE, view_ts: "2026-01-01 10:00:00"}
+        - {view_id: v2, user_id: u2, url: /shoes, country: FR, view_ts: "2026-01-01 10:00:00"}
+        - {view_id: v3, user_id: u3, url: /hats, country: FR, view_ts: "2026-01-01 10:00:00"}
+      purchases:
+        - {purchase_id: p1, user_id: u1, amount: 50.00, purchase_ts: "2026-01-01 10:10:00"}
+        - {purchase_id: p2, user_id: u2, amount: 25.00, purchase_ts: "2026-01-01 10:12:00"}
+        - {purchase_id: p3, user_id: u3, amount: 15.00, purchase_ts: "2026-01-01 10:15:00"}
+    expect:
+      rows:
+        - {url: /shoes, revenue: 75.00, purchases: 2}
+        - {url: /hats, revenue: 15.00, purchases: 1}
+
+  - name: a_view_counts_in_every_overlapping_hop_window
+    target: views_per_country
+    given:
+      page_views:
+        - {view_id: v1, user_id: u1, url: /a, country: DE, view_ts: "2026-01-01 10:02:30"}
+    expect:
+      rows:
+        - {window_start: "2026-01-01 09:58:00", country: DE, views: 1}
+        - {window_start: "2026-01-01 09:59:00", country: DE, views: 1}
+        - {window_start: "2026-01-01 10:00:00", country: DE, views: 1}
+        - {window_start: "2026-01-01 10:01:00", country: DE, views: 1}
+        - {window_start: "2026-01-01 10:02:00", country: DE, views: 1}

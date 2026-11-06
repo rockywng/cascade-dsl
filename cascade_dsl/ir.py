@@ -143,6 +143,7 @@ class Pipeline:
     sinks: dict[str, Sink]
     quarantine: Quarantine | None
     secrets: set[str] = field(default_factory=set)
+    schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     relations: dict[str, RelationInfo] = field(default_factory=dict)
     loc: Location | None = None
 

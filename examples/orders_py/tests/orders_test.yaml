@@ -1,0 +1,63 @@
+tests:
+  - name: ltv_sums_amounts_per_customer
+    target: customer_ltv
+    given:
+      orders:
+        - {order_id: o1, customer_id: c1, amount: 10.00, currency: usd, order_ts: "2026-01-01 10:00:00"}
+        - {order_id: o2, customer_id: c1, amount: 5.50, currency: eur, order_ts: "2026-01-01 10:05:00"}
+        - {order_id: o3, customer_id: c2, amount: 7.00, currency: usd, order_ts: "2026-01-01 10:06:00"}
+    expect:
+      rows:
+        - {customer_id: c1, lifetime_value: 15.50, order_count: 2}
+        - {customer_id: c2, lifetime_value: 7.00, order_count: 1}
+
+  - name: non_positive_amounts_are_dropped
+    target: clean_orders
+    given:
+      orders:
+        - {order_id: o1, customer_id: c1, amount: 10.00, currency: usd, order_ts: "2026-01-01 10:00:00"}
+        - {order_id: o2, customer_id: c1, amount: 0, currency: usd, order_ts: "2026-01-01 10:01:00"}
+        - {order_id: o3, customer_id: c1, amount: -3.00, currency: usd, order_ts: "2026-01-01 10:02:00"}
+    expect:
+      rows:
+        - {order_id: o1, currency: USD}
+
+  - name: unknown_currency_is_quarantined
+    target: clean_orders.quarantined
+    given:
+      orders:
+        - {order_id: o1, customer_id: c1, amount: 10.00, currency: usd, order_ts: "2026-01-01 10:00:00"}
+        - {order_id: o2, customer_id: c1, amount: 4.00, currency: jpy, order_ts: "2026-01-01 10:01:00"}
+    expect:
+      rows:
+        - {order_id: o2, currency: JPY, _violated_expectation: known_currency}
+
+  - name: enrichment_uses_customer_segment_as_of_order_time
+    target: orders_enriched
+    given:
+      customers:
+        - {customer_id: c1, name: Acme, segment: smb, updated_at: "2026-01-01 09:00:00"}
+        - {_op: update, customer_id: c1, segment: enterprise, updated_at: "2026-01-01 11:00:00"}
+      orders:
+        - {order_id: o1, customer_id: c1, amount: 10.00, currency: usd, order_ts: "2026-01-01 10:00:00"}
+        - {order_id: o2, customer_id: c1, amount: 20.00, currency: usd, order_ts: "2026-01-01 12:00:00"}
+        - {order_id: o3, customer_id: c9, amount: 30.00, currency: usd, order_ts: "2026-01-01 12:00:00"}
+    expect:
+      rows:
+        - {order_id: o1, customer_name: Acme, segment: smb}
+        - {order_id: o2, customer_name: Acme, segment: enterprise}
+        - {order_id: o3, customer_name: null, segment: unknown}
+
+  - name: revenue_is_bucketed_per_minute_and_segment
+    target: revenue_per_minute
+    given:
+      customers:
+        - {customer_id: c1, name: Acme, segment: smb, updated_at: "2026-01-01 00:00:00"}
+      orders:
+        - {order_id: o1, customer_id: c1, amount: 10.00, currency: usd, order_ts: "2026-01-01 10:00:10"}
+        - {order_id: o2, customer_id: c1, amount: 2.50, currency: usd, order_ts: "2026-01-01 10:00:50"}
+        - {order_id: o3, customer_id: c1, amount: 4.00, currency: usd, order_ts: "2026-01-01 10:01:05"}
+    expect:
+      rows:
+        - {window_start: "2026-01-01 10:00:00", segment: smb, currency: USD, revenue: 12.50, orders: 2}
+        - {window_start: "2026-01-01 10:01:00", segment: smb, currency: USD, revenue: 4.00, orders: 1}

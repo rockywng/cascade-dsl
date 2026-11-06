@@ -121,12 +121,16 @@ models:
 - **Columns contract.** When given, the names must match the query output in order (CD310).
   Expressions whose type the compiler can't infer, or that differ from the contract, are wrapped in
   `CAST` in a generated `<model>__typed` view. Time attributes are never cast (CD311).
-- **Expectations** compile into the model view:
-  - `drop`: the row is filtered out (`WHERE (check) IS TRUE`, so NULL counts as a violation).
+- **Expectations** compile into the model view. A NULL check result counts as a violation.
+  - `drop`: the row is filtered out through `CASCADE_EXPECT(...)`, which also counts it.
   - `quarantine`: filtered out *and* written, with `_violated_expectation` and `_quarantined_at`,
-    to the pipeline's `quarantine:` destination (append-only models only).
-  - `fail`: `CASCADE_ASSERT(...)` from the runtime jar throws `ExpectationViolation` and fails the
-    task.
+    to the pipeline's `quarantine:` destination (append-only models only). The rows are also
+    available as the view `<model>__quarantined`, which tests can target as `<model>.quarantined`.
+  - `fail`: `CASCADE_ASSERT(...)` throws `ExpectationViolation` and fails the task.
+
+  Both UDFs live in `cascade-runtime.jar`, which ships with every job. They export the counters
+  `cascade_expectation_checked` and `cascade_expectation_violations`, labeled `cascade_model`,
+  `expectation` and `action`.
 
 ## Sinks
 
@@ -191,6 +195,112 @@ its normalized SQL and its input schemas. Comments, whitespace and keyword case 
 | `state_loss` | some operator state is discarded (`STATE_INCOMPATIBLE`, `STATE_DROPPED`); needs `--allow-state-loss` | 3 |
 | `breaking` | sink contract broken (removed/retyped columns, changed key or mode) | 1 |
 
+## Python API
+
+`pipeline.py` defines a `Pipeline`. It builds the same document as `pipeline.yaml`, so every check,
+the generated SQL and the manifest are identical. A directory with both files uses the YAML.
+
+```python
+from cascade_dsl.api import Pipeline, expect, kafka, secret, sum_, count
+
+pipeline = p = Pipeline("shop", owner="data-eng", state_ttl="30d",
+                        vars={"bootstrap": "localhost:9092"},
+                        environments={"prod": {"bootstrap": secret("kafka/prod")}})
+
+bus = p.connection("bus", kafka(bootstrap_servers=p.var("bootstrap")))
+orders = p.source("orders", bus, topic="orders", format="json",
+                  columns={"order_id": "STRING NOT NULL", "amount": "DECIMAL(10, 2)",
+                           "ts": "TIMESTAMP(3)"},
+                  event_time=("ts", "5s"))
+
+@p.model(expectations=[expect.drop("positive", "amount > 0")])
+def paid(orders):                       # parameters name the inputs
+    return f"SELECT * FROM {orders} WHERE amount IS NOT NULL"
+
+@p.model
+def revenue(paid):                      # or return a builder query
+    return paid.tumble("ts", "1m").group_by().agg(revenue=sum_("amount"), orders=count())
+
+p.sink("revenue_out", revenue, bus, topic="revenue")
+```
+
+- **Declarations.** `connection(name, kafka(...) | postgres_cdc(...) | iceberg(...) | jdbc(...) |
+  filesystem(...) | connector(type, ...))`, `source(...)`, `model` (decorator), `sql_model(name,
+  sql | sql_file=...)`, `sink(...)` and `quarantine(...)` take the same options as the YAML keys.
+- **Builder** (`cascade_dsl.builder`). It has `where`, `select`, `with_columns`, `group_by(...).agg(...)`,
+  `tumble` / `hop` / `cumulate`, `join(other, on, how, within=(left_time, right_time, upper[, lower]))`
+  for regular or interval joins, `temporal_join(versioned, on, as_of)` and
+  `dedup(keys, order_by, keep="first"|"last")`. Helpers: `sum_`, `count`, `count_distinct`, `min_`,
+  `max_`, `avg`, `lit`, `interval`. Generated aliases are backtick-quoted, because names like
+  `views` are reserved words. Subquery aliases are deterministic (`q1`, `q2`, ...), so rebuilding
+  never changes a model's state identity.
+- **Errors.** Diagnostics point at `pipeline.py` lines. An exception while building a model is
+  reported as CD304 rather than a traceback.
+- **In-process use.** `p.compile()` and `p.validate()` work in a notebook.
+
+## Tests
+
+Test files are `tests/*.yaml` in the project. They work for YAML and Python projects alike.
+
+```yaml
+tests:
+  - name: ltv_sums_amounts_per_customer
+    target: customer_ltv            # a model, or <model>.quarantined
+    given:                          # rows per source; unlisted sources are empty
+      orders:
+        - {order_id: o1, customer_id: c1, amount: 10.00, order_ts: "2026-01-01 10:00:00"}
+      customers:                    # changelog sources: _op insert | update | delete
+        - {_op: update, customer_id: c1, segment: enterprise}
+    expect:
+      rows:                         # only the listed columns are compared
+        - {customer_id: c1, lifetime_value: 10.00}
+      # empty: true                 # no rows
+      # error: positive_amount      # the job must fail, mentioning this text
+    ordered: false                  # default: multiset comparison
+```
+
+`cascade test PATH [-k substring]` runs each test in a fresh local Flink (embedded MiniCluster)
+with the sources replaced by bounded files:
+- **Event time.** It advances to the end of input, so every window fires.
+- **Updating models.** These are compared by their final state: the produced changelog
+  (`+I/-U/+U/-D`) is applied first.
+- **Values.** They're compared by Flink column type: decimals numerically, timestamps parsed, and
+  so on.
+- **Failures.** A failing test prints the missing and unexpected rows and points at the test's
+  file and line.
+
+## Exact schemas: `cascade infer`
+
+`cascade infer PATH` asks Flink's validator for every model's exact output schema and writes
+`cascade.lock.json`; commit it. While a model's fingerprint (its SQL, contract and input schemas)
+matches the lock, the compiler uses those types (CD360). That resolves CD408 for expressions the
+static analysis can't type. When the model or an input changes, the entry is ignored and the
+compiler warns (CD361). Compilation itself never needs a JVM.
+
+## Compiled plans and restore tests
+
+- `cascade plan PATH -o out [--previous old/plan.json]` writes `plan.json` (Flink's compiled plan)
+  and `plan-setup.sql`. The setup script holds the tables, functions and settings the plan
+  references by name; secrets stay in it rather than in the plan. Deploy by running
+  `plan-setup.sql`, then `EXECUTE PLAN 'plan.json'`.
+  - With `--previous`, nodes are matched against the running version's plan. A node matches when
+    its definition and everything upstream of it are identical. A stateful node whose own
+    definition is unchanged also matches when only its upstream changed and it feeds the same
+    sinks; this is reported. Matched nodes keep their old operator UIDs through a per-node
+    `table.exec.uid.format`. Changed and new nodes get fresh, collision-free UIDs.
+  - Production connectors must be on the tools classpath. `--local-connectors` uses stand-ins.
+- `cascade restore-test OLD NEW [--no-pin] [--seconds N]` runs OLD locally with stand-in
+  connectors, stops it with a savepoint, and starts NEW from that savepoint with
+  `ignore-unclaimed-state=false`. It reports whether every piece of state mapped, and which
+  operators start empty.
+
+## Schema import
+
+`cascade import-schema --registry URL --subject SUBJECT [--version N] [--source NAME]` (or
+`--avsc FILE`) prints a `columns:` block converted from Avro: logical types, nullable unions,
+records → `ROW`, arrays, maps, enums. Basic auth comes from `CASCADE_REGISTRY_USER_INFO=user:pass`.
+It's a reviewable, explicit step, so compilation never depends on the registry.
+
 ## Diagnostic codes
 
 | Range | Area |
@@ -198,9 +308,10 @@ its normalized SQL and its input schemas. Comments, whitespace and keyword case 
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
 | CD1xx | names, sources, event time, primary keys |
 | CD2xx | connectors, properties, formats, secrets |
-| CD30x–CD32x | model SQL, references, cycles, contracts, expectations |
+| CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |
 | CD35x | state / TTL |
+| CD36x | schema lock (CD360 used, CD361 stale, CD362 Flink could not resolve a model) |
 | CD4xx | sinks: changelog compatibility, keys, types, ON CONFLICT |
 | CD5xx | pipeline-level (unused nodes, no sinks) |
 

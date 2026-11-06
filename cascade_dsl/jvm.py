@@ -1,0 +1,152 @@
+"""Driver for runtime/target/cascade-tools.jar (local Flink in an embedded MiniCluster)."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+
+import yaml
+
+from .lower import Stmt
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TARGET = os.path.join(REPO, "runtime", "target")
+SEPARATOR = "-- @@cascade"
+DEFAULT_JAVA_OPTS = (
+    "--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED "
+    "--add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED "
+    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
+    "--add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED "
+    "--add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED "
+    "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED "
+    "--add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED")
+
+
+class ToolsError(RuntimeError):
+    pass
+
+
+def find_flink_home(explicit: str | None = None) -> str | None:
+    for cand in (explicit, os.environ.get("FLINK_HOME")):
+        if cand and os.path.exists(os.path.join(cand, "bin", "sql-client.sh")):
+            return cand
+    return None
+
+
+def runtime_jar() -> str | None:
+    jar = os.path.join(TARGET, "cascade-runtime.jar")
+    return jar if os.path.exists(jar) else None
+
+
+def script(stmts: list[Stmt]) -> str:
+    return f"\n{SEPARATOR}\n".join(st.render() for st in stmts) + "\n"
+
+
+class Tools:
+    def __init__(self, flink_home: str):
+        self.flink_home = flink_home
+        self.tools_jar = os.path.join(TARGET, "cascade-tools.jar")
+        if not os.path.exists(self.tools_jar) or not runtime_jar():
+            raise ToolsError("JVM tools are not built; run: FLINK_HOME=<flink> runtime/build.sh")
+
+    def _java(self) -> str:
+        return os.path.join(os.environ["JAVA_HOME"], "bin", "java") if os.environ.get("JAVA_HOME") else "java"
+
+    def _java_major(self) -> int:
+        if not hasattr(self, "_major"):
+            proc = subprocess.run([self._java(), "-version"], capture_output=True, text=True)
+            m = re.search(r'version "(\d+)(?:\.(\d+))?', proc.stderr)
+            major = int(m.group(1)) if m else 17
+            self._major = int(m.group(2)) if major == 1 and m and m.group(2) else major
+        return self._major
+
+    def _java_opts(self) -> list[str]:
+        opts = DEFAULT_JAVA_OPTS
+        try:
+            with open(os.path.join(self.flink_home, "conf", "config.yaml")) as f:
+                conf = yaml.safe_load(f) or {}
+            opts = conf.get("env", {}).get("java", {}).get("opts", {}).get("all") or opts
+        except (OSError, yaml.YAMLError, AttributeError):
+            pass
+        # Flink's config lists flags for newer JDKs; its launch scripts drop them on older ones
+        newer = {"--sun-misc-unsafe-memory-access": 23, "--enable-native-access": 22}
+        major = self._java_major()
+        return [o for o in str(opts).split() if all(not o.startswith(f) or major >= v for f, v in newer.items())]
+
+    def _run(self, args: list[str], timeout: int) -> None:
+        java = self._java()
+        cp = os.pathsep.join([self.tools_jar, runtime_jar(), os.path.join(self.flink_home, "lib", "*")])
+        cmd = [java, *self._java_opts(),
+               f"-Dlog4j.configurationFile={os.path.join(REPO, 'runtime', 'tools', 'log4j2.properties')}",
+               "-cp", cp, "dev.cascade.tools.Main", *args]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise ToolsError(f"cascade-tools timed out after {timeout}s")
+        if proc.returncode != 0:
+            raise ToolsError(f"cascade-tools failed (exit {proc.returncode}):\n{proc.stderr[-4000:]}")
+
+    @staticmethod
+    def _read(path: str) -> dict:
+        with open(path) as f:
+            return json.load(f)
+
+    def describe(self, stmts: list[Stmt], timeout: int = 180) -> dict:
+        with tempfile.TemporaryDirectory(prefix="cascade-describe-") as d:
+            path = os.path.join(d, "script.sql")
+            with open(path, "w") as f:
+                f.write(script([s for s in stmts if s.kind != "insert"]))
+            out = os.path.join(d, "out.json")
+            self._run(["describe", path, out], timeout)
+            return self._read(out)
+
+    def run_tests(self, cases: list[tuple[str, list[Stmt], str]], per_test_timeout: int = 60,
+                  timeout: int = 900) -> list[dict]:
+        """cases: (name, setup statements, query). Returns one result dict per case, in order."""
+        with tempfile.TemporaryDirectory(prefix="cascade-tests-") as d:
+            index = {}
+            for i, (name, stmts, query) in enumerate(cases):
+                td = os.path.join(d, "tests", f"{i:04d}")
+                os.makedirs(td)
+                index[f"{i:04d}"] = name
+                with open(os.path.join(td, "setup.sql"), "w") as f:
+                    f.write(script(stmts))
+                with open(os.path.join(td, "query.sql"), "w") as f:
+                    f.write(query)
+            out = os.path.join(d, "out.json")
+            self._run(["run", os.path.join(d, "tests"), out, str(per_test_timeout)], timeout)
+            results = self._read(out)["results"]
+            for r in results:
+                r["name"] = index[r["name"]]
+            return results
+
+    def compile_plan(self, stmts: list[Stmt], out_path: str, timeout: int = 180) -> dict:
+        with tempfile.TemporaryDirectory(prefix="cascade-plan-") as d:
+            path = os.path.join(d, "script.sql")
+            with open(path, "w") as f:
+                f.write(script(stmts))
+            self._run(["compile-plan", path, os.path.abspath(out_path)], timeout)
+            result_path = os.path.abspath(out_path) + ".result.json"
+            result = self._read(result_path)
+            os.remove(result_path)
+            return result
+
+    def restore_test(self, old_setup: list[Stmt], old_plan: str, new_setup: list[Stmt], new_plan: str,
+                     seconds: int = 8, timeout: int = 400) -> dict:
+        d = tempfile.mkdtemp(prefix="cascade-restore-")
+        try:
+            out = os.path.join(d, "out.json")
+            paths = []
+            for label, stmts in (("old", old_setup), ("new", new_setup)):
+                path = os.path.join(d, f"{label}-setup.sql")
+                with open(path, "w") as f:
+                    f.write(script(stmts))
+                paths.append(path)
+            self._run(["restore-test", paths[0], os.path.abspath(old_plan), paths[1], os.path.abspath(new_plan),
+                       os.path.join(d, "savepoints"), str(seconds), out], timeout)
+            return self._read(out)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

@@ -47,7 +47,7 @@ CASES = [
 class FlinkVerifyTest(unittest.TestCase):
     def test_example(self):
         r = compile_pipeline(EXAMPLE)
-        v = run_verify(r.checked, r.lowered.sql, FLINK)
+        v = run_verify(r.checked, r.lowered, FLINK)
         self.assertTrue(v.ok, v.error or v.findings)
         self.assertEqual(v.sink_modes["ltv_to_kafka"], "I,UA")
         self.assertEqual(v.sink_modes["revenue_to_lake"], "I")
@@ -63,7 +63,7 @@ class FlinkVerifyTest(unittest.TestCase):
                 self.assertTrue(r.lowered is not None, [d.format() for d in r.diagnostics.items])
                 static = r.checked.pipeline.relations["m"].changelog
                 self.assertEqual(static, expected, f"{name}: static analysis")
-                v = run_verify(r.checked, r.lowered.sql, FLINK)
+                v = run_verify(r.checked, r.lowered, FLINK)
                 self.assertFalse(v.error, f"{name}: planner rejected SQL: {v.error}")
                 mode = v.sink_modes.get("out", "")
                 planner = "updating" if any(x in mode for x in ("UA", "UB", "D")) else "append"
@@ -75,16 +75,16 @@ class FlinkVerifyTest(unittest.TestCase):
         sql = "SELECT o.order_id AS k, p.paid FROM orders o LEFT JOIN payments p ON o.order_id = p.order_id"
         r = one_model(sql)
         self.assertIn("CD410", r.diagnostics.codes())
-        v = run_verify(r.checked, r.lowered.sql, FLINK)
+        v = run_verify(r.checked, r.lowered, FLINK)
         self.assertIn("ON CONFLICT", v.error)
         r = one_model(sql, on_conflict="error")
         self.assertIn("ON CONFLICT DO ERROR", r.lowered.sql)
-        self.assertTrue(run_verify(r.checked, r.lowered.sql, FLINK).ok)
+        self.assertTrue(run_verify(r.checked, r.lowered, FLINK).ok)
 
     def test_planner_rejects_invalid_sql(self):
         r = one_model("SELECT order_id AS k, amount FROM orders WHERE no_such_col > 1", sink_mode="append")
         self.assertTrue(r.ok)  # statically fine: the analyzer does not resolve WHERE columns
-        v = run_verify(r.checked, r.lowered.sql, FLINK)
+        v = run_verify(r.checked, r.lowered, FLINK)
         self.assertFalse(v.ok)
         self.assertIn("no_such_col", v.error)
 

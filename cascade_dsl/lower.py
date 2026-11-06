@@ -262,8 +262,11 @@ def _manifest(c: Checked, sql: str) -> dict:
             return h("source", ident, s.event_time.column if s.event_time else None,
                      s.event_time.max_out_of_orderness_ms if s.event_time else None)
         m = p.models[n]
-        return h("model", normalize_sql(m.sql), [(e.name, e.check, e.on_violation) for e in m.expectations],
-                 _cols(p.relations[n].columns))
+        # name-free: inputs are referred to by position (their schemas are part of the state_id), so
+        # renaming a model or one of its inputs keeps every state_id: views are inlined, the plan
+        # doesn't change
+        return h("model", normalize_sql(_unnamed_sql(c, n)),
+                 [(e.check, e.on_violation) for e in m.expectations], _cols(p.relations[n].columns))
 
     def upstream_of(n):
         if n not in upstream:
@@ -308,6 +311,15 @@ def _manifest(c: Checked, sql: str) -> dict:
             "options": c.options[k.name],
         }
 
+    for m in p.models.values():  # quarantine destinations are sinks too: renaming a model moves them
+        qname = f"{m.name}__quarantine"
+        if qname in c.options:
+            cols = _cols(p.relations[m.name].columns) + [{"name": "_violated_expectation", "type": "STRING"},
+                                                        {"name": "_quarantined_at", "type": "TIMESTAMP_LTZ(3)"}]
+            sinks[qname] = {"from": m.name, "mode": "append", "primary_key": [], "on_conflict": None,
+                            "columns": cols, "schema_hash": h(cols), "options": c.options[qname],
+                            "quarantine": True}
+
     artifacts = set()
     for conn in p.connections.values():
         spec = CATALOG.get(conn.type)
@@ -329,7 +341,7 @@ def _manifest(c: Checked, sql: str) -> dict:
         }
     runtime_fns = [cls for fn, cls in ((ASSERT_FN, ASSERT_CLASS), (EXPECT_FN, EXPECT_CLASS)) if f"{fn}(" in sql]
     return {
-        "format_version": 1,
+        "format_version": 2,  # 2: name-free logic hashes
         "compiler": f"cascade {__version__}",
         "pipeline": p.name,
         "environment": p.env,
@@ -349,6 +361,23 @@ def _manifest(c: Checked, sql: str) -> dict:
                                "function": f.function, "returns": f.returns.text if f.returns else None,
                                "deterministic": f.deterministic} for f in p.functions.values()},
     }
+
+
+def _unnamed_sql(c: Checked, name: str) -> str:
+    """The model's SQL with each referenced source/model replaced by its input position."""
+    import re
+    sql = c.pipeline.models[name].sql
+    a = c.analyses.get(name)
+    if a is None:
+        return sql
+    inputs = c.pipeline.relations[name].inputs
+    for r in sorted(a.refs, key=lambda r: -r.pos):
+        if r.name not in inputs:
+            continue
+        m = re.compile(r"`?" + re.escape(r.name) + r"`?", re.IGNORECASE).match(sql, r.pos)
+        if m:
+            sql = sql[:m.start()] + f"_input{inputs.index(r.name)}" + sql[m.end():]
+    return sql
 
 
 def mermaid(c: Checked) -> str:

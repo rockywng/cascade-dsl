@@ -46,6 +46,11 @@ def _content(node: dict) -> dict:
         c["configuration"] = conf
     else:
         c.pop("configuration", None)
+    if isinstance(c.get("state"), list):
+        # the retention time is a property of the state, not its identity: a new TTL applies to the
+        # restored entries (only turning TTL on or off changes the state's serializer)
+        c["state"] = [{**st, "ttl": bool(st.get("ttl")) and st.get("ttl") not in ("0 ms",)} if isinstance(st, dict)
+                      else st for st in c["state"]]
     return c
 
 
@@ -147,6 +152,9 @@ class PinReport:
     # new operators that need pre-upgrade input to be correct: (label, why)
     needs_history: list[tuple[str, str]] = field(default_factory=list)
     dropped_stateful: list[str] = field(default_factory=list)
+    # replaced sink operators without declared state (most sinks keep none; a transactional
+    # exactly-once writer does, and would lose its pending transactions)
+    dropped_sinks: list[str] = field(default_factory=list)
 
     @property
     def restorable(self) -> bool:
@@ -206,8 +214,14 @@ def pin_uids(old: dict, new: dict, allow_drift: bool = True, tag: str | None = N
                 if why and old_nodes:  # a first deployment has no "before"
                     report.needs_history.append((_label(node), why))
         node["configuration"] = conf
-    report.dropped_stateful = [_label(old_nodes[o]) for o in sorted(old_nodes)
-                               if o not in matched_old and is_stateful(old_nodes[o])]
+    for o in sorted(old_nodes):
+        n = old_nodes[o]
+        if o in matched_old or not is_stateful(n):
+            continue
+        if n["type"].startswith("stream-exec-sink") and "state" not in n:
+            report.dropped_sinks.append(_label(n))
+        else:
+            report.dropped_stateful.append(_label(n))
     return new, report
 
 
@@ -255,7 +269,7 @@ def operator_map_for(r, setup, plan_path: str, flink_home: str) -> dict:
 
 
 def restore_test(old_path: str, new_path: str, flink_home: str, env: str | None = None,
-                 pin: bool = True, seconds: int = 8) -> dict:
+                 pin: bool = True, seconds: int = 8, allow_state_loss: bool = False) -> dict:
     """Run the old version locally, take a savepoint, and restore the new version from it.
 
     Uses local stand-in connectors (datagen / blackhole), strict mode (no unclaimed state allowed)."""
@@ -272,7 +286,8 @@ def restore_test(old_path: str, new_path: str, flink_home: str, env: str | None 
                 old = json.load(f)
             with open(new_plan) as f:
                 _, report = pin_uids(old, json.load(f))  # analysis only; the plan stays unpinned
-        result = tools.restore_test(old_setup, old_plan, new_setup, new_plan, seconds)
+        result = tools.restore_test(old_setup, old_plan, new_setup, new_plan, seconds,
+                                    allow_state_loss=allow_state_loss)
     result["pinned"] = pin
     result["report"] = report
     return result

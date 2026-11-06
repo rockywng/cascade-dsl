@@ -68,7 +68,8 @@ class PinUidsTest(unittest.TestCase):
         self.assertEqual(len(report.drift), 2)  # aggregate and sink
         _, strict = pin_uids(OLD, new, allow_drift=False, tag="v2")
         self.assertEqual(strict.drift, [])
-        self.assertEqual(len(strict.dropped_stateful), 2)
+        self.assertEqual(len(strict.dropped_stateful), 1)  # the aggregate
+        self.assertEqual(len(strict.dropped_sinks), 1)  # a sink without declared state
 
     def test_pins_chain_across_versions(self):
         v2, _ = pin_uids(OLD, plan([SRC, CALC, AGG, SINK], [(1, 2), (2, 3), (3, 4)]), tag="v2")

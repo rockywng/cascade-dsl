@@ -155,7 +155,7 @@ class Tools:
             return result
 
     def restore_test(self, old_setup: list[Stmt], old_plan: str, new_setup: list[Stmt], new_plan: str,
-                     seconds: int = 8, timeout: int = 400) -> dict:
+                     seconds: int = 8, timeout: int = 400, allow_state_loss: bool = False) -> dict:
         d = tempfile.mkdtemp(prefix="cascade-restore-")
         try:
             out = os.path.join(d, "out.json")
@@ -166,7 +166,8 @@ class Tools:
                     f.write(script(stmts))
                 paths.append(path)
             self._run(["restore-test", paths[0], os.path.abspath(old_plan), paths[1], os.path.abspath(new_plan),
-                       os.path.join(d, "savepoints"), str(seconds), out], timeout)
+                       os.path.join(d, "savepoints"), str(seconds), out,
+                       "allow" if allow_state_loss else "strict"], timeout)
             return self._read(out)
         finally:
             shutil.rmtree(d, ignore_errors=True)

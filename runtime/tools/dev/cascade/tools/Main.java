@@ -89,7 +89,7 @@ public final class Main {
                 break;
             case "restore-test":
                 out = restoreTest(Paths.get(args[1]), args[2], Paths.get(args[3]), args[4], args[5],
-                        Integer.parseInt(args[6]));
+                        Integer.parseInt(args[6]), args.length > 8 && "allow".equals(args[8]));
                 outPath = args[7];
                 break;
             case "job-graph":
@@ -357,7 +357,8 @@ public final class Main {
     }
 
     private static Map<String, Object> restoreTest(
-            Path oldSetup, String oldPlan, Path newSetup, String newPlan, String spDir, int seconds)
+            Path oldSetup, String oldPlan, Path newSetup, String newPlan, String spDir, int seconds,
+            boolean allowStateLoss)
             throws Exception {
         Map<String, Object> out = new LinkedHashMap<>();
         JobClient oldJob = null;
@@ -376,7 +377,7 @@ public final class Main {
 
             Configuration restore = new Configuration();
             restore.setString("execution.state-recovery.path", savepoint);
-            restore.setString("execution.state-recovery.ignore-unclaimed-state", "false");
+            restore.setString("execution.state-recovery.ignore-unclaimed-state", String.valueOf(allowStateLoss));
             TableEnvironment t2 = newEnv(restore);
             setup(t2, statements(newSetup));
             TableResult r2 = t2.executePlan(PlanReference.fromFile(newPlan));

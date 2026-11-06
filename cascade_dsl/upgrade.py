@@ -23,8 +23,26 @@ def diff_manifests(old: dict, new: dict) -> tuple[str, list[Change]]:
     changes: list[Change] = []
     on, nn = old.get("nodes", {}), new.get("nodes", {})
 
+    if old.get("format_version") != new.get("format_version"):
+        changes.append(Change("warning", "MANIFEST_FORMAT_CHANGED", "manifest",
+                              f"manifests come from different compiler formats ({old.get('format_version')} -> "
+                              f"{new.get('format_version')}); state identities may differ only for that reason. "
+                              "Recompile the running version with this compiler to compare exactly"))
+
+    # renames: a node that disappeared under one name and appeared under another with the same state
+    renamed: dict[str, str] = {}
+    gone = {k: v for k, v in on.items() if k not in nn and v.get("state_id")}
+    fresh = {k: v for k, v in nn.items() if k not in on and v.get("state_id")}
+    for oname, o in gone.items():
+        match = [k for k, v in fresh.items() if v["state_id"] == o["state_id"] and v["kind"] == o["kind"]
+                 and k not in renamed.values()]
+        if len(match) == 1:
+            renamed[oname] = match[0]
+            changes.append(Change("ok", "RENAMED", match[0], f"{o['kind']} '{oname}' is now '{match[0]}'; "
+                                  "its state carries over"))
+
     for name, o in on.items():
-        n = nn.get(name)
+        n = nn.get(renamed.get(name, name))
         if o.get("state_id") is None:
             continue
         if n is None or n.get("state_id") is None:
@@ -54,6 +72,8 @@ def diff_manifests(old: dict, new: dict) -> tuple[str, list[Change]]:
                                   "was built with the old logic (results may mix old and new semantics)"))
 
     for name, n in nn.items():
+        if name in renamed.values():
+            continue
         if n.get("state_id") is not None and (name not in on or on[name].get("state_id") is None):
             what = "will start from its startup mode" if n["kind"] == "source" else "starts with empty state"
             changes.append(Change("warning", "STATE_NEW", name, f"{n['kind']} '{name}' is new and {what}"))
@@ -92,6 +112,7 @@ def diff_manifests(old: dict, new: dict) -> tuple[str, list[Change]]:
             changes.append(Change("warning", "SINK_ADDED", name, f"sink '{name}' is new"))
 
     changes += _scaling_changes(old, new)
+    changes += _planner_changes(old, new)
     verdict = max((c.level for c in changes), key=ORDER.get, default="ok")
     return verdict, sorted(changes, key=lambda c: -ORDER[c.level])
 
@@ -124,3 +145,32 @@ def _scaling_changes(old: dict, new: dict) -> list[Change]:
     return [Change("warning", "MAX_PARALLELISM_UNSET", "scaling",
                    f"max_parallelism is no longer set (was {o}); Flink keeps the savepoint's value on restore, "
                    "but new deployments from scratch would derive a different one")]
+
+
+# Flink options that change how stateful operators are planned (local/global aggregation, split
+# distinct aggregates, ...): operators get re-planned and their state no longer maps
+REPLAN_OPTIONS = ("table.exec.mini-batch.enabled", "table.optimizer.agg-phase-strategy",
+                  "table.optimizer.distinct-agg.split.enabled", "table.optimizer.incremental-agg-enabled",
+                  "table.exec.sink.upsert-materialize", "table.optimizer.multiple-input-enabled",
+                  "table.exec.mini-batch.size", "table.optimizer.reuse-sub-plan-enabled",
+                  "table.optimizer.reuse-source-enabled")
+
+
+def _planner_changes(old: dict, new: dict) -> list[Change]:
+    out = []
+    stateful = any(n.get("stateful_ops") for n in old.get("nodes", {}).values())
+    if not stateful:
+        return out
+    oc, nc = old.get("flink_config") or {}, new.get("flink_config") or {}
+    for key in REPLAN_OPTIONS:
+        if oc.get(key) != nc.get(key):
+            out.append(Change("state_loss", "PLANNER_CONFIG_CHANGED", key,
+                              f"'{key}' {oc.get(key)} -> {nc.get(key)} re-plans stateful operators (e.g. "
+                              "local/global aggregation), so their state may not map. `cascade plan --previous` "
+                              "or `cascade restore-test` shows exactly which"))
+    unbounded = any(not op.get("bounded") for n in old.get("nodes", {}).values() for op in n.get("stateful_ops", []))
+    if unbounded and (old.get("state_ttl_ms") is None) != (new.get("state_ttl_ms") is None):
+        out.append(Change("state_loss", "STATE_TTL_TOGGLED", "defaults.state_ttl",
+                          "turning state TTL on or off changes the format of unbounded state, which then "
+                          "cannot be restored (changing the TTL duration is fine)"))
+    return out

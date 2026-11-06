@@ -172,6 +172,8 @@ def _print_pin_report(report) -> None:
         print(f"    new stateful operator (starts empty): {x}")
     for x in report.dropped_stateful:
         print(f"    state dropped (operator removed or changed): {x}")
+    for x in report.dropped_sinks:
+        print(f"    sink replaced: {x} (keeps no state unless it writes exactly-once transactions)")
     if report.needs_history:
         print("  WARNING: new operators that need data from before the upgrade (results will be incomplete "
               "until they have seen it; backfill or replay their inputs):")
@@ -220,7 +222,8 @@ def cmd_restore_test(args) -> int:
     print(f"running {args.old} locally, taking a savepoint, restoring {args.new} "
           f"({'with' if not args.no_pin else 'without'} UID pinning) ...", file=sys.stderr)
     try:
-        res = restore_test(args.old, args.new, home, args.env, pin=not args.no_pin, seconds=args.seconds)
+        res = restore_test(args.old, args.new, home, args.env, pin=not args.no_pin, seconds=args.seconds,
+                           allow_state_loss=args.allow_state_loss)
     except PlanError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -361,6 +364,8 @@ def main(argv=None) -> int:
     sp.add_argument("--flink-home")
     sp.add_argument("--no-pin", action="store_true", help="do not pin UIDs (shows what an unpinned deploy does)")
     sp.add_argument("--seconds", type=int, default=8, help="how long to run OLD before the savepoint")
+    sp.add_argument("--allow-state-loss", action="store_true",
+                    help="restore with ignore-unclaimed-state (like --allowNonRestoredState)")
     sp.set_defaults(fn=cmd_restore_test)
 
     sp = sub.add_parser("deploy", help="generate Kubernetes resources (FlinkDeployment, ConfigMap, Dockerfile)")

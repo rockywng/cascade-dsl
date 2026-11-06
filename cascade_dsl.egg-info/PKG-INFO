@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: cascade-dsl
+Version: 0.1.0
+Summary: Declarative pipeline DSL that compiles to Flink SQL
+Requires-Python: >=3.10
+Requires-Dist: PyYAML>=6

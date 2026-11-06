@@ -1,5 +1,6 @@
 """cascade deploy: generated Kubernetes resources, and the runner that executes them."""
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +26,11 @@ def load_all(d):
             with open(os.path.join(d, name)) as f:
                 out[name] = yaml.safe_load(f)
     return out
+
+
+def sql_text(script: str) -> str:
+    """SQL without comments and layout (the YAML example's .sql files have comments and other indentation)."""
+    return " ".join(re.sub(r"--[^\n]*", "", script).split())
 
 
 class DeployTest(unittest.TestCase):
@@ -73,8 +79,8 @@ class DeployTest(unittest.TestCase):
                 y["metadata"]["annotations"].pop("cascade.dev/sql-sha256")
             if name == "configmap.yaml":
                 for k in x["data"]:  # headers name the source file
-                    x["data"][k] = " ".join(x["data"][k].split("\n", 1)[1].split())  # SQL indentation differs
-                    y["data"][k] = " ".join(y["data"][k].split("\n", 1)[1].split())
+                    x["data"][k] = sql_text(x["data"][k])
+                    y["data"][k] = sql_text(y["data"][k])
             self.assertEqual(x, y, name)
         shutil.rmtree(a)
 

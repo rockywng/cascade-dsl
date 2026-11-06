@@ -41,7 +41,7 @@ services:
       retries: 30
 
   jobmanager:
-    image: cascade-it:latest
+    image: cascade-it:it
     build:
       context: ..
       dockerfile: integration/.work/Dockerfile
@@ -67,7 +67,7 @@ services:
       postgres: {condition: service_healthy}
 
   taskmanager:
-    image: cascade-it:latest
+    image: cascade-it:it
     command: taskmanager
     environment:
       FLINK_PROPERTIES: |

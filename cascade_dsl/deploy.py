@@ -208,6 +208,26 @@ def _check_plan_matches(plan: dict, stmts: list[Stmt]):
                           "recompile it with `cascade plan` for this version/environment")
 
 
+def merge_pod_template(base: dict, extra: dict) -> dict:
+    """deploy.pod_template merged into the generated one: mappings merge recursively, containers
+    merge by name, other lists are appended (volumes, tolerations, ...)."""
+    out = dict(base)
+    for k, v in extra.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = merge_pod_template(out[k], v)
+        elif k == "containers" and isinstance(v, list):
+            by_name = {c.get("name"): dict(c) for c in out.get(k, [])}
+            for c in v:
+                name = c.get("name")
+                by_name[name] = merge_pod_template(by_name[name], c) if name in by_name else dict(c)
+            out[k] = list(by_name.values())
+        elif k in out and isinstance(out[k], list) and isinstance(v, list):
+            out[k] = out[k] + v
+        else:
+            out[k] = v
+    return out
+
+
 def _content_hash(files: dict) -> str:
     import hashlib
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:10]
@@ -272,6 +292,12 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
         annotations["cascade.dev/model-scaling"] = json.dumps(
             {m.name: {"min": m.scaling.min, "max": m.scaling.max} for m in p.models.values() if m.scaling},
             sort_keys=True)
+    pod_template = {
+        "metadata": {"annotations": {"cascade.dev/job-config": job_cm}},
+        "spec": {"containers": [container], "volumes": volumes},
+    }
+    if cfg.get("pod_template"):
+        pod_template = merge_pod_template(pod_template, cfg["pod_template"])
     return {
         "apiVersion": "flink.apache.org/v1beta1",
         "kind": "FlinkDeployment",
@@ -284,10 +310,7 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
             "jobManager": {"replicas": int(jm.get("replicas", 1)),
                            "resource": {"memory": _memory(jm.get("memory", "2g")), "cpu": float(jm.get("cpu", 1))}},
             "taskManager": {"resource": {"memory": _memory(tm.get("memory", "4g")), "cpu": float(tm.get("cpu", 1))}},
-            "podTemplate": {
-                "metadata": {"annotations": {"cascade.dev/job-config": job_cm}},
-                "spec": {"containers": [container], "volumes": volumes},
-            },
+            "podTemplate": pod_template,
             "job": {
                 "jarURI": f"local://{RUNTIME_JAR}",
                 "entryClass": RUNNER,

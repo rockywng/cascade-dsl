@@ -93,10 +93,41 @@ def _sinks_reached(plan: dict) -> dict[int, frozenset]:
     return memo
 
 
+# exec node types that keep state. Not every one declares a "state" entry in the plan JSON
+# (temporal joins, for example, do not), so the type is the reliable signal.
+STATEFUL_TYPES = ("stream-exec-table-source-scan", "stream-exec-sink", "stream-exec-changelog-normalize",
+                  "stream-exec-temporal-join", "stream-exec-join", "stream-exec-multi-join",
+                  "stream-exec-interval-join", "stream-exec-window-join", "stream-exec-group-aggregate",
+                  "stream-exec-global-group-aggregate", "stream-exec-incremental-group-aggregate",
+                  "stream-exec-window-aggregate", "stream-exec-global-window-aggregate",
+                  "stream-exec-group-window-aggregate", "stream-exec-deduplicate", "stream-exec-rank",
+                  "stream-exec-window-rank", "stream-exec-window-deduplicate", "stream-exec-over-aggregate",
+                  "stream-exec-match", "stream-exec-limit", "stream-exec-sort-limit")
+
+# stateful operators whose output depends on input from before they started: started empty next to
+# sources that resume from saved positions, they only ever see post-upgrade input
+HISTORY_TYPES = {
+    "stream-exec-temporal-join": "its versioned table starts empty and the source will not resend old "
+                                 "rows, so lookups miss for every key that has not changed since the upgrade",
+    "stream-exec-join": "it only joins rows that arrive after the upgrade",
+    "stream-exec-multi-join": "it only joins rows that arrive after the upgrade",
+    "stream-exec-group-aggregate": "it only aggregates rows that arrive after the upgrade",
+    "stream-exec-global-group-aggregate": "it only aggregates rows that arrive after the upgrade",
+    "stream-exec-incremental-group-aggregate": "it only aggregates rows that arrive after the upgrade",
+    "stream-exec-deduplicate": "it does not know rows seen before the upgrade",
+    "stream-exec-rank": "it does not know rows seen before the upgrade",
+    "stream-exec-over-aggregate": "it only aggregates rows that arrive after the upgrade",
+    "stream-exec-changelog-normalize": "it does not know rows seen before the upgrade",
+}
+
+
 def is_stateful(node: dict) -> bool:
-    t = node["type"]
-    return "state" in node or t.startswith(("stream-exec-table-source-scan", "stream-exec-sink",
-                                            "stream-exec-changelog-normalize"))
+    return "state" in node or node["type"].startswith(STATEFUL_TYPES)
+
+
+def history_warning(node: dict) -> str | None:
+    t = node["type"].rsplit("_", 1)[0]
+    return HISTORY_TYPES.get(t)
 
 
 def _label(node: dict) -> str:
@@ -113,6 +144,8 @@ class PinReport:
     exact: list[tuple[str, str]] = field(default_factory=list)  # (new label, old label)
     drift: list[tuple[str, str]] = field(default_factory=list)
     new_stateful: list[str] = field(default_factory=list)
+    # new operators that need pre-upgrade input to be correct: (label, why)
+    needs_history: list[tuple[str, str]] = field(default_factory=list)
     dropped_stateful: list[str] = field(default_factory=list)
 
     @property
@@ -169,6 +202,9 @@ def pin_uids(old: dict, new: dict, allow_drift: bool = True, tag: str | None = N
             conf[UID_KEY] = f"{tag}-<id>_<transformation>"
             if is_stateful(node):
                 report.new_stateful.append(_label(node))
+                why = history_warning(node)
+                if why and old_nodes:  # a first deployment has no "before"
+                    report.needs_history.append((_label(node), why))
         node["configuration"] = conf
     report.dropped_stateful = [_label(old_nodes[o]) for o in sorted(old_nodes)
                                if o not in matched_old and is_stateful(old_nodes[o])]

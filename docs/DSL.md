@@ -393,6 +393,12 @@ compiler warns (CD361). Compilation itself never needs a JVM.
     sinks; this is reported. Matched nodes keep their old operator UIDs through a per-node
     `table.exec.uid.format`. Changed and new nodes get fresh, collision-free UIDs.
   - Production connectors must be on the tools classpath. `--local-connectors` uses stand-ins.
+  - New stateful operators start empty, but their sources resume from saved positions, so they
+    only see post-upgrade input. The plan report names those whose results depend on earlier
+    input and says why: a new TemporalJoin, for example, has an empty versioned table and misses
+    every key that hasn't changed since the upgrade. The planner can create such operators even
+    for unchanged models. Adding a model that reads a joined model can duplicate the join for the
+    new branch.
 - `cascade restore-test OLD NEW [--no-pin] [--seconds N]` runs OLD locally with stand-in
   connectors, stops it with a savepoint, and starts NEW from that savepoint with
   `ignore-unclaimed-state=false`. It reports whether every piece of state mapped, and which
@@ -415,6 +421,10 @@ deploy:
   artifacts: {org.apache.flink:flink-sql-connector-kafka: <version>}   # connector versions for the image
   jars: [libs/extra.jar]                                # more jars for /opt/flink/usrlib
   flink_config: {}                                      # extra flinkConfiguration entries
+  pod_template:                                         # merged into the generated pod template
+    spec:
+      nodeSelector: {pool: flink}
+      volumes: [...]                                    # lists append; containers merge by name
   labels: {team: data-eng}
 ```
 
@@ -430,6 +440,11 @@ the Flink Kubernetes Operator:
 | `kustomization.yaml` | `kubectl apply -k`, or for GitOps |
 | `Dockerfile` | Runtime image: `flink:<version>`, the connector jars the manifest lists (one `ARG` per version), `cascade-runtime.jar`, UDF jars, and PyFlink when needed |
 | `operators.json` | Copied from `--plan-dir`: vertex → model mapping |
+
+**Upgrades through the operator.** The job ConfigMap is named after its content and referenced
+from the pod template. So `kubectl apply -k` of a new version changes the FlinkDeployment spec,
+and the operator does a savepoint upgrade (`upgrade_mode: savepoint`). A running job never sees
+the next version's files. Old ConfigMaps stay behind until you delete them.
 
 **Secrets.** A secret `${secret:kafka/prod/bootstrap}` stays a placeholder everywhere on disk. The
 pod gets the env var `CASCADE_SECRET_KAFKA_PROD_BOOTSTRAP` from key `kafka.prod.bootstrap` of the

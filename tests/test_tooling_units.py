@@ -78,6 +78,21 @@ class PinUidsTest(unittest.TestCase):
         self.assertEqual(uid_of(v3, "stream-exec-group-aggregate"), "3_<transformation>")
 
 
+class StatefulDetectionTest(unittest.TestCase):
+    def test_new_temporal_join_needs_history(self):
+        # temporal joins carry no "state" entry in plan JSON; they must still count as stateful
+        tj = node(5, "stream-exec-temporal-join_1")
+        new = plan([SRC, CALC, AGG, SINK, tj], [(1, 2), (2, 3), (3, 4), (2, 5)])
+        _, report = pin_uids(OLD, new, tag="v2")
+        self.assertIn("stream-exec-temporal-join_1#5 #5", report.new_stateful)
+        self.assertEqual([x[0] for x in report.needs_history], ["stream-exec-temporal-join_1#5 #5"])
+        self.assertIn("lookups miss", report.needs_history[0][1])
+
+    def test_first_deployment_needs_no_history(self):
+        _, report = pin_uids({"nodes": [], "edges": []}, OLD, tag="v1")
+        self.assertEqual(report.needs_history, [])
+
+
 class AvroImportTest(unittest.TestCase):
     SCHEMA = {
         "type": "record", "name": "Order", "fields": [

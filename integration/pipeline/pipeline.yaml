@@ -11,9 +11,19 @@ flink:
     table.exec.source.idle-timeout: 2s
 
 deploy:
-  image: cascade-it:latest
+  image: cascade-it:it                 # not :latest, so kind uses the loaded image
+  jobmanager: {memory: 1g, cpu: 0.25}
+  taskmanager: {memory: 1536m, cpu: 0.5, slots: 4}
   checkpoints: {interval: 5s, dir: "file:///flink-data/checkpoints"}
   savepoints: file:///flink-data/savepoints
+  pod_template:                        # one-node kind cluster: a host directory is shared storage
+    spec:
+      containers:
+        - name: flink-main-container
+          volumeMounts: [{name: flink-data, mountPath: /flink-data}]
+      volumes:
+        - name: flink-data
+          hostPath: {path: /flink-data, type: Directory}
 
 connections:
   bus:

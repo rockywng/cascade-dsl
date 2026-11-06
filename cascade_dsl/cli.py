@@ -172,6 +172,11 @@ def _print_pin_report(report) -> None:
         print(f"    new stateful operator (starts empty): {x}")
     for x in report.dropped_stateful:
         print(f"    state dropped (operator removed or changed): {x}")
+    if report.needs_history:
+        print("  WARNING: new operators that need data from before the upgrade (results will be incomplete "
+              "until they have seen it; backfill or replay their inputs):")
+        for label, why in report.needs_history:
+            print(f"    {label}: {why}")
 
 
 def cmd_plan(args) -> int:

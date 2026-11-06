@@ -42,6 +42,9 @@ class Failed(Exception):
     pass
 
 
+LAST_REPORT = {"text": ""}  # output of the last `cascade plan`
+
+
 # --- shell helpers ------------------------------------------------------------------------
 
 def _docker_prefix() -> list[str]:
@@ -53,7 +56,7 @@ def _docker_prefix() -> list[str]:
 
 
 def run(cmd: list[str], check=True, capture=True, input=None, env=None, timeout=900) -> str:
-    if cmd[0] == "docker" and _docker_prefix():
+    if cmd[0] in ("docker", "kind") and _docker_prefix():
         cmd = _docker_prefix() + [shlex.join(cmd)]
     proc = subprocess.run(cmd, capture_output=capture, text=True, input=input, timeout=timeout,
                           env={**os.environ, **(env or {})}, cwd=REPO)
@@ -96,8 +99,20 @@ def wait_for(what: str, fn, timeout=120, every=2):
 
 # --- systems ------------------------------------------------------------------------------
 
+def exec_compose(service: str, *args, input=None, check=True) -> str:
+    return compose("exec", "-T", service, *args, input=input, check=check)
+
+
+# where Kafka/Postgres commands run: the compose stack, or pods in kind (k8s.py swaps this)
+EXEC = {"fn": exec_compose}
+
+
+def exec_in(service: str, *args, input=None, check=True) -> str:
+    return EXEC["fn"](service, *args, input=input, check=check)
+
+
 def kafka(*args, input=None) -> str:
-    return compose("exec", "-T", "kafka", *args, input=input)
+    return exec_in("kafka", *args, input=input)
 
 
 def produce(topic: str, rows: list[dict]):
@@ -110,7 +125,7 @@ def consume(topic: str, keys: bool = False) -> list:
             "--from-beginning", "--timeout-ms", "4000"]
     if keys:
         args += ["--property", "print.key=true", "--property", "key.separator=|"]
-    out = compose("exec", "-T", "kafka", *args, check=False)
+    out = exec_in("kafka", *args, check=False)
     rows = []
     for line in out.splitlines():
         line = line.strip()
@@ -123,7 +138,7 @@ def consume(topic: str, keys: bool = False) -> list:
 
 
 def psql(sql: str) -> list[list[str]]:
-    out = compose("exec", "-T", "postgres", "psql", "-U", "flink", "-d", "shop", "-At", "-F", "|", "-c", sql)
+    out = exec_in("postgres", "psql", "-U", "flink", "-d", "shop", "-At", "-F", "|", "-c", sql)
     return [line.split("|") for line in out.strip().splitlines() if line]
 
 
@@ -159,11 +174,11 @@ def build(skip: bool):
     cascade("deploy", "integration/pipeline", "-o", out, flink=False)
     shutil.copy(os.path.join(out, "Dockerfile"), os.path.join(WORK, "Dockerfile"))
     compose("build", "jobmanager", timeout=1800)
-    ok("image cascade-it:latest built from the generated Dockerfile")
+    ok("image cascade-it:it built from the generated Dockerfile")
     shutil.rmtree(FLINK_HOME, ignore_errors=True)
     shutil.copytree(FLINK_BASE, FLINK_HOME, symlinks=True)
     run(["docker", "rm", "-f", "cascade-it-extract"], check=False)
-    run(["docker", "create", "--name", "cascade-it-extract", "cascade-it:latest"])
+    run(["docker", "create", "--name", "cascade-it-extract", "cascade-it:it"])
     run(["docker", "cp", "cascade-it-extract:/opt/flink/lib/.", os.path.join(FLINK_HOME, "lib")])
     run(["docker", "rm", "cascade-it-extract"])
     jars = sorted(j for j in os.listdir(os.path.join(FLINK_HOME, "lib")) if "connector" in j or "postgres" in j)
@@ -197,6 +212,7 @@ def package(version: str, project: str, previous: str | None = None) -> str:
     if previous:
         args += ["--previous", os.path.join(WORK, f"plan-{previous}", "plan.json")]
     report = cascade(*args)
+    LAST_REPORT["text"] = report
     deploy_dir = os.path.join(WORK, f"deploy-{version}")
     shutil.rmtree(deploy_dir, ignore_errors=True)
     cascade("deploy", project, "-o", deploy_dir, "--plan-dir", plan_dir, flink=False)
@@ -321,35 +337,57 @@ sinks:
     return os.path.relpath(dst_dir, REPO)
 
 
-def phase_upgrade(job_id: str):
-    step("upgrade: savepoint v1, restore v2 (adds a model) with pinned UIDs")
-    v2 = write_v2()
-    args = package("v2", v2, previous="v1")
-    out = flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", job_id)
-    m = re.search(r"Savepoint completed\. Path: (\S+)", out)
-    if not m:
-        raise Failed("stop-with-savepoint failed:\n" + out[-2000:])
-    savepoint = m.group(1)
-    ok(f"v1 stopped with savepoint {savepoint.rsplit('/', 1)[-1]}")
-    # change a customer while the job is down: the CDC source must resume from its saved position
+def change_customer_before_upgrade():
+    """Customer c1 changes while v1 runs; v1 consumes the change before the savepoint."""
     psql("UPDATE customers SET segment = 'enterprise', updated_at = '2026-01-01 10:02:30' WHERE customer_id = 'c1'")
-    submit("v2", args, savepoint=savepoint)  # strict: no --allowNonRestoredState
+    # a later, unrelated transaction: Postgres CDC may redeliver the last transaction before the
+    # savepoint after a restore (at-least-once), which would hand c1's change to the new join
+    psql("INSERT INTO customers VALUES ('c3', 'smb', '2026-01-01 10:02:40')")
+    time.sleep(10)
+
+
+def check_upgrade_report():
+    """v2's new model makes the planner build a second TemporalJoin, which starts empty while the CDC
+    source resumes from its saved position: `cascade plan` must say so."""
+    text = LAST_REPORT["text"]
+    if "TemporalJoin" not in text or "lookups miss" not in text:
+        raise Failed("cascade plan did not warn about the new, empty TemporalJoin:\n" + text)
+    ok("cascade plan warned: the new TemporalJoin starts empty and will miss unchanged customers")
+
+
+def check_after_upgrade():
     produce("orders", [
         order("o6", "c1", 100.00, "10:03:10"),
         order("o7", "c2", 2.00, "10:05:00"),    # closes the 10:03 window
     ])
     # keyed state restored: totals continue from v1; offsets restored: o1..o5 not re-read
     expect("LTV continues from restored state, no order read twice", ltv_table,
-           {"c1": (115.0, 3), "c2": (23.0, 3)})
+           {"c1": (115.0, 3), "c2": (23.0, 3)}, timeout=180)
     expect("upsert-kafka sink after upgrade", ltv_topic, {"c1": (115.0, 3), "c2": (23.0, 3)})
-    # CDC position restored: the update made during the downtime is applied, at its event time
-    expect("CDC update made while stopped is seen after restore", revenue,
+    # the restored TemporalJoin knows c1's update from before the upgrade
+    expect("restored temporal join enriches with the pre-upgrade CDC update", revenue,
            {("10:00", "smb"): (15.0, 2), ("10:00", "enterprise"): (20.0, 1),
             ("10:02", "enterprise"): (1.0, 1), ("10:03", "enterprise"): (100.0, 1)})
+    # the new model's own TemporalJoin started empty: exactly the hazard the plan report warned about
+    # (o7 at 10:05:00 is still buffered: the watermark is 10:04:58)
     counts = lambda: {k["segment"]: v["orders"] for k, v in consume("orders_per_segment", keys=True) if v}  # noqa
-    # o7 (10:05:00) is still buffered by the event-time temporal join: the watermark is 10:04:58
-    expect("new model starts from empty state (counts only post-upgrade orders)", counts,
-           {"enterprise": 1})
+    expect("new model's empty TemporalJoin misses c1 (as warned)", counts, {"unknown": 1})
+
+
+def phase_upgrade(job_id: str):
+    step("upgrade: savepoint v1, restore v2 (adds a model) with pinned UIDs")
+    v2 = write_v2()
+    args = package("v2", v2, previous="v1")
+    check_upgrade_report()
+    change_customer_before_upgrade()
+    out = flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", job_id)
+    m = re.search(r"Savepoint completed\. Path: (\S+)", out)
+    if not m:
+        raise Failed("stop-with-savepoint failed:\n" + out[-2000:])
+    savepoint = m.group(1)
+    ok(f"v1 stopped with savepoint {savepoint.rsplit('/', 1)[-1]}")
+    submit("v2", args, savepoint=savepoint)  # strict: no --allowNonRestoredState
+    check_after_upgrade()
 
 
 def main():

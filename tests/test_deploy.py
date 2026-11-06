@@ -117,6 +117,19 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(spec["metadata"]["annotations"]["cascade.dev/job-config"], cm)
         shutil.rmtree(root)
 
+    def test_pod_template_is_merged(self):
+        from cascade_dsl.deploy import merge_pod_template
+        base = {"spec": {"containers": [{"name": "flink-main-container", "volumeMounts": [{"name": "a"}]}],
+                         "volumes": [{"name": "a"}]}}
+        extra = {"spec": {"containers": [{"name": "flink-main-container", "volumeMounts": [{"name": "b"}]},
+                                         {"name": "sidecar", "image": "x"}],
+                          "volumes": [{"name": "b"}], "nodeSelector": {"pool": "flink"}}}
+        m = merge_pod_template(base, extra)["spec"]
+        self.assertEqual([c["name"] for c in m["containers"]], ["flink-main-container", "sidecar"])
+        self.assertEqual(m["containers"][0]["volumeMounts"], [{"name": "a"}, {"name": "b"}])
+        self.assertEqual(m["volumes"], [{"name": "a"}, {"name": "b"}])
+        self.assertEqual(m["nodeSelector"], {"pool": "flink"})
+
     def test_needs_an_image(self):
         r = compile_pipeline(os.path.join(EXAMPLES, "clickstream_py"))
         with self.assertRaises(DeployError):

@@ -101,6 +101,10 @@ def _pg_finish(role, mode, fmt, opts, ctx: LowerCtx):
     problems = _db_table_finish("schema-name", "table-name")(role, mode, fmt, opts, ctx)
     # replication slots are per-consumer; derive a stable unique name
     opts.setdefault("slot.name", re.sub(r"[^a-z0-9_]", "_", f"{ctx.pipeline}_{ctx.node}".lower())[:63])
+    # The legacy (non-incremental) reader re-snapshots the whole table when a job is restored from a
+    # savepoint (seen in integration/run.py with Flink CDC 3.7): every upgrade would re-emit every row.
+    # The incremental reader resumes from the saved LSN.
+    opts.setdefault("scan.incremental.snapshot.enabled", "true")
     return problems
 
 

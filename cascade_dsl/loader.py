@@ -30,7 +30,7 @@ SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "descript
 MODEL_KEYS = {"sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling"}
 DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
                "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
-               "jars"}
+               "jars", "pod_template"}
 SCALING_KEYS = {"max_parallelism", "parallelism", "min", "max", "target_utilization", "max_lag", "autoscale"}
 
 

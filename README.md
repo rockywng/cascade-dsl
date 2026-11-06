@@ -176,6 +176,14 @@ through `CASCADE_ASSERT`. Both UDFs report
 expectation and action, so dropped rows show up on dashboards. Quarantined rows also go to a sink,
 and tests can target them as `<model>.quarantined`.
 
+## Integration environment
+
+[integration/](integration/) runs a pipeline against real Kafka, Postgres CDC and JDBC on Flink
+2.3.0. It runs once as a docker-compose session cluster and once through the Flink Kubernetes
+Operator on kind, using exactly what `cascade plan` and `cascade deploy` produce. Each run upgrades
+v1 to v2 through a savepoint and checks keyed state, Kafka offsets and the CDC position from
+outside the job. It has already found five bugs, listed in its README.
+
 ## Tests of the compiler itself
 
 ```bash
@@ -229,8 +237,9 @@ CI runs everything against Flink 2.3.0.
 - **UID pinning matches the operators Flink generates.** If a Flink upgrade changes how a query is
   planned, operators won't match, and the restore test reports that before deploy.
 - **Schema import handles Avro only** (no JSON Schema or Protobuf).
-- **`cascade deploy` output is checked locally, not on a cluster.** The tests run the runner in
-  `--validate` mode against the generated ConfigMap. The FlinkDeployment and Dockerfile haven't
-  been applied to a real operator or built in CI. Connector versions are build arguments.
+- **Integration runs cover Kafka, Postgres CDC and JDBC only.** [integration/](integration/)
+  runs a pipeline against real Kafka, Postgres CDC and JDBC on Flink 2.3, under docker compose and
+  under the Flink Kubernetes Operator on kind. It includes a savepoint upgrade. Iceberg, MySQL CDC
+  and schema-registry formats aren't in it yet.
 - **Operator attribution is structural.** It's exact for sources, sinks and stateful operators.
   Stateless operators fused across models are attributed by their position in the graph.

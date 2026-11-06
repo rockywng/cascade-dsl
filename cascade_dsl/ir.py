@@ -159,6 +159,7 @@ class Pipeline:
     quarantine: Quarantine | None
     secrets: set[str] = field(default_factory=set)
     scaling: Scaling | None = None
+    deploy: dict | None = None  # deployment settings (image, resources, checkpoints, ...), vars resolved
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     relations: dict[str, RelationInfo] = field(default_factory=dict)
     loc: Location | None = None

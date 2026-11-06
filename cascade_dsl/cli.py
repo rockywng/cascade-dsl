@@ -229,6 +229,28 @@ def cmd_restore_test(args) -> int:
     return 1
 
 
+def cmd_deploy(args) -> int:
+    from .deploy import DeployError, build, secret_key
+    r = compile_pipeline(args.path, args.env)
+    _print_diags(r, False, False)
+    if not r.ok:
+        return 1
+    try:
+        info = build(r, args.out, plan_dir=args.plan_dir, image=args.image)
+    except DeployError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"wrote {info['out']}: FlinkDeployment '{info['name']}' ({info['mode']} mode)", file=sys.stderr)
+    if info["mode"] == "statements":
+        print("  note: without --plan-dir the job is planned at startup and operator UIDs are not pinned; "
+              "use `cascade plan` for upgrades that must keep state", file=sys.stderr)
+    if info["secrets"]:
+        print(f"  needs Secret '{info['secret_name']}' with keys: "
+              + ", ".join(sorted(secret_key(s) for s in info["secrets"])) + " (see secret.template.yaml)",
+              file=sys.stderr)
+    return 0
+
+
 def cmd_import_schema(args) -> int:
     from .registry import SchemaImportError, avro_columns, columns_yaml, fetch
     try:
@@ -335,6 +357,14 @@ def main(argv=None) -> int:
     sp.add_argument("--no-pin", action="store_true", help="do not pin UIDs (shows what an unpinned deploy does)")
     sp.add_argument("--seconds", type=int, default=8, help="how long to run OLD before the savepoint")
     sp.set_defaults(fn=cmd_restore_test)
+
+    sp = sub.add_parser("deploy", help="generate Kubernetes resources (FlinkDeployment, ConfigMap, Dockerfile)")
+    sp.add_argument("path")
+    sp.add_argument("--env")
+    sp.add_argument("-o", "--out", default="deploy")
+    sp.add_argument("--plan-dir", help="directory written by `cascade plan` (deploys EXECUTE PLAN with pinned UIDs)")
+    sp.add_argument("--image", help="runtime image (overrides deploy.image)")
+    sp.set_defaults(fn=cmd_deploy)
 
     sp = sub.add_parser("import-schema", help="generate source columns from a schema registry subject or .avsc")
     sp.add_argument("--registry")

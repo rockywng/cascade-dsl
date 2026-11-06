@@ -19,6 +19,16 @@ scaling:
   target_utilization: 0.7
   max_lag: 1m
 
+# How `cascade deploy` runs the job on Kubernetes (Flink Kubernetes Operator).
+deploy:
+  image: ghcr.io/acme/cascade-orders:${var:image_tag}
+  namespace: data-pipelines
+  jobmanager: {memory: 2g, cpu: 1}
+  taskmanager: {memory: 4g, cpu: 2, slots: 2}
+  checkpoints: {interval: 30s, dir: "${var:state_bucket}/checkpoints"}
+  savepoints: ${var:state_bucket}/savepoints
+  upgrade_mode: savepoint
+
 flink:
   config:
     table.exec.mini-batch.enabled: "true"
@@ -29,11 +39,15 @@ flink:
 vars:
   kafka_bootstrap: localhost:9092
   warehouse: s3://dev-lake/warehouse
+  image_tag: dev
+  state_bucket: s3://dev-flink-state/orders
 environments:
   prod:
     vars:
       kafka_bootstrap: ${secret:kafka/prod/bootstrap}
       warehouse: s3://prod-lake/warehouse
+      image_tag: "1.4.0"
+      state_bucket: s3://prod-flink-state/orders
 
 connections:
   events:

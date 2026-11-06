@@ -137,6 +137,7 @@ class Pipeline:
     owner: str | None = None
     state_ttl: str | None = None
     flink_config: dict | None = None
+    deploy: dict | None = None  # image, namespace, jobmanager, taskmanager, checkpoints, ... (see docs)
     scaling: dict | None = None  # max_parallelism, parallelism, min, max, target_utilization, max_lag, autoscale
     vars: dict = field(default_factory=dict)
     environments: dict = field(default_factory=dict)
@@ -221,6 +222,8 @@ class Pipeline:
             doc["flink"] = _ld({"config": _ld(self.flink_config, self._line)}, self._line)
         if self.scaling:
             doc["scaling"] = _ld(self.scaling, self._line)
+        if self.deploy:
+            doc["deploy"] = _nested(self.deploy, self._line)
         if self.vars:
             doc["vars"] = _ld(self.vars, self._line)
         if self.environments:

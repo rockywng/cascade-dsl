@@ -16,9 +16,15 @@ pipeline = Pipeline(
         "table.exec.mini-batch.allow-latency": "2s",
         "table.exec.mini-batch.size": "5000",
     },
-    vars={"kafka_bootstrap": "localhost:9092", "warehouse": "s3://dev-lake/warehouse"},
+    deploy={"image": "ghcr.io/acme/cascade-orders:${var:image_tag}", "namespace": "data-pipelines",
+            "jobmanager": {"memory": "2g", "cpu": 1}, "taskmanager": {"memory": "4g", "cpu": 2, "slots": 2},
+            "checkpoints": {"interval": "30s", "dir": "${var:state_bucket}/checkpoints"},
+            "savepoints": "${var:state_bucket}/savepoints", "upgrade_mode": "savepoint"},
+    vars={"kafka_bootstrap": "localhost:9092", "warehouse": "s3://dev-lake/warehouse",
+          "image_tag": "dev", "state_bucket": "s3://dev-flink-state/orders"},
     environments={"prod": {"kafka_bootstrap": secret("kafka/prod/bootstrap"),
-                           "warehouse": "s3://prod-lake/warehouse"}},
+                           "warehouse": "s3://prod-lake/warehouse",
+                           "image_tag": "1.4.0", "state_bucket": "s3://prod-flink-state/orders"}},
 )
 p = pipeline
 

@@ -1,0 +1,153 @@
+package dev.cascade.runner;
+
+import org.apache.flink.table.api.CompiledPlan;
+import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.PlanReference;
+import org.apache.flink.table.api.StatementSet;
+import org.apache.flink.table.api.TableEnvironment;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Entry point of a deployed cascade job (FlinkDeployment {@code job.entryClass}).
+ *
+ * <pre>
+ *   SqlRunner --setup setup.sql (--plan plan.json | --statements statements.sql) [--validate]
+ * </pre>
+ *
+ * <p>setup.sql holds SET, CREATE FUNCTION and CREATE TEMPORARY TABLE statements; compiled plans
+ * reference those tables by name, so the setup always runs first. Statements are separated by a
+ * line containing only {@code -- @@cascade}.
+ *
+ * <p>{@code ${secret:a/b}} placeholders are replaced from the environment variable
+ * {@code CASCADE_SECRET_A_B} (the FlinkDeployment maps each one from a Kubernetes Secret), escaped
+ * for SQL string literals. Missing secrets fail fast with the full list. Secrets never appear in the
+ * plan or the ConfigMap.
+ *
+ * <p>{@code --validate} runs the setup and plans the job without submitting it.
+ */
+public final class SqlRunner {
+
+    static final String SEPARATOR = "-- @@cascade";
+    static final Pattern SECRET = Pattern.compile("\\$\\{secret:([^}]+)\\}");
+    private static final Pattern SET = Pattern.compile("(?s)^SET\\s+'(.*?)'\\s*=\\s*'(.*)'\\s*;?$");
+
+    private SqlRunner() {}
+
+    public static void main(String[] args) throws Exception {
+        String setup = null;
+        String plan = null;
+        String statements = null;
+        boolean validate = false;
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "--setup":
+                    setup = args[++i];
+                    break;
+                case "--plan":
+                    plan = args[++i];
+                    break;
+                case "--statements":
+                    statements = args[++i];
+                    break;
+                case "--validate":
+                    validate = true;
+                    break;
+                default:
+                    throw new IllegalArgumentException("unknown argument " + args[i]);
+            }
+        }
+        if (setup == null || (plan == null) == (statements == null)) {
+            throw new IllegalArgumentException(
+                    "usage: SqlRunner --setup setup.sql (--plan plan.json | --statements statements.sql) [--validate]");
+        }
+        Map<String, String> env = System.getenv();
+        TableEnvironment tEnv =
+                TableEnvironment.create(EnvironmentSettings.newInstance().inStreamingMode().build());
+        for (String stmt : split(substitute(read(setup), env))) {
+            Matcher m = SET.matcher(stmt);
+            if (m.matches()) {
+                tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));
+            } else {
+                tEnv.executeSql(stripSemicolon(stmt));
+            }
+        }
+        if (plan != null) {
+            CompiledPlan compiled = tEnv.loadPlan(PlanReference.fromFile(plan));
+            if (validate) {
+                System.out.println(compiled.explain());
+                System.out.println("cascade: plan OK");
+                return;
+            }
+            compiled.execute();
+        } else {
+            StatementSet set = tEnv.createStatementSet();
+            for (String stmt : split(substitute(read(statements), env))) {
+                set.addInsertSql(stripSemicolon(stmt));
+            }
+            if (validate) {
+                System.out.println(set.explain());
+                System.out.println("cascade: statements OK");
+                return;
+            }
+            set.execute();
+        }
+    }
+
+    static String read(String path) throws Exception {
+        return new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8);
+    }
+
+    static List<String> split(String text) {
+        List<String> out = new ArrayList<>();
+        for (String part : text.split("(?m)^" + Pattern.quote(SEPARATOR) + "\\s*$")) {
+            String s = part.trim();
+            // drop leading comment lines
+            while (s.startsWith("--")) {
+                int nl = s.indexOf('\n');
+                s = nl < 0 ? "" : s.substring(nl + 1).trim();
+            }
+            if (!s.isEmpty()) {
+                out.add(s);
+            }
+        }
+        return out;
+    }
+
+    static String stripSemicolon(String s) {
+        return s.endsWith(";") ? s.substring(0, s.length() - 1) : s;
+    }
+
+    /** Environment variable that carries a secret: CASCADE_SECRET_ + name, non-alphanumerics as _. */
+    public static String envName(String secret) {
+        return "CASCADE_SECRET_" + secret.trim().replaceAll("[^A-Za-z0-9]", "_").toUpperCase();
+    }
+
+    static String substitute(String text, Map<String, String> env) {
+        Matcher m = SECRET.matcher(text);
+        StringBuffer sb = new StringBuffer();
+        TreeSet<String> missing = new TreeSet<>();
+        while (m.find()) {
+            String value = env.get(envName(m.group(1)));
+            if (value == null) {
+                missing.add(m.group(1).trim() + " (" + envName(m.group(1)) + ")");
+                value = "";
+            }
+            // values land inside SQL string literals
+            m.appendReplacement(sb, Matcher.quoteReplacement(value.replace("'", "''")));
+        }
+        m.appendTail(sb);
+        if (!missing.isEmpty()) {
+            throw new IllegalStateException("missing secrets: " + String.join(", ", missing));
+        }
+        return sb.toString();
+    }
+}

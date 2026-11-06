@@ -23,11 +23,14 @@ DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h|d)\s*$")
 UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "environments",
-            "connections", "sources", "models", "sinks", "quarantine", "scaling"}
+            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy"}
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict"}
 MODEL_KEYS = {"sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling"}
+DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
+               "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
+               "jars"}
 SCALING_KEYS = {"max_parallelism", "parallelism", "min", "max", "target_utilization", "max_lag", "autoscale"}
 
 
@@ -247,6 +250,10 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         scaling = _load_scaling(subst(ctx.require_mapping(doc["scaling"], "scaling", doc, "scaling"), doc, "scaling"),
                                 ctx, SCALING_KEYS, "scaling")
 
+    deploy = None
+    if doc.get("deploy") is not None:
+        deploy = _load_deploy(subst(ctx.require_mapping(doc["deploy"], "deploy", doc, "deploy"), doc, "deploy"), ctx)
+
     if diags.has_errors:
         raise CompileError(diags)
 
@@ -255,7 +262,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         description=doc.get("description"), owner=doc.get("owner"),
         state_ttl_ms=state_ttl_ms, flink_config=flink_config,
         connections=connections, sources=sources, models=models, sinks=sinks,
-        quarantine=quarantine, secrets=secrets, scaling=scaling, loc=ctx.loc(doc),
+        quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, loc=ctx.loc(doc),
     )
     return p, diags
 
@@ -272,6 +279,37 @@ def _resolve_vars(doc, env, ctx: _Ctx) -> dict:
         ctx.check_keys(e, {"vars"}, f"environment '{env}'")
         variables.update(ctx.require_mapping(e.get("vars"), "vars", e, "vars"))
     return variables
+
+
+def _load_deploy(d, ctx: _Ctx) -> dict:
+    ctx.check_keys(d, DEPLOY_KEYS, "deploy")
+    for key in ("jobmanager", "taskmanager"):
+        r = ctx.require_mapping(d.get(key), f"deploy.{key}", d, key)
+        ctx.check_keys(r, {"memory", "cpu", "slots", "replicas"}, f"deploy.{key}")
+    cp = ctx.require_mapping(d.get("checkpoints"), "deploy.checkpoints", d, "checkpoints")
+    ctx.check_keys(cp, {"interval", "dir", "mode", "timeout", "min_pause"}, "deploy.checkpoints")
+    for key in ("interval", "timeout", "min_pause"):
+        if cp.get(key) is not None:
+            try:
+                parse_duration_ms(cp[key])
+            except ValueError as e:
+                ctx.diags.error("CD006", str(e), ctx.loc(cp, key))
+    if d.get("upgrade_mode", "savepoint") not in ("savepoint", "last-state", "stateless"):
+        ctx.diags.error("CD014", "deploy.upgrade_mode must be savepoint, last-state or stateless",
+                        ctx.loc(d, "upgrade_mode"))
+    for key, value in d.items():
+        if key != "secrets" and VAR_RE.search(str(value)) and "${secret:" in str(value):
+            ctx.diags.error("CD530", f"deploy.{key} cannot use secrets; they are injected into the job's SQL only",
+                            ctx.loc(d, key), hint="put the value in the Flink deployment's own configuration")
+    return _plain(d)
+
+
+def _plain(v):
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_plain(x) for x in v]
+    return v
 
 
 def _load_scaling(d, ctx: _Ctx, allowed: set, what: str) -> Scaling:

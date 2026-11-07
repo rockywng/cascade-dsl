@@ -459,7 +459,8 @@ def check_after_v3():
     def total():  # final value per key (the upsert topic carries every update)
         final = {k["segment"]: (v["orders"] if v else 0) for k, v in consume("orders_per_segment_bf", keys=True)}
         return sum(final.values())
-    expect("backfilled temporal join counts every historical order once", total, 6)
+    # (v3 runs 2 orders readers on 1 partition: the empty one stands down after its 60 s idle timeout)
+    expect("backfilled temporal join counts every historical order once", total, 6, timeout=300)
 
 
 def phase_v3(job_id: str):

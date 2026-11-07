@@ -45,13 +45,19 @@ class IdleTimeoutTest(unittest.TestCase):
         self.assertTrue(r.ok)
         self.assertNotIn("idle-timeout", r.lowered.sql)
 
-    def test_cdc_idle_timeout_is_job_wide_and_kafka_sources_are_pinned_to_never_idle(self):
+    def test_cdc_idle_timeout_is_job_wide_and_kafka_sources_get_a_long_one(self):
         r = compiled(replace=CDC_IDLE)
         self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
         self.assertIn("SET 'table.exec.source.idle-timeout' = '2000 ms';", r.lowered.sql)
-        self.assertEqual(r.checked.options["orders"]["scan.watermark.idle-timeout"], "0 ms")
-        self.assertEqual(r.checked.options["payments"]["scan.watermark.idle-timeout"], "0 ms")
+        self.assertEqual(r.checked.options["orders"]["scan.watermark.idle-timeout"], "60000 ms")
+        self.assertEqual(r.checked.options["payments"]["scan.watermark.idle-timeout"], "60000 ms")
         self.assertNotIn("scan.watermark.idle-timeout", r.checked.options["customers"])
+
+    def test_kafka_source_can_opt_out_of_idling(self):
+        r = compiled(replace=("    event_time: {column: ts, max_out_of_orderness: 5s}\n",
+                              "    event_time: {column: ts, max_out_of_orderness: 5s, idle_timeout: 0s}\n"))
+        self.assertTrue(r.ok)
+        self.assertEqual(r.checked.options["orders"]["scan.watermark.idle-timeout"], "0 ms")
 
     def test_kafka_source_with_its_own_idle_timeout(self):
         r = compiled(replace=("    event_time: {column: pay_ts, max_out_of_orderness: 5s}\n",

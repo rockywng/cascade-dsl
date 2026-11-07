@@ -161,6 +161,11 @@ def _check_sources(c: Checked):
 IDLE_GLOBAL = "table.exec.source.idle-timeout"
 IDLE_SOURCE = "scan.watermark.idle-timeout"
 WATERMARK_PUSHDOWN = {"kafka", "upsert-kafka"}  # connectors that take a per-source idle timeout
+# Kafka sources that declare no idle_timeout, when a job-wide one is set for other sources. Not
+# "never": a reader subtask with no partition (parallelism above the partition count) only stands
+# down through an idle timeout, and would hold event time back forever. Long enough that a broker
+# restart or a restore doesn't let other sources overtake the stream.
+KAFKA_DEFAULT_IDLE_MS = 60_000
 
 
 def _is_zero_duration(v) -> bool:
@@ -206,9 +211,10 @@ def _check_idle_timeouts(c: Checked):
     for s in timed:
         if pushdown(s) and s.name in c.options:
             own = s.event_time.idle_timeout_ms
-            if own is not None or global_ms:
-                # explicit, so a job-wide timeout set for other sources doesn't apply here
-                c.options[s.name].setdefault(IDLE_SOURCE, f"{own or 0} ms")
+            if own is None and global_ms:
+                own = KAFKA_DEFAULT_IDLE_MS  # explicit, so the short job-wide one doesn't apply here
+            if own is not None:
+                c.options[s.name].setdefault(IDLE_SOURCE, f"{own} ms")
 
 
 # --- models ----------------------------------------------------------------------------

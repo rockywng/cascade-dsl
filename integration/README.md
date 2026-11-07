@@ -142,7 +142,9 @@ The soak found:
    after its snapshot. It also applied to `orders`. When orders stalled for 2 s, the customer
    changes' watermark carried event time past orders still waiting in Kafka. Now:
    - **Idle timeouts are per source** (`event_time.idle_timeout`).
-   - **Kafka sources are pinned** to `scan.watermark.idle-timeout = 0 ms` unless they declare one.
+   - **Kafka sources get their own, long one** (60 s) unless they declare one. The first fix used
+     "never idle", which froze event time in v3: parallelism 2 over a one-partition topic leaves
+     a reader with no partition, and only an idle timeout lets it stand down.
    - **The job-wide option raises CD108.**
 
 The upgrade matrix (`tests/test_upgrade_matrix.py`, stand-in connectors, 15 kinds of upgrade)

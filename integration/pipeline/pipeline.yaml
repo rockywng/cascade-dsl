@@ -53,7 +53,8 @@ sources:
       updated_at: TIMESTAMP(3)
     primary_key: [customer_id]
     # the CDC source goes quiet after its snapshot; don't let it hold back event time. Only this
-    # source idles: orders stalling (broker restart, restore) must hold event time, not be overtaken.
+    # source idles quickly; orders gets 60 s, so a short stall (broker restart, restore) holds event
+    # time instead of being overtaken.
     event_time: {column: updated_at, idle_timeout: 2s}
 
 models:

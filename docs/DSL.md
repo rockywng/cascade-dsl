@@ -120,8 +120,10 @@ How it compiles:
 - Kafka sources take a per-source `scan.watermark.idle-timeout`.
 - Other connectors (CDC) can only use the job-wide setting, so the compiler sets it from their
   `idle_timeout`. They must all agree (CD109). Every Kafka source then gets an explicit
-  per-source value (`0 ms` meaning never idle when it declares none), so the job-wide timeout
-  doesn't reach it.
+  per-source value, so the short job-wide timeout doesn't reach it. A Kafka source that declares
+  none gets 60 s. That isn't "never": with more readers than partitions, a reader with no
+  partition only stands down through an idle timeout, and would otherwise hold back event time
+  forever. `idle_timeout: 0s` opts a Kafka source out of idling entirely.
 - Setting both the job-wide option and a per-source `idle_timeout` is an error (CD109).
 
 ## Models

@@ -83,10 +83,13 @@ def apply(p: Pipeline, diags: Diagnostics) -> None:
                                 and (_connector_type(p, p.sources[r.name]) or "").endswith("-cdc")
                                 and p.sources[r.name].event_time is not None})
         idle = p.flink_config.get("table.exec.source.idle-timeout")
-        if cdc_versioned and idle and idle not in ("0", "0 ms", "0ms"):
+        if not idle or idle in ("0", "0 ms", "0ms", "0s"):
+            idle = next((f"{p.sources[s].event_time.idle_timeout_ms} ms" for s in cdc_versioned
+                         if p.sources[s].event_time.idle_timeout_ms), None)
+        if cdc_versioned and idle:
             diags.warning("CD372", f"model '{m.name}': its backfill replays history through an event-time "
                           f"temporal join on CDC source(s) {', '.join(cdc_versioned)}, and "
-                          f"table.exec.source.idle-timeout ({idle}) lets event time advance without them. "
+                          f"an idle timeout ({idle}) lets event time advance without them. "
                           "Historical rows can be joined before the CDC snapshot arrives and then find no "
                           "version (the outcome depends on timing)", m.loc, node=m.name,
                           hint="backfill models that don't need that join, or accept 'no match' for history; "

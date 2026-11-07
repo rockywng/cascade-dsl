@@ -1,0 +1,409 @@
+"""Soak and failure-injection run: the integration pipeline under continuous load for a while, with
+failures injected, and every result checked exactly against ground truth afterwards.
+
+    python3 integration/soak.py [--minutes 20] [--rate 100] [--keep] [--skip-build]
+
+Load: orders streamed into Kafka at --rate per second; event time advances 100 ms per order, so
+one-minute windows close every few seconds. Customers change in Postgres every few seconds (CDC).
+
+Failures, spread over the run: TaskManager killed; Kafka broker restarted; Postgres restarted (the
+CDC connection drops); stop-with-savepoint and resubmit under load; TaskManager killed twice in a
+row. After each, the job must be RUNNING again.
+
+Ground truth is what actually landed in the `orders` topic (a producer can lose or duplicate
+messages while a broker restarts; the job sees exactly what is in the topic). After the run:
+  - LTV per customer, in Postgres (JDBC upsert) and in the upsert-kafka topic, must equal the sum
+    and count of positive orders: exactly-once state through every failure
+  - the revenue sink writes exactly-once (Kafka transactions). Read with read_committed, every
+    closed window appears once per segment, and its total equals the orders in that window
+Segment attribution is not checked: it depends on when CDC updates arrive relative to orders.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import run as it
+from run import Failed, ok, step
+
+BASE = datetime(2026, 1, 1, 10, 0, 0)
+CUSTOMERS = [f"c{i}" for i in range(50)]
+SEGMENTS = ["smb", "enterprise", "mid"]
+
+
+# --- pipeline ---------------------------------------------------------------------------------
+
+def write_pipeline(delivery: str = "exactly-once") -> str:
+    """The integration pipeline, with the revenue sink writing exactly-once (Kafka transactions)."""
+    with open(os.path.join(it.HERE, "pipeline", "pipeline.yaml")) as f:
+        text = f.read()
+    text = text.replace("    topic: revenue\n", f"    topic: revenue\n    delivery: {delivery}\n")
+    d = os.path.join(it.WORK, "pipeline-soak")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    with open(os.path.join(d, "pipeline.yaml"), "w") as f:
+        f.write(text)
+    return os.path.relpath(d, it.REPO)
+
+
+# --- load -------------------------------------------------------------------------------------
+
+class Load:
+    """Streams orders into Kafka through a long-lived console producer; restarts it if it dies."""
+
+    def __init__(self, rate: int):
+        self.rate = rate
+        self.seq = 0
+        self.stop = threading.Event()
+        self.restarts = 0
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def order(self, i: int) -> dict:
+        ts = BASE + timedelta(milliseconds=100 * i)
+        amount = Decimal(-5) if i % 97 == 0 else Decimal(i % 50 + 1) + Decimal("0.25")
+        return {"order_id": f"o{i}", "customer_id": CUSTOMERS[i % len(CUSTOMERS)], "amount": float(amount),
+                "order_ts": ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
+
+    def _producer(self):
+        cmd = ["docker", "compose", "-f", os.path.join(it.HERE, "docker-compose.yml"), "exec", "-T", "kafka",
+               "/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server", "kafka:9092", "--topic", "orders",
+               "--producer-property", "acks=all", "--producer-property", "enable.idempotence=true"]
+        if it._docker_prefix():
+            cmd = it._docker_prefix() + [" ".join(cmd)]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                text=True, cwd=it.REPO)
+
+    def _loop(self):
+        proc = self._producer()
+        next_at = time.time()
+        while not self.stop.is_set():
+            batch = max(1, self.rate // 10)
+            try:
+                proc.stdin.write("".join(json.dumps(self.order(self.seq + k)) + "\n" for k in range(batch)))
+                proc.stdin.flush()
+                self.seq += batch
+            except (BrokenPipeError, OSError, ValueError):
+                self.restarts += 1
+                time.sleep(3)
+                proc = self._producer()
+                continue
+            if proc.poll() is not None:
+                self.restarts += 1
+                time.sleep(3)
+                proc = self._producer()
+            next_at += 0.1
+            time.sleep(max(0.0, next_at - time.time()))
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+
+    def event_time(self) -> datetime:
+        return BASE + timedelta(milliseconds=100 * self.seq)
+
+
+class CustomerChanges:
+    """Changes a random customer's segment every few seconds, at the current event time."""
+
+    def __init__(self, load: Load):
+        self.load = load
+        self.stop = threading.Event()
+        self.count = 0
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self):
+        i = 0
+        while not self.stop.wait(4):
+            c = CUSTOMERS[(i * 7) % len(CUSTOMERS)]
+            seg = SEGMENTS[i % len(SEGMENTS)]
+            ts = self.load.event_time().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                it.psql(f"INSERT INTO customers VALUES ('{c}', '{seg}', '{ts}') ON CONFLICT (customer_id) "
+                        f"DO UPDATE SET segment = EXCLUDED.segment, updated_at = EXCLUDED.updated_at")
+                self.count += 1
+            except Failed:
+                pass  # Postgres is being restarted
+            i += 1
+
+
+# --- Flink REST -------------------------------------------------------------------------------
+
+def rest(path: str):
+    with urllib.request.urlopen(f"http://localhost:8081{path}", timeout=10) as r:
+        return json.loads(r.read())
+
+
+def job_info() -> dict:
+    jobs = [j for j in rest("/jobs/overview")["jobs"] if j["state"] in ("RUNNING", "RESTARTING", "CREATED")]
+    if not jobs:
+        return {}
+    jid = jobs[0]["jid"]
+    cp = rest(f"/jobs/{jid}/checkpoints")
+    return {"jid": jid, "state": jobs[0]["state"], "completed": cp["counts"]["completed"],
+            "failed": cp["counts"]["failed"], "restored": cp["counts"].get("restored", 0),
+            "last_cp_ms": (cp.get("latest", {}).get("completed") or {}).get("end_to_end_duration")}
+
+
+def wait_healthy(what: str, since_checkpoints: int | None = None, timeout=240):
+    """RUNNING again, with all tasks running and a new completed checkpoint."""
+    def check():
+        info = job_info()
+        if info.get("state") != "RUNNING":
+            return None
+        vertices = rest(f"/jobs/{info['jid']}")["vertices"]
+        if any(v["status"] != "RUNNING" for v in vertices):
+            return None
+        if since_checkpoints is not None and info["completed"] <= since_checkpoints:
+            return None
+        return info
+    info = it.wait_for(what, check, timeout=timeout, every=3)
+    ok(f"{what}: RUNNING, {info['completed']} checkpoints completed, last took {info['last_cp_ms']} ms")
+    return info
+
+
+class Sampler:
+    """Every minute: checkpoint size and duration, TaskManager heap. Slow growth shows up here."""
+
+    def __init__(self):
+        self.samples: list[dict] = []
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self):
+        t0 = time.time()
+        while not self.stop.wait(60):
+            try:
+                info = job_info()
+                cp = rest(f"/jobs/{info['jid']}/checkpoints").get("latest", {}).get("completed") or {}
+                heap = 0
+                for tm in rest("/taskmanagers")["taskmanagers"]:
+                    m = rest(f"/taskmanagers/{tm['id']}/metrics?get=Status.JVM.Memory.Heap.Used")
+                    heap += int(float(m[0]["value"])) if m else 0
+                self.samples.append({"min": round((time.time() - t0) / 60), "state_bytes": cp.get("state_size")
+                                     or cp.get("checkpointed_size"), "cp_ms": cp.get("end_to_end_duration"),
+                                     "heap_mb": heap // (1 << 20)})
+            except Exception:  # noqa: BLE001 -- the cluster may be mid-failure
+                continue
+
+    def report(self):
+        s = [x for x in self.samples if x["state_bytes"]]
+        if len(s) < 4:
+            ok(f"health samples: {len(s)} (too few for a trend)")
+            return
+        q = len(s) // 4
+        first, last = s[:q], s[-q:]
+        avg = lambda xs, k: sum(x[k] or 0 for x in xs) / len(xs)  # noqa: E731
+        ok(f"health over {s[-1]['min']} min ({len(s)} samples): checkpoint state "
+           f"{avg(first, 'state_bytes') / 1024:.0f} KiB -> {avg(last, 'state_bytes') / 1024:.0f} KiB, "
+           f"checkpoint time {avg(first, 'cp_ms'):.0f} -> {avg(last, 'cp_ms'):.0f} ms, "
+           f"TaskManager heap {avg(first, 'heap_mb'):.0f} -> {avg(last, 'heap_mb'):.0f} MiB "
+           f"(first vs. last quarter)")
+        growth = avg(last, "state_bytes") / max(avg(first, "state_bytes"), 1)
+        if growth > 3:
+            raise Failed(f"checkpointed state grew {growth:.1f}x over the run (bounded state expected)")
+
+
+# --- failures ---------------------------------------------------------------------------------
+
+def kill_taskmanager():
+    it.compose("kill", "taskmanager")
+    it.compose("up", "-d", "taskmanager")
+
+
+def restart_kafka():
+    it.compose("restart", "kafka", timeout=300)
+
+
+def restart_postgres():
+    it.compose("restart", "postgres", timeout=300)
+
+
+def kill_taskmanager_twice():
+    kill_taskmanager()
+    time.sleep(8)
+    kill_taskmanager()
+
+
+# --- ground truth ------------------------------------------------------------------------------
+
+def consume_all(topic: str, committed: bool = False) -> list[str]:
+    args = ["/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", "kafka:9092", "--topic", topic,
+            "--from-beginning", "--timeout-ms", "15000"]
+    if committed:
+        args += ["--isolation-level", "read_committed"]
+    if topic in ("customer_ltv",):
+        args += ["--property", "print.key=true", "--property", "key.separator=|"]
+    out = it.exec_in("kafka", *args, check=False)
+    return [line for line in out.splitlines() if line.startswith("{")]
+
+
+def truth() -> tuple[dict, dict, datetime]:
+    """From the orders topic: LTV per customer, revenue per window, and the max event time."""
+    ltv: dict = defaultdict(lambda: [Decimal(0), 0])
+    windows: dict = defaultdict(Decimal)
+    max_ts = BASE
+    for line in consume_all("orders"):
+        o = json.loads(line)
+        ts = datetime.strptime(o["order_ts"], "%Y-%m-%d %H:%M:%S.%f")
+        max_ts = max(max_ts, ts)
+        amount = Decimal(str(o["amount"]))
+        if amount <= 0:
+            continue
+        ltv[o["customer_id"]][0] += amount
+        ltv[o["customer_id"]][1] += 1
+        windows[ts.replace(second=0, microsecond=0)] += amount
+    return {k: (v[0], v[1]) for k, v in ltv.items()}, dict(windows), max_ts
+
+
+def check_results(expected_ltv: dict, expected_windows: dict, max_ts: datetime):
+    step("ground truth vs. sinks")
+
+    def table():
+        return {r[0]: (Decimal(r[1]), int(r[2])) for r in it.psql("SELECT * FROM customer_ltv")}
+    last = {}
+
+    def converged():
+        last["t"] = table()
+        return last["t"] if last["t"] == expected_ltv else None
+    try:
+        actual = it.wait_for("LTV table to converge", converged, timeout=300, every=5)
+    except Failed:
+        t = last.get("t", {})
+        diff = {k: (t.get(k), expected_ltv.get(k)) for k in set(t) | set(expected_ltv) if t.get(k) != expected_ltv.get(k)}
+        raise Failed(f"JDBC LTV differs from ground truth for {len(diff)} customers (actual, expected): "
+                     f"{sorted(diff.items())[:5]}")
+    ok(f"JDBC LTV equals ground truth for all {len(actual)} customers "
+       f"({sum(v[1] for v in actual.values())} orders, exactly once)")
+
+    final = {}
+    for line in consume_all("customer_ltv"):
+        k, _, v = line.partition("|")
+        key = json.loads(k)["customer_id"]
+        final[key] = None if v == "null" else (Decimal(str(json.loads(v)["lifetime_value"])),
+                                               int(json.loads(v)["order_count"]))
+    final = {k: v for k, v in final.items() if v is not None}
+    if final != expected_ltv:
+        diff = {k: (final.get(k), expected_ltv.get(k)) for k in set(final) | set(expected_ltv)
+                if final.get(k) != expected_ltv.get(k)}
+        raise Failed(f"upsert-kafka LTV differs from ground truth for {len(diff)} keys: {list(diff.items())[:5]}")
+    ok("upsert-kafka LTV equals ground truth")
+
+    rows = [json.loads(line) for line in consume_all("revenue", committed=True)]
+    seen: dict = {}
+    for r in rows:
+        key = (r["window_start"], r["segment"])
+        if key in seen:
+            raise Failed(f"revenue sink emitted window {key} twice: {seen[key]} and {r}")
+        seen[key] = r
+    totals: dict = defaultdict(Decimal)
+    for r in rows:
+        totals[datetime.strptime(r["window_start"][:19], "%Y-%m-%d %H:%M:%S")] += Decimal(str(r["revenue"]))
+    closed = {w: v for w, v in expected_windows.items() if w + timedelta(minutes=1) <= max_ts - timedelta(seconds=2)}
+    wrong = {w: (totals.get(w), v) for w, v in closed.items() if totals.get(w) != v}
+    if wrong:
+        raise Failed(f"{len(wrong)} of {len(closed)} closed windows have the wrong revenue: "
+                     f"{sorted(wrong.items())[:5]}")
+    ok(f"exactly-once revenue sink: {len(rows)} rows, no duplicates, all {len(closed)} closed windows exact")
+
+
+# --- main -------------------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--minutes", type=float, default=20)
+    ap.add_argument("--rate", type=int, default=100, help="orders per second")
+    ap.add_argument("--cycles", type=int, default=1, help="times each kind of failure is injected")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--delivery", default="exactly-once", choices=["exactly-once", "at-least-once"],
+                    help="revenue sink guarantee (at-least-once is a control: the duplicate check must fail)")
+    a = ap.parse_args()
+    started = time.time()
+    code = 1
+    load = changes = None
+    try:
+        it.build(a.skip_build)
+        it.start()
+        step(f"soak: {a.minutes:g} minutes at {a.rate} orders/s, with failures")
+        project = write_pipeline(a.delivery)
+        args = it.package("soak", project)
+        it.submit("soak", args)
+        wait_healthy("job started", since_checkpoints=0)
+        load, changes = Load(a.rate), None
+        load.thread.start()
+        changes = CustomerChanges(load)
+        changes.thread.start()
+
+        sampler = Sampler()
+        sampler.thread.start()
+        kinds = [("TaskManager killed", kill_taskmanager),
+                 ("Kafka broker restarted", restart_kafka),
+                 ("Postgres restarted (CDC connection drops)", restart_postgres),
+                 ("stop-with-savepoint and resubmit under load", None),
+                 ("TaskManager killed twice in a row", kill_taskmanager_twice)]
+        n = len(kinds) * a.cycles
+        schedule = [((k + 1) / (n + 1), *kinds[k % len(kinds)]) for k in range(n)]
+        total = a.minutes * 60
+        t0 = time.time()
+        for frac, name, action in schedule:
+            time.sleep(max(0.0, t0 + frac * total - time.time()))
+            before = job_info()
+            print(f"   ..  t+{time.time() - t0:.0f}s: {name} ({load.seq} orders produced, "
+                  f"{changes.count} customer changes)", flush=True)
+            if action is None:
+                out = it.flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", before["jid"])
+                m = re.search(r"Savepoint completed\. Path: (\S+)", out)
+                if not m:
+                    raise Failed("stop-with-savepoint under load failed:\n" + out[-2000:])
+                it.submit("soak", args, savepoint=m.group(1))
+                wait_healthy(f"after {name}", since_checkpoints=0)
+            else:
+                action()
+                wait_healthy(f"after {name}", since_checkpoints=before.get("completed", 0)
+                             if action is not kill_taskmanager and action is not kill_taskmanager_twice else None)
+        time.sleep(max(0.0, t0 + total - time.time()))
+
+        step("drain")
+        sampler.stop.set()
+        sampler.report()
+        load.stop.set()
+        changes.stop.set()
+        load.thread.join(timeout=60)
+        changes.thread.join(timeout=30)
+        it.produce("orders", [load.order(load.seq + 600)])  # +60s of event time closes the last windows
+        info = job_info()
+        ok(f"produced {load.seq} orders ({load.restarts} producer restarts), {changes.count} customer changes; "
+           f"job {info.get('state')}, {info.get('completed')} checkpoints, {info.get('failed')} failed")
+        expected_ltv, expected_windows, max_ts = truth()
+        check_results(expected_ltv, expected_windows, max_ts)
+        print(f"\nPASSED in {time.time() - started:.0f}s")
+        code = 0
+    except (Failed, RuntimeError) as e:
+        print(f"\nFAILED: {e}", file=sys.stderr)
+        try:
+            print(it.compose("logs", "--tail", "80", "jobmanager", "taskmanager", check=False)[-8000:], file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        for t in (load, changes):
+            if t is not None:
+                t.stop.set()
+        if not a.keep:
+            it.compose("down", "-v", "--remove-orphans", check=False)
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

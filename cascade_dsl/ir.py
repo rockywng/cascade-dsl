@@ -26,6 +26,7 @@ class EventTime:
     column: str
     max_out_of_orderness_ms: int
     loc: Location | None = None
+    idle_timeout_ms: int | None = None  # None: never idle
 
 
 @dataclass

@@ -72,6 +72,14 @@ def _kafka_finish(role, mode, fmt, opts, ctx: LowerCtx):
             problems.append(("CD214", f"format '{fmt}' cannot be used with upsert mode"))
     if role == "source":
         opts.setdefault("properties.group.id", f"{ctx.pipeline}.{ctx.node}")
+    if role == "sink" and opts.get("sink.delivery-guarantee") == "exactly-once":
+        # Flink's default transaction timeout (1 h) exceeds the broker's default maximum
+        # (transaction.max.timeout.ms = 15 min): the producer is rejected and the job crash-loops
+        # (found by integration/soak.py). Transactions must outlive a checkpoint plus a restart.
+        opts.setdefault("properties.transaction.timeout.ms", str(15 * 60 * 1000))
+        # one stable prefix per sink: transactional ids must not collide across jobs and must stay
+        # the same across restarts so pending transactions can be aborted or committed
+        opts.setdefault("sink.transactional-id-prefix", f"{ctx.pipeline}.{ctx.node}")
     registry = opts.pop("__schema_registry_url", None)
     if fmt in ("avro-confluent", "debezium-avro-confluent"):
         if not registry:

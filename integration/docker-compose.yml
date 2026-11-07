@@ -42,6 +42,7 @@ services:
 
   jobmanager:
     image: cascade-it:it
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: integration/.work/Dockerfile
@@ -59,6 +60,12 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         jobmanager.memory.process.size: 1024m
+        execution.checkpointing.interval: 5s
+        execution.checkpointing.dir: file:///flink-data/checkpoints
+        execution.checkpointing.savepoint-dir: file:///flink-data/savepoints
+        execution.checkpointing.incremental: true
+        state.backend.type: rocksdb
+        restart-strategy.type: exponential-delay
     volumes:
       - ./.work/flink-data:/flink-data
       - ./.work/jobs:/jobs:ro
@@ -69,9 +76,13 @@ services:
   taskmanager:
     image: cascade-it:it
     command: taskmanager
+    # like a Kubernetes pod: a TaskManager that exits is restarted (see integration/README.md:
+    # a database outage under a JDBC sink makes the TaskManager shut itself down)
+    restart: unless-stopped
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
+        state.backend.type: rocksdb
         taskmanager.numberOfTaskSlots: 4
         taskmanager.memory.process.size: 2048m
     volumes:

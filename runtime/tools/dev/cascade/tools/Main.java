@@ -370,9 +370,17 @@ public final class Main {
             oldJob = r1.getJobClient().orElseThrow(() -> new IllegalStateException("no job client"));
             waitFor(oldJob, JobStatus.RUNNING, 60);
             Thread.sleep(seconds * 1000L);
+            // a savepoint, then cancel: stop-with-savepoint ends the job, and the job's local MiniCluster
+            // can shut down before the savepoint future resolves ("MiniCluster is not yet running")
             String savepoint =
-                    oldJob.stopWithSavepoint(false, new File(spDir).toURI().toString(), SavepointFormatType.CANONICAL)
+                    oldJob.triggerSavepoint(new File(spDir).toURI().toString(), SavepointFormatType.CANONICAL)
                             .get(120, TimeUnit.SECONDS);
+            try {
+                oldJob.cancel().get(30, TimeUnit.SECONDS);
+            } catch (Throwable ignored) {
+                // already gone
+            }
+            oldJob = null;
             out.put("savepoint", savepoint);
 
             Configuration restore = new Configuration();
@@ -384,7 +392,11 @@ public final class Main {
             newJob = r2.getJobClient().orElseThrow(() -> new IllegalStateException("no job client"));
             JobStatus status = waitFor(newJob, JobStatus.RUNNING, 60);
             Thread.sleep(3000); // restore failures surface right after scheduling
-            status = newJob.getJobStatus().get(10, TimeUnit.SECONDS);
+            try {
+                status = newJob.getJobStatus().get(10, TimeUnit.SECONDS);
+            } catch (Throwable t) {
+                status = JobStatus.FAILED; // its MiniCluster is gone: the job ended; the result says why
+            }
             out.put("restored", status == JobStatus.RUNNING);
             out.put("status", status.toString());
             if (status != JobStatus.RUNNING) {

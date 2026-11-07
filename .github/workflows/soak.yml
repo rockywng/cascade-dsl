@@ -1,0 +1,36 @@
+name: soak
+
+# The integration pipeline under continuous load with injected failures (TaskManager kills, Kafka
+# and Postgres restarts, savepoint upgrades), then every sink checked exactly against ground truth.
+# See integration/soak.py. Nightly, or on demand with a chosen duration.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: soak duration in minutes
+        default: "45"
+      cycles:
+        description: times each kind of failure is injected
+        default: "3"
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: pip install pyyaml
+      - name: Soak with failure injection
+        run: >
+          python integration/soak.py
+          --minutes ${{ github.event.inputs.minutes || '45' }}
+          --cycles ${{ github.event.inputs.cycles || '3' }}

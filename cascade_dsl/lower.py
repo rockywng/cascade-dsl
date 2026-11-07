@@ -115,6 +115,7 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
         settings["pipeline.max-parallelism"] = str(p.scaling.max_parallelism)
     if p.scaling and p.scaling.parallelism:
         settings["parallelism.default"] = str(p.scaling.parallelism)
+    settings.update(c.settings)
     settings.update(p.flink_config)
     for k, v in settings.items():
         stmts.append(Stmt("set", k, f"SET {lit(k)} = {lit(v)};", options={k: v}))

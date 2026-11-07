@@ -425,13 +425,19 @@ def _load_source(name, s, ctx: _Ctx) -> Source:
             et_d.line, et_d.key_lines = s.key_lines.get("event_time", 0), {}
             et = et_d
         et = ctx.require_mapping(et, "event_time", s, "event_time")
-        ctx.check_keys(et, {"column", "max_out_of_orderness"}, f"{what}.event_time")
+        ctx.check_keys(et, {"column", "max_out_of_orderness", "idle_timeout"}, f"{what}.event_time")
         try:
             delay = parse_duration_ms(et.get("max_out_of_orderness", "0s"))
         except ValueError as e:
             ctx.diags.error("CD006", str(e), ctx.loc(et, "max_out_of_orderness"))
             delay = 0
-        event_time = EventTime(str(et.get("column", "")), delay, ctx.loc(et))
+        idle = None
+        if et.get("idle_timeout") is not None:
+            try:
+                idle = parse_duration_ms(et.get("idle_timeout"))
+            except ValueError as e:
+                ctx.diags.error("CD006", str(e), ctx.loc(et, "idle_timeout"))
+        event_time = EventTime(str(et.get("column", "")), delay, ctx.loc(et), idle)
     endpoint = {k: v for k, v in s.items() if k not in SOURCE_COMMON}
     return Source(
         name=name, connection=str(s.get("connection", "")), endpoint=endpoint,

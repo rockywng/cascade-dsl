@@ -34,6 +34,7 @@ class Checked:
     options: dict[str, dict] = field(default_factory=dict)  # node -> Flink WITH options
     implicit_connections: set[str] = field(default_factory=set)
     inferred: dict[str, list | None] = field(default_factory=dict)  # model -> columns before contract
+    settings: dict[str, str] = field(default_factory=dict)  # job-wide SETs derived by the compiler
 
 
 def _suggest(name, candidates) -> str | None:
@@ -50,6 +51,7 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     _check_functions(c)
     _check_connections(c)
     _check_sources(c)
+    _check_idle_timeouts(c)
     _check_models(c)
     _check_sinks(c)
     _check_quarantine(c)
@@ -154,6 +156,59 @@ def _check_sources(c: Checked):
                 c.options[s.name] = opts
         p.relations[s.name] = RelationInfo(columns=out_cols, rowtime=rowtime, changelog=changelog,
                                            upsert_key=list(s.primary_key) or None)
+
+
+IDLE_GLOBAL = "table.exec.source.idle-timeout"
+IDLE_SOURCE = "scan.watermark.idle-timeout"
+WATERMARK_PUSHDOWN = {"kafka", "upsert-kafka"}  # connectors that take a per-source idle timeout
+
+
+def _is_zero_duration(v) -> bool:
+    return str(v).strip().replace(" ", "") in ("0", "0ms", "0s")
+
+
+def _check_idle_timeouts(c: Checked):
+    """Idle timeouts are per source. A job-wide one marks *every* source idle when it pauses, so a
+    stalled fact stream (broker restart, slow restore) lets another source's watermark move event
+    time past rows that are still on their way, and windows then drop them as late."""
+    p, d = c.pipeline, c.diagnostics
+    timed = [s for s in p.sources.values() if s.event_time]
+    declared = [s for s in timed if s.event_time.idle_timeout_ms is not None]
+    raw = p.flink_config.get(IDLE_GLOBAL)
+    if raw is not None and not _is_zero_duration(raw):
+        if declared:
+            d.error("CD109", f"flink.config sets {IDLE_GLOBAL} and source(s) "
+                    f"{', '.join(s.name for s in declared)} declare event_time.idle_timeout; use one or the other",
+                    declared[0].event_time.loc, node=declared[0].name,
+                    hint=f"remove {IDLE_GLOBAL}; idle_timeout on the sources that legitimately go quiet")
+        elif len(timed) > 1:
+            d.warning("CD108", f"{IDLE_GLOBAL} ({raw}) applies to every source, including "
+                      f"{', '.join(s.name for s in timed)}: if one stalls (broker restart, slow restore), the "
+                      "others' watermarks move event time past its pending rows and windows drop them as late",
+                      p.loc, hint="set event_time.idle_timeout only on sources that legitimately go quiet "
+                                  "(a CDC dimension table, a low-traffic partition)")
+        return
+    if not declared:
+        return
+
+    def pushdown(s):
+        return (c.options.get(s.name) or {}).get("connector") in WATERMARK_PUSHDOWN
+    shared = [s for s in timed if not pushdown(s)]
+    values = {s.event_time.idle_timeout_ms or 0 for s in shared}
+    if len(values) > 1:
+        d.error("CD109", f"sources {', '.join(s.name for s in shared)} can only take the job-wide idle timeout "
+                "(their connectors don't support a per-source one), so they must all declare the same "
+                "event_time.idle_timeout (or none)", shared[0].event_time.loc, node=shared[0].name)
+        return
+    global_ms = next(iter(values), 0)
+    if global_ms:
+        c.settings[IDLE_GLOBAL] = f"{global_ms} ms"
+    for s in timed:
+        if pushdown(s) and s.name in c.options:
+            own = s.event_time.idle_timeout_ms
+            if own is not None or global_ms:
+                # explicit, so a job-wide timeout set for other sources doesn't apply here
+                c.options[s.name].setdefault(IDLE_SOURCE, f"{own or 0} ms")
 
 
 # --- models ----------------------------------------------------------------------------
@@ -465,6 +520,13 @@ def _check_sinks(c: Checked):
                                            LowerCtx(p.name, k.name, k.connection, k.primary_key), k.options)
             _report_option_problems(c, problems, k.loc, k.name)
             c.options[k.name] = opts
+        if spec is not None and spec.type == "jdbc":
+            d.info("CD215", f"sink '{k.name}': while the database is unreachable, the JDBC sink fails the job, "
+                   "and its close() rethrows the write error during failover, which Flink treats as fatal: "
+                   "the TaskManager shuts down (flink-connector-jdbc 4.1; seen in integration/soak.py)",
+                   k.loc, node=k.name,
+                   hint="run TaskManagers under a supervisor that restarts them (Kubernetes does), and "
+                        "don't share a session cluster with other jobs")
         if k.mode == "upsert" and not k.primary_key:
             d.error("CD405", f"upsert sink '{k.name}' needs a primary_key", k.loc, node=k.name)
         if rel is None:

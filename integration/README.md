@@ -62,6 +62,35 @@ minutes.
   joined before the CDC snapshot arrives. Compose saw 2 unknown / 4 enterprise; kind saw 5 / 1.
   `cascade validate` warns about this (CD372), and the run asserts the warning.
 
+## Soak and failure injection: `soak.py`
+
+```bash
+python3 integration/soak.py --minutes 60 --cycles 3 --rate 150
+```
+
+This runs the integration pipeline under continuous load. Orders stream into Kafka with advancing
+event time, so windows close every few seconds, and customers change in Postgres every few
+seconds. Failures are injected along the way, each kind `--cycles` times:
+- the TaskManager is killed, once and then twice in a row
+- the Kafka broker is restarted
+- Postgres is restarted, so the CDC connection drops
+- the job is stopped with a savepoint and resubmitted while load continues
+
+After each failure the job must be running again and complete a new checkpoint.
+
+**Ground truth** is what actually landed in the `orders` topic. A producer can lose or duplicate
+messages while a broker restarts, and the job sees exactly what the topic holds. After the run:
+- **LTV** in Postgres (JDBC upsert) and in the upsert topic must equal ground truth exactly. That
+  shows the state is exactly-once through every failure.
+- **The revenue sink writes exactly-once**, using Kafka transactions. Read with `read_committed`,
+  every closed window must appear exactly once per segment, with the exact total.
+- **Health:** checkpoint size, checkpoint duration and TaskManager heap are sampled every minute.
+  The state must stay bounded.
+
+`--delivery at-least-once` is the control. It makes the revenue sink at-least-once, and the
+duplicate check must fail, which it does: a window gets replayed after a failure. The nightly
+workflow (`.github/workflows/soak.yml`) runs 45 minutes with every kind of failure three times.
+
 ## What it found
 
 These are all fixed in the compiler, and the runs guard against them:
@@ -89,6 +118,32 @@ These are all fixed in the compiler, and the runs guard against them:
    template, so applying a new version triggers a savepoint upgrade.
 5. **`kind load docker-image` fails on Docker Desktop's containerd image store**, with "content
    digest not found". `k8s.py` loads the runtime image as a single-platform archive.
+
+The soak found:
+
+6. **Exactly-once Kafka sinks crash-looped on first deploy.** Flink's default transaction timeout
+   (1 h) is above the broker's default maximum (`transaction.max.timeout.ms` = 15 min). Kafka
+   rejects the producer, and every checkpoint fails. The catalog now sets
+   `properties.transaction.timeout.ms` to 15 min for exactly-once sinks, plus a stable
+   `sink.transactional-id-prefix` per sink.
+7. **A database outage under a JDBC sink shuts down the whole TaskManager.** This is a connector
+   bug, in flink-connector-jdbc 4.1. The sink's `close()` rethrows the failed write while the task
+   fails over, and Flink treats an exception during cleanup as fatal. The job recovers only if
+   something restarts the TaskManager. Kubernetes does, and `cascade deploy` uses application mode
+   (one job per cluster); a shared session cluster would lose every job on that TaskManager. The
+   compose stack now restarts TaskManagers like Kubernetes would, and the compiler reports this
+   for JDBC sinks (CD215).
+8. **The compose session cluster had no checkpointing configured.** Only the Kubernetes
+   deployment set it, so failure recovery was untested there. It's now configured the same way.
+9. **A job-wide idle timeout dropped orders as late after failures.** This needed the 60-minute
+   run: 7 of 897 revenue windows were short, every one right after a Kafka restart or a double
+   TaskManager kill. LTV was still exact, because unwindowed state has no lateness. The cause was
+   `table.exec.source.idle-timeout: 2s`, set so the CDC source wouldn't hold back event time
+   after its snapshot. It also applied to `orders`. When orders stalled for 2 s, the customer
+   changes' watermark carried event time past orders still waiting in Kafka. Now:
+   - **Idle timeouts are per source** (`event_time.idle_timeout`).
+   - **Kafka sources are pinned** to `scan.watermark.idle-timeout = 0 ms` unless they declare one.
+   - **The job-wide option raises CD108.**
 
 The upgrade matrix (`tests/test_upgrade_matrix.py`, stand-in connectors, 15 kinds of upgrade)
 found more. These are disagreements between `check-upgrade`, the pin report and real restores, all

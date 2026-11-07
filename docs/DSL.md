@@ -93,6 +93,7 @@ sources:
     event_time:                 # or just `event_time: order_ts`
       column: order_ts
       max_out_of_orderness: 5s  # -> WATERMARK FOR order_ts AS order_ts - INTERVAL '5' SECOND
+      idle_timeout: 30s         # optional; see "Idle sources" below
     processing_time: proc       # optional: adds `proc AS PROCTIME()`
     primary_key: [order_id]     # required for CDC / versioned tables
     options: {...}              # raw Flink WITH options, applied last
@@ -100,6 +101,28 @@ sources:
 
 > In YAML flow style (`{a: DECIMAL(10, 2)}`) the comma splits the mapping; quote such types or
 > use block style.
+
+### Idle sources
+
+An operator with several event-time inputs only moves event time forward as far as its slowest input.
+A source that goes quiet, such as a CDC dimension table after its snapshot, would hold back event
+time forever. `event_time.idle_timeout` lets that source stop counting after it has been quiet for
+the given time. Set it **only on sources that legitimately go quiet**. Sources without one never
+go idle.
+
+Don't use Flink's job-wide `table.exec.source.idle-timeout` for this; it raises CD108. It marks
+*every* source idle, including the main fact stream. When that stream stalls (a broker restart, a
+slow restore after a TaskManager loss), another source's watermark moves event time past rows still
+waiting in Kafka. Windows then drop those rows as late. The soak test reproduced this: 7 of 897
+revenue windows were under-counted across 15 injected failures.
+
+How it compiles:
+- Kafka sources take a per-source `scan.watermark.idle-timeout`.
+- Other connectors (CDC) can only use the job-wide setting, so the compiler sets it from their
+  `idle_timeout`. They must all agree (CD109). Every Kafka source then gets an explicit
+  per-source value (`0 ms` meaning never idle when it declares none), so the job-wide timeout
+  doesn't reach it.
+- Setting both the job-wide option and a per-source `idle_timeout` is an error (CD109).
 
 ## Models
 
@@ -154,6 +177,14 @@ sinks:
 when it can't prove that the query's upsert key equals the sink's primary key. The compiler proves
 this statically for GROUP BY keys and pass-through CDC keys and warns otherwise (CD410). `cascade
 verify` gives the planner's answer.
+
+**Delivery guarantees.** Kafka sinks are at-least-once by default: after a failure, rows written
+since the last checkpoint are written again. Upsert sinks converge, but append topics get
+duplicates. With `delivery: exactly-once`, the sink writes in Kafka transactions committed on
+checkpoints, and consumers must read with `isolation.level=read_committed`. The compiler sets
+`properties.transaction.timeout.ms` to 15 minutes, because Flink's default is higher than what
+brokers accept. It also sets a stable `sink.transactional-id-prefix` per sink. Output becomes
+visible once per checkpoint interval.
 
 ## Quarantine
 
@@ -323,8 +354,8 @@ to live (CD370 lists what is copied).
 - **History is limited** to what the sources still hold, such as Kafka retention.
 - **A CDC snapshot holds only each row's current version.** So a backfilled *event-time* temporal
   join finds no version for events older than a row's last change.
-- **Idle timeouts make temporal-join backfills timing-dependent (CD372).** With
-  `table.exec.source.idle-timeout` set, the replayed fact history (available at once) can be joined
+- **Idle timeouts make temporal-join backfills timing-dependent (CD372).** With an idle timeout on
+  the CDC source, the replayed fact history (available at once) can be joined
   before the CDC snapshot arrives, and then finds no version. The integration runs saw different
   splits under compose and kind. Rows arriving after the snapshot are joined correctly.
 
@@ -510,8 +541,8 @@ It's a reviewable, explicit step, so compilation never depends on the registry.
 | Range | Area |
 |---|---|
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
-| CD1xx | names, sources, event time, primary keys; functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
-| CD2xx | connectors, properties, formats, secrets |
+| CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
+| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage) |
 | CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |
 | CD35x | state / TTL |

@@ -274,5 +274,45 @@ class SemanticTest(unittest.TestCase):
         self.assertEqual(r.checked.pipeline.relations["m"].changelog, "updating")
 
 
+class SinkSafetyTest(unittest.TestCase):
+    """Connector defaults found by integration/soak.py."""
+
+    def test_exactly_once_kafka_gets_a_broker_compatible_timeout_and_prefix(self):
+        r = compile_text("""
+            models:
+              m: {sql: SELECT order_id FROM orders}
+            sinks:
+              out: {from: m, connection: bus, topic: t, delivery: exactly-once}
+            """)
+        opts = r.checked.options["out"]
+        # the Flink default (1 h) exceeds the broker default maximum (15 min) and crash-loops the job
+        self.assertEqual(opts["properties.transaction.timeout.ms"], "900000")
+        self.assertEqual(opts["sink.transactional-id-prefix"], "test_pipe.out")
+
+    def test_at_least_once_kafka_has_no_transactions(self):
+        r = compile_text("""
+            models:
+              m: {sql: SELECT order_id FROM orders}
+            sinks:
+              out: {from: m, connection: bus, topic: t}
+            """)
+        self.assertNotIn("properties.transaction.timeout.ms", r.checked.options["out"])
+
+    def test_jdbc_sink_outage_behaviour_is_reported(self):
+        r = compile_text("""
+            pipeline: jdbc_out
+            connections:
+              wh: {type: jdbc, properties: {url: "jdbc:postgresql://db/x", password: "${secret:p}"}}
+            sources:
+              ticks:
+                connection: datagen
+                columns: {k: STRING}
+            sinks:
+              out: {from: ticks, connection: wh, table: t}
+            """, base=False)
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.errors])
+        self.assertIn("CD215", codes(r))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,11 +5,6 @@ owner: platform
 defaults: {state_ttl: 1d}
 scaling: {max_parallelism: 120, parallelism: 1}
 
-flink:
-  config:
-    # the CDC source goes idle after its snapshot; don't let it hold back event time
-    table.exec.source.idle-timeout: 2s
-
 deploy:
   image: cascade-it:it                 # not :latest, so kind uses the loaded image
   jobmanager: {memory: 1g, cpu: 0.25}
@@ -57,7 +52,9 @@ sources:
       segment: STRING
       updated_at: TIMESTAMP(3)
     primary_key: [customer_id]
-    event_time: updated_at
+    # the CDC source goes quiet after its snapshot; don't let it hold back event time. Only this
+    # source idles: orders stalling (broker restart, restore) must hold event time, not be overtaken.
+    event_time: {column: updated_at, idle_timeout: 2s}
 
 models:
   clean_orders:

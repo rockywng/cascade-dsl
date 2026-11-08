@@ -1,3 +1,4 @@
+import re
 import json
 import os
 import unittest
@@ -312,6 +313,29 @@ class SinkSafetyTest(unittest.TestCase):
             """, base=False)
         self.assertTrue(r.ok, [d.format() for d in r.diagnostics.errors])
         self.assertIn("CD215", codes(r))
+
+    def test_postgres_jdbc_connections_keep_idle_connections_alive(self):
+        """Found on EKS: PrivateLink drops a flow idle for 350 s silently, and the Postgres driver
+        (keepalive off by default) then blocked the sink forever on its next write."""
+        def url_of(u):
+            r = compile_text(f"""
+                pipeline: jdbc_ka
+                connections:
+                  wh: {{type: jdbc, properties: {{url: "{u}", password: "${{secret:p}}"}}}}
+                sources:
+                  ticks:
+                    connection: datagen
+                    columns: {{k: STRING}}
+                sinks:
+                  out: {{from: ticks, connection: wh, table: t}}
+                """, base=False)
+            self.assertTrue(r.ok, [d.format() for d in r.diagnostics.errors])
+            return re.search(r"'url' = '([^']*)'", r.lowered.sql).group(1)
+        self.assertEqual(url_of("jdbc:postgresql://db:5432/x"), "jdbc:postgresql://db:5432/x?tcpKeepAlive=true")
+        self.assertEqual(url_of("jdbc:postgresql://db/x?sslmode=require"),
+                         "jdbc:postgresql://db/x?sslmode=require&tcpKeepAlive=true")
+        self.assertEqual(url_of("jdbc:postgresql://db/x?tcpKeepAlive=false"), "jdbc:postgresql://db/x?tcpKeepAlive=false")
+        self.assertEqual(url_of("jdbc:mysql://db/x"), "jdbc:mysql://db/x")
 
 
 if __name__ == "__main__":

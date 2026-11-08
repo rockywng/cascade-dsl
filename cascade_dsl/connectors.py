@@ -116,6 +116,18 @@ def _pg_finish(role, mode, fmt, opts, ctx: LowerCtx):
     return problems
 
 
+def _jdbc_finish(role, mode, fmt, opts, ctx: LowerCtx):
+    # The Postgres driver leaves TCP keepalive off. Cloud NATs and AWS PrivateLink drop a flow idle
+    # for 350 s without telling either end, so a sink whose input went quiet that long waited
+    # forever on its next write: the job stayed RUNNING, checkpoints stopped, no data moved (found
+    # by cascade-dataplane's EKS soak). With keepalive on, the pod's probe timing (Cascade sets it
+    # well under 350 s) keeps the flow alive and finds a dead one. MySQL's driver has it on already.
+    url = str(opts.get("url") or "")
+    if url.startswith("jdbc:postgresql:") and "tcpkeepalive=" not in url.lower():
+        opts["url"] = url + ("&" if "?" in url else "?") + "tcpKeepAlive=true"
+    return []
+
+
 def _iceberg_finish(role, mode, fmt, opts, ctx: LowerCtx):
     problems = _db_table_finish("catalog-database", "catalog-table")(role, mode, fmt, opts, ctx)
     if role == "sink" and mode == "upsert":
@@ -225,6 +237,7 @@ register(ConnectorSpec(
     # Flink 2.x splits JDBC into a core module plus one module per database; the driver is separate
     sink_modes={"append", "upsert"}, artifact="org.apache.flink:flink-connector-jdbc-core",
     extra_artifacts=lambda props: _jdbc_artifacts(str(props.get("url", ""))),
+    finish=_jdbc_finish,
 ))
 
 JDBC_DIALECTS = {  # url prefix -> (Flink dialect module, driver coordinate)

@@ -740,12 +740,61 @@ deploy:
 records → `ROW`, arrays, maps, enums. Basic auth comes from `CASCADE_REGISTRY_USER_INFO=user:pass`.
 It's a reviewable, explicit step, so compilation never depends on the registry.
 
+## What the DSL can't do, and why
+
+These were reviewed one by one in November 2026. Each is a limit of Flink, of the connectors, or of
+the data itself, not something missing from the compiler.
+
+- **Bootstrapping or migrating SQL operator state** (State Processor API). Flink SQL operators keep
+  internal, unversioned state layouts that change between Flink versions and planner rules.
+  Writing them would tie the DSL to planner internals. Instead:
+  - **New state:** build it from history with `backfill`.
+  - **A process model's own state:** it's yours. Use the State Processor API against its
+    `ctx.uid(...)` operators.
+- **History a source doesn't have.** A backfill reaches as far as Kafka retention goes. A CDC
+  snapshot holds only each row's current version, so event-time temporal joins over history find
+  no older versions. That's a property of the data, not the compiler.
+- **DataStream iterations, Gelly, Flink ML.** Flink 2.0 removed iterations and Gelly, and Flink ML
+  has no 2.x release. Iterative algorithms belong in a process model or outside Flink.
+- **Per-source idle timeouts on CDC sources.** Flink CDC's table sources don't implement watermark
+  push-down, so only the job-wide timeout reaches them (CD109). Fixing that needs a change in
+  Flink CDC itself.
+- **A JDBC sink's outage killing its TaskManager** (CD215). This is a bug in
+  flink-connector-jdbc 4.1: `close()` rethrows during failover. Application mode, which is the
+  default target, contains it: Kubernetes restarts the pod and only this job is affected.
+- **Exactly-once into sinks without transactions or idempotence.** Elasticsearch, DynamoDB and
+  filesystem-append deliveries are what each connector guarantees. Upsert modes make replays
+  idempotent wherever the sink has a key.
+- **Connectors with no Flink 2.x release:** Pulsar, Pub/Sub, HBase, MongoDB (non-CDC),
+  OpenSearch 2. ClickHouse's 2.x jar has no SQL factory, and Redis has no Apache connector. Use
+  `type: custom` once a build exists, or a process model for DataStream-only connectors.
+- **Flink 1.x.** Compiled-plan UID pinning, the 2.x connector line, the planner behaviour the
+  upgrade matrix verifies and the process-model API are all checked on 2.x only. Supporting 1.20
+  would mean a second connector catalog and a second verified matrix. It's possible, but not
+  supported.
+- **Managed Flink services.** Confluent Cloud takes only SQL statements in its own catalog (no
+  jars, no plans). AWS Managed Flink and Ververica run jars through their own APIs. The
+  `flink-run` files and `pipeline.sql` are the starting points.
+- **Splitting one project into several jobs.** One pipeline is one job. Splitting inside a
+  project would compute shared models twice, or need hidden topics between jobs. Split across
+  projects and connect them with `from_pipeline`.
+- **Planned UID pinning for pipelines with process models or `mode: batch`.** Flink compiles plans
+  only for pure streaming SQL. Such pipelines deploy as statements. Process-model state is pinned
+  by `ctx.uid`.
+- **Proof at production scale.** The soak (`integration/soak.py`, nightly) covers:
+  - failures, rescaling, CDC schema changes and slot loss
+  - thousands of keys and multiple partitions
+
+  It runs on a CI runner. State in the tens of GBs, high parallelism and sustained high
+  throughput need a real cluster; run `soak.py` there with `--rate`, `--customers` and
+  `--partitions` scaled up.
+
 ## Diagnostic codes
 
 | Range | Area |
 |---|---|
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
-| CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
+| CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts, CD110 alignment/emit without push-down, CD111 SOURCE_WATERMARK unsupported); batch (CD120 unbounded source, CD121 temporal join, CD122 backfill); `from_pipeline` (CD130 cycle, CD131 upstream doesn't compile, CD132 unknown sink, CD133 sink not readable, CD134 not streamable); process models (CD140 state not checked by upgrades, CD141 key_by column, CD142 event_time / primary_key column); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
 | CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage) |
 | CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |

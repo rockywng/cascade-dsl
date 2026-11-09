@@ -58,6 +58,7 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     _check_quarantine(c)
     _check_pipeline(c)
     _check_scaling(c)
+    _check_batch(c)
     return c
 
 
@@ -147,6 +148,8 @@ def _check_sources(c: Checked):
                     d.error("CD104", f"source '{s.name}' ({spec.type}) requires a primary_key", s.loc,
                             hint="CDC sources are keyed changelogs; declare the table's primary key", node=s.name)
                 changelog = "updating" if spec.source_is_changelog(s.format, bool(s.primary_key)) else "append"
+                if p.mode == "batch":
+                    changelog = "append"  # a bounded read (snapshot) is insert-only
                 if changelog == "updating" and not s.primary_key and spec.type == "kafka":
                     d.warning("CD107", f"changelog source '{s.name}' has no primary_key; Flink cannot "
                               "normalize duplicate change events", s.loc, node=s.name)
@@ -358,6 +361,8 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
     updating_inputs = [i for i in inputs if rels.get(i) and rels[i].changelog == "updating"
                        and i not in temporal_sides]
     changelog = "updating" if (a.updating or updating_inputs) else "append"
+    if p.mode == "batch":
+        changelog = "append"  # batch operators emit final results once
     if updating_inputs and a.windows:
         d.warning("CD332", f"model '{name}': window aggregation over updating input(s) "
                   f"{', '.join(updating_inputs)}", m.loc, node=name,
@@ -387,6 +392,8 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
 
     # --- state
     unbounded = [op for op in a.ops if not op.bounded and op.kind in UNBOUNDED_KINDS]
+    if p.mode == "batch":
+        unbounded = []  # a batch job's state lives for one run
     if unbounded and p.state_ttl_ms is None and not a.has_ttl_hint and not m.allow_unbounded_state:
         ops = "; ".join(op.detail for op in unbounded)
         d.error("CD350", f"model '{name}' keeps unbounded state ({ops}) and no state TTL is configured",
@@ -689,6 +696,57 @@ def _check_pipeline(c: Checked):
                   hint="it will not be part of the deployed job", node=n)
 
 
+# --- batch ------------------------------------------------------------------------------
+
+# how each catalog connector reads a bounded snapshot; None = can't be bounded
+BATCH_SOURCE = {
+    "kafka": {"scan.bounded.mode": "latest-offset"},   # everything in the topic when the job starts
+    "postgres-cdc": {"scan.startup.mode": "snapshot"}, "mysql-cdc": {"scan.startup.mode": "snapshot"},
+    "oracle-cdc": {"scan.startup.mode": "snapshot"}, "sqlserver-cdc": {"scan.startup.mode": "snapshot"},
+    "db2-cdc": {"scan.startup.mode": "snapshot"}, "mongodb-cdc": {"scan.startup.mode": "snapshot"},
+    "iceberg": {"streaming": "false"}, "hudi": {"read.streaming.enabled": "false"},
+    "paimon": {}, "filesystem": {}, "jdbc": {}, "datagen": {},
+    "kinesis": None,
+}
+
+
+def _check_batch(c: Checked):
+    """mode: batch runs the pipeline once over bounded inputs, then finishes."""
+    p, d = c.pipeline, c.diagnostics
+    if p.mode != "batch":
+        return
+    c.settings["execution.runtime-mode"] = "batch"
+    for s in p.sources.values():
+        opts = c.options.get(s.name)
+        if opts is None:
+            continue
+        connector = opts.get("connector")
+        custom = s.connection in p.connections and p.connections[s.connection].type == "custom"
+        if custom:
+            continue  # the user's options decide boundedness
+        bounded = BATCH_SOURCE.get(connector, {})
+        if bounded is None:
+            d.error("CD120", f"source '{s.name}': connector '{connector}' has no bounded read, so it can't be "
+                    "used in a batch pipeline", s.loc, node=s.name)
+            continue
+        for k, v in bounded.items():
+            opts[k] = v
+        if connector == "datagen" and "number-of-rows" not in opts:
+            d.error("CD120", f"source '{s.name}': datagen in a batch pipeline needs number_of_rows", s.loc,
+                    node=s.name)
+        if connector == "upsert-kafka" and "scan.bounded.mode" in opts:
+            pass
+    for m in p.models.values():
+        if m.backfill:
+            d.error("CD122", f"model '{m.name}': backfill only applies to streaming pipelines (a batch run "
+                    "always reads its inputs from the start)", m.loc, node=m.name)
+    for name, a in c.analyses.items():
+        if any(r.temporal for r in a.refs):
+            d.error("CD121", f"model '{name}': temporal joins (FOR SYSTEM_TIME AS OF) are streaming-only",
+                    p.models[name].loc, node=name, hint="join on the key instead; a batch run sees one version "
+                                                        "of each table")
+
+
 # --- scaling ----------------------------------------------------------------------------
 
 FLINK_MAX_PARALLELISM = 32768
@@ -708,6 +766,8 @@ def _check_scaling(c: Checked):
             d.error("CD521", f"set '{key}' through `scaling.{field_name}`, not flink.config", p.loc,
                     hint="the scaling block is what the autoscaler and upgrade checks read")
     keyed = [n for n in c.order if p.relations.get(n) and p.relations[n].stateful_ops]
+    if p.mode == "batch":
+        keyed = []  # no state survives a batch run, so max parallelism can change freely
     if sc is None or sc.max_parallelism is None:
         if keyed:
             d.warning("CD520", f"pipeline keeps keyed state ({', '.join(keyed[:3])}"

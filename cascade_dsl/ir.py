@@ -192,6 +192,7 @@ class Pipeline:
     functions: dict[str, Function] = field(default_factory=dict)
     deploy: dict | None = None  # deployment settings (image, resources, checkpoints, ...), vars resolved
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
+    mode: str = "streaming"  # streaming | batch
     relations: dict[str, RelationInfo] = field(default_factory=dict)
     loc: Location | None = None
 

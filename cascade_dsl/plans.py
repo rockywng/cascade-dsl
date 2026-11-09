@@ -270,6 +270,9 @@ def compile_plan(path: str, flink_home: str, out: str, env: str | None = None, l
     r = compile_pipeline(path, env)
     if r.lowered is None:
         raise PlanError("compilation failed:\n" + "\n".join(d.format() for d in r.diagnostics.errors))
+    if r.checked.pipeline.mode == "batch":
+        raise PlanError("batch pipelines have no compiled plan: Flink compiles plans for streaming jobs only, "
+                        "and a batch run has no state to keep across upgrades. Deploy without --plan-dir.")
     tmp = workdir or tempfile.mkdtemp(prefix="cascade-plan-")
     stmts = localize(r.lowered, r.checked, "restore", tmp) if local else r.lowered.statements
     result = Tools(flink_home).compile_plan(stmts, out)

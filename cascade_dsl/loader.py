@@ -23,7 +23,7 @@ DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h|d)\s*$")
 UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "environments",
-            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions"}
+            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions", "mode"}
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict"}
@@ -278,6 +278,9 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
     if doc.get("deploy") is not None:
         deploy = _load_deploy(subst(ctx.require_mapping(doc["deploy"], "deploy", doc, "deploy"), doc, "deploy"), ctx)
 
+    mode = str(doc.get("mode", "streaming"))
+    if mode not in ("streaming", "batch"):
+        diags.error("CD006", f"mode must be streaming or batch (got '{mode}')", ctx.loc(doc, "mode"))
     if diags.has_errors:
         raise CompileError(diags)
 
@@ -287,6 +290,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         state_ttl_ms=state_ttl_ms, flink_config=flink_config,
         connections=connections, sources=sources, models=models, sinks=sinks,
         quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, functions=functions, loc=ctx.loc(doc),
+        mode=mode,
     )
     return p, diags
 

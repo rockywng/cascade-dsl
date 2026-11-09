@@ -54,6 +54,24 @@ Durations: `500ms`, `5s`, `10m`, `1h`, `7d`.
   time. Properties marked as secrets (`password`, `sasl_jaas_config`) must use a `${secret:...}`
   reference or compilation fails (CD201).
 
+### Batch pipelines
+
+`mode: batch` (top level; the default is `streaming`) runs the pipeline once over bounded inputs and
+finishes. Use it for nightly recomputes and one-off reprocessing.
+
+- **Sources are read as a bounded snapshot.** Kafka reads up to the latest offset at start
+  (`scan.bounded.mode`), CDC sources take a snapshot (`scan.startup.mode: snapshot`), and Iceberg and
+  Hudi do a one-off read. Filesystem, JDBC and Paimon are bounded already. Datagen needs
+  `number_of_rows`. Kinesis can't be bounded (CD120). For `custom` connectors, your options decide.
+- **Results are final.** Every model emits each result once, so a `GROUP BY` can write to an append
+  sink, and no state TTL is needed.
+- **Streaming-only features are errors.** Temporal joins (CD121) and `backfill` (CD122): a batch
+  run always reads its inputs from the start, and sees one version of each table.
+- **Deployment.** It's a FlinkDeployment with `upgradeMode: stateless`; a new spec reruns the job.
+  There's no compiled plan (Flink compiles plans for streaming only), so `cascade plan` refuses.
+- **Tests.** `cascade test` runs a batch pipeline's tests as a streaming job over the same fixtures,
+  which ends with the same final results.
+
 ## Connections
 
 ```yaml

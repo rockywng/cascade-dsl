@@ -110,6 +110,9 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     os.makedirs(out, exist_ok=True)
     setup = [_in_image(st) for st in lowered.statements if st.kind != "insert"]
     files = {"setup.sql": _header(r, "setup") + script(setup)}
+    if plan_dir and p.mode == "batch":
+        raise DeployError("batch pipelines deploy as statements (Flink compiles plans for streaming jobs only); "
+                          "drop --plan-dir")
     if plan_dir:
         plan_path = os.path.join(plan_dir, "plan.json")
         if not os.path.exists(plan_path):
@@ -317,7 +320,8 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
                 "entryClass": RUNNER,
                 "args": args,
                 "parallelism": (sc.parallelism if sc and sc.parallelism else 1),
-                "upgradeMode": cfg.get("upgrade_mode", "savepoint"),
+                # a batch run has no state to carry over; a new spec reruns the job
+                "upgradeMode": cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint"),
                 "state": "running",
             },
         },

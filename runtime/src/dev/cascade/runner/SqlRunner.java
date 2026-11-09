@@ -5,6 +5,7 @@ import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.PlanReference;
 import org.apache.flink.table.api.StatementSet;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.TableResult;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -47,6 +48,7 @@ public final class SqlRunner {
         String plan = null;
         String statements = null;
         boolean validate = false;
+        boolean await = false;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--setup":
@@ -61,6 +63,9 @@ public final class SqlRunner {
                 case "--validate":
                     validate = true;
                     break;
+                case "--await":
+                    await = true; // block until the job finishes (batch runs; local tests)
+                    break;
                 default:
                     throw new IllegalArgumentException("unknown argument " + args[i]);
             }
@@ -70,9 +75,20 @@ public final class SqlRunner {
                     "usage: SqlRunner --setup setup.sql (--plan plan.json | --statements statements.sql) [--validate]");
         }
         Map<String, String> env = System.getenv();
+        List<String> setupStmts = split(substitute(read(setup), env));
+        // the planner (streaming or batch) is fixed when the environment is created, so the runtime
+        // mode must be known before any SET is applied
+        boolean batch = false;
+        for (String stmt : setupStmts) {
+            Matcher m = SET.matcher(stmt);
+            if (m.matches() && m.group(1).equals("execution.runtime-mode")) {
+                batch = m.group(2).trim().equalsIgnoreCase("batch");
+            }
+        }
+        EnvironmentSettings.Builder settings = EnvironmentSettings.newInstance();
         TableEnvironment tEnv =
-                TableEnvironment.create(EnvironmentSettings.newInstance().inStreamingMode().build());
-        for (String stmt : split(substitute(read(setup), env))) {
+                TableEnvironment.create((batch ? settings.inBatchMode() : settings.inStreamingMode()).build());
+        for (String stmt : setupStmts) {
             Matcher m = SET.matcher(stmt);
             if (m.matches()) {
                 tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));
@@ -87,7 +103,10 @@ public final class SqlRunner {
                 System.out.println("cascade: plan OK");
                 return;
             }
-            compiled.execute();
+            TableResult result = compiled.execute();
+            if (await) {
+                result.await();
+            }
         } else {
             StatementSet set = tEnv.createStatementSet();
             for (String stmt : split(substitute(read(statements), env))) {
@@ -98,7 +117,10 @@ public final class SqlRunner {
                 System.out.println("cascade: statements OK");
                 return;
             }
-            set.execute();
+            TableResult result = set.execute();
+            if (await) {
+                result.await();
+            }
         }
     }
 

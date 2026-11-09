@@ -367,6 +367,7 @@ def _manifest(c: Checked, sql: str) -> dict:
         "secret_refs_in_options": sorted({v for opts in c.options.values() for v in opts.values()
                                           if SECRET_RE.match(v) or "${secret:" in v}),
         "artifacts": sorted(artifacts),
+        "imports": p.imports,  # sources that read other pipelines' sinks
         "runtime_functions": runtime_fns,
         "functions": {f.name: {"language": f.language, "class": f.class_name, "jar": f.jar, "file": f.file,
                                "function": f.function, "returns": f.returns.text if f.returns else None,

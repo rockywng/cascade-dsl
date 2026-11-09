@@ -170,6 +170,44 @@ sources:
 > In YAML flow style (`{a: DECIMAL(10, 2)}`) the comma splits the mapping; quote such types or
 > use block style.
 
+### Reading another pipeline: `from_pipeline`
+
+```yaml
+sources:
+  ltv:
+    from_pipeline: ../shop      # the upstream project directory
+    sink: ltv_out               # one of its sinks
+    startup: earliest           # optional: any source key overrides what is derived
+    event_time: ts              # optional, as on any source
+```
+
+The compiler compiles the upstream project (same `--env`) and takes from that sink:
+- **The connection.** An identical connection here is reused; otherwise it's added as
+  `<connection>__<pipeline>`, along with its secrets.
+- **The data's location and schema.** That's the topic, table or path, the columns, primary key
+  and format.
+- **How to read it.**
+  - An **upsert Kafka sink** is read with upsert-kafka as a keyed changelog.
+  - An **exactly-once Kafka sink** is read with `isolation.level=read_committed`.
+
+The manifest lists these imports. Upstream changes show up on the next compile, as schema changes
+of this source.
+
+Connection, columns and format can't be set on such a source (CD005). Other errors:
+- an import cycle (CD130)
+- an upstream project that doesn't compile (CD131)
+- an unknown sink (CD132)
+- a sink that can't be read back, such as `print` (CD133)
+- in streaming mode, a sink that can't be read as a stream (JDBC, DynamoDB, or Iceberg upserts)
+  (CD134)
+
+This is also how to **split a pipeline into several jobs**: one project per job, joined through
+sinks. One pipeline always compiles to one job; splitting it inside a project would compute
+shared models twice, or need a hidden topic between the jobs.
+
+Kafka sources can also read any compacted topic as a table with `changelog: upsert` (needs a
+`primary_key`).
+
 ### Idle sources
 
 An operator with several event-time inputs only moves event time forward as far as its slowest input.

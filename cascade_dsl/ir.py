@@ -56,6 +56,7 @@ class Source:
     description: str | None = None
     loc: Location | None = None
     copy_of: str | None = None  # generated backfill copy of this source
+    from_pipeline: dict | None = None  # {path, sink}: read another pipeline's sink (imports.py)
 
 
 @dataclass
@@ -193,6 +194,7 @@ class Pipeline:
     deploy: dict | None = None  # deployment settings (image, resources, checkpoints, ...), vars resolved
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     mode: str = "streaming"  # streaming | batch
+    imports: list = field(default_factory=list)  # [{source, pipeline, sink, path}]
     relations: dict[str, RelationInfo] = field(default_factory=dict)
     loc: Location | None = None
 

@@ -74,6 +74,12 @@ def _kafka_finish(role, mode, fmt, opts, ctx: LowerCtx):
             problems.append(("CD214", f"format '{fmt}' cannot be used with upsert mode"))
     if role == "source":
         opts.setdefault("properties.group.id", f"{ctx.pipeline}.{ctx.node}")
+        if opts.pop("__changelog", "append") == "upsert":
+            # upsert-kafka reads the whole compacted topic as a table; it takes no startup mode
+            opts["connector"] = "upsert-kafka"
+            f = opts.pop("format", None) or "json"
+            opts["key.format"] = opts["value.format"] = f
+            opts.pop("scan.startup.mode", None)
     if role == "sink" and opts.get("sink.delivery-guarantee") == "exactly-once":
         # Flink's default transaction timeout (1 h) exceeds the broker's default maximum
         # (transaction.max.timeout.ms = 15 min): the producer is rejected and the job crash-loops
@@ -198,6 +204,8 @@ register(ConnectorSpec(
     source={
         "topic": Prop("topic", required=True),
         "group_id": Prop("properties.group.id"),
+        "changelog": Prop("__changelog", values={"append": "append", "upsert": "upsert"},
+                          doc="upsert: a compacted topic of keyed rows, read with upsert-kafka"),
         "startup": Prop("scan.startup.mode", default="group", values={
             "earliest": "earliest-offset", "latest": "latest-offset", "group": "group-offsets"}),
     },

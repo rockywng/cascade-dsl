@@ -148,6 +148,11 @@ def _check_sources(c: Checked):
                     d.error("CD104", f"source '{s.name}' ({spec.type}) requires a primary_key", s.loc,
                             hint="CDC sources are keyed changelogs; declare the table's primary key", node=s.name)
                 changelog = "updating" if spec.source_is_changelog(s.format, bool(s.primary_key)) else "append"
+                if s.endpoint.get("changelog") == "upsert":
+                    changelog = "updating"
+                    if not s.primary_key:
+                        d.error("CD104", f"source '{s.name}' reads an upsert topic and needs a primary_key", s.loc,
+                                node=s.name)
                 if p.mode == "batch":
                     changelog = "append"  # a bounded read (snapshot) is insert-only
                 if changelog == "updating" and not s.primary_key and spec.type == "kafka":

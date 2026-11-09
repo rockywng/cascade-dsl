@@ -32,11 +32,14 @@ class Result:
         return not self.diagnostics.has_errors and self.lowered is not None
 
 
-def compile_pipeline(path: str, env: str | None = None, emit: bool = True, use_lock: bool = True) -> Result:
+def compile_pipeline(path: str, env: str | None = None, emit: bool = True, use_lock: bool = True,
+                     _imports: tuple = ()) -> Result:
     try:
         pipeline, diags = load_project(path, env)
     except CompileError as e:
         return Result(e.diagnostics)
+    from . import imports
+    imports.apply(pipeline, diags, env, _imports)
     if use_lock:
         from .schemas import read_lock
         pipeline.schema_lock = read_lock(pipeline.root_dir)

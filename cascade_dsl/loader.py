@@ -431,9 +431,17 @@ def _str_list(value, ctx, parent, key, what) -> list[str]:
 
 def _load_source(name, s, ctx: _Ctx) -> Source:
     what = f"source '{name}'"
-    if "connection" not in s:
+    imported = "from_pipeline" in s
+    if imported:
+        for k in ("connection", "columns", "format"):
+            if k in s:
+                ctx.diags.error("CD005", f"{what} reads another pipeline's sink: its '{k}' comes from that sink",
+                                ctx.loc(s, k))
+        if "sink" not in s:
+            ctx.diags.error("CD005", f"{what} has from_pipeline but no 'sink'", ctx.loc(s))
+    elif "connection" not in s:
         ctx.diags.error("CD005", f"{what} is missing 'connection'", ctx.loc(s))
-    if "columns" not in s:
+    if "columns" not in s and not imported:
         ctx.diags.error("CD005", f"{what} is missing 'columns'", ctx.loc(s),
                         hint="sources must declare their schema; it becomes the table DDL")
     event_time = None
@@ -479,7 +487,7 @@ def _load_source(name, s, ctx: _Ctx) -> Source:
             ctx.diags.error("CD005", f"{what}.event_time: give either 'watermark' or 'max_out_of_orderness'",
                             ctx.loc(et, "watermark"))
         event_time = EventTime(str(et.get("column", "")), delay, ctx.loc(et), idle, expression, alignment, emit)
-    endpoint = {k: v for k, v in s.items() if k not in SOURCE_COMMON}
+    endpoint = {k: v for k, v in s.items() if k not in SOURCE_COMMON | {"from_pipeline", "sink"}}
     return Source(
         name=name, connection=str(s.get("connection", "")), endpoint=endpoint,
         format=s.get("format"),
@@ -488,6 +496,7 @@ def _load_source(name, s, ctx: _Ctx) -> Source:
         event_time=event_time, processing_time=s.get("processing_time"),
         options={str(k): str(v) for k, v in ctx.require_mapping(s.get("options"), "options", s, "options").items()},
         description=s.get("description"), loc=ctx.loc(s),
+        from_pipeline={"path": str(s["from_pipeline"]), "sink": str(s.get("sink", ""))} if imported else None,
     )
 
 

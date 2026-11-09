@@ -305,6 +305,54 @@ quarantine:
 
 ---
 
+## Process models
+
+When SQL can't express it, a model can be **DataStream code**: keyed state and timers, broadcast
+state, async I/O, custom windows and triggers, side outputs. The class implements
+`dev.cascade.api.Process` (in `cascade-runtime.jar`):
+
+```java
+public class Sessionize implements Process {
+  public DataStream<Row> apply(ProcessContext ctx, List<DataStream<Row>> inputs) {
+    KeyedStream<Row, String> clicks = (KeyedStream<Row, String>) inputs.get(0);   // key_by
+    return clicks.process(new Sessions(ctx.config(), ctx.sideOutput("late")))
+        .returns(ctx.outputType())
+        .uid(ctx.uid("sessionize"));        // stable uid: state survives upgrades
+  }
+}
+```
+
+```yaml
+models:
+  sessions:
+    process:
+      class: com.acme.process.Sessionize
+      jar: jobs/acme-process.jar      # copied into the image (usrlib)
+      inputs: [clicks]                # sources or models, one DataStream each, in order
+      key_by: [user_id]               # optional: inputs arrive keyed by these columns
+      config: {gap: PT30M}            # ctx.config()
+      changelog: append               # or upsert (with primary_key) / retract
+      event_time: session_closed      # output time attribute; carries the stream's watermarks
+      side_outputs:                   # each becomes a relation: sessions_late
+        late: {columns: {user_id: STRING, url: STRING, ts: TIMESTAMP(3)}}
+    columns: {...}                    # required: the output schema
+    expectations: [...]               # as on any model
+```
+
+The model's output is a relation like any other. SQL models, sinks and tests read it, and its
+event time works with windows downstream. Inputs carry their event-time timestamps and
+watermarks; rows of updating inputs carry their `RowKind`. `cascade test` runs process models
+with fixtures. `examples/sessions` sessionizes clicks with state, timers and a late-data side
+output, and has a SQL window over the result.
+
+Limits:
+- **No compiled plan.** Flink can't compile a plan for DataStream code. A pipeline with a process
+  model deploys as statements (`cascade plan` refuses), and its SQL operators get Flink's
+  generated UIDs. Upgrades that don't change the pipeline's SQL restore fine. A changed SQL query
+  may not, so check it with `restore-test`.
+- **The model's own state is yours.** `check-upgrade` sees a process model only as a whole
+  (CD140). Use `ctx.uid(...)` on stateful operators, and change state in a compatible way.
+
 ## Functions
 
 User-defined scalar functions are declared once and then called by name in any model's SQL.
@@ -636,6 +684,54 @@ Secret. At startup the runner substitutes the value into the SQL, escaped for a 
 and fails listing every missing secret. Secrets aren't allowed in `deploy:` settings (CD530),
 since only the job's SQL is substituted. `SqlRunner ... --validate` plans the job without
 submitting it.
+
+### Other targets
+
+`deploy.target` picks what `cascade deploy` generates. The default, `kubernetes`, is the
+FlinkDeployment above: application mode, one job per cluster.
+
+**`session`: a FlinkSessionJob on a shared, operator-managed session cluster.**
+
+```yaml
+deploy:
+  target: session
+  session_cluster: shared-flink                  # the FlinkDeployment running the session cluster
+  jar_uri: s3://artifacts/cascade-runtime.jar    # where the operator fetches the runner
+```
+
+Session jobs can't mount files, so the job's scripts travel base64-encoded in its arguments.
+The cluster supplies everything else, and `REQUIREMENTS` lists it:
+- the connector jars
+- process and UDF jars in `usrlib`
+- the secrets as environment variables
+
+Python UDFs need files on the cluster, so they aren't supported here. On a shared cluster, one
+JDBC sink's database outage takes down a TaskManager that other jobs run on (CD215).
+
+**`flink-run`: a `run.sh` around `flink run`, for clusters the operator doesn't manage.**
+
+```yaml
+deploy:
+  target: flink-run
+  run:
+    mode: remote                  # or yarn-application
+    jobmanager: flink-jm:8081     # remote: the cluster's REST address
+  flink_config: {state.checkpoints.dir: "hdfs:///flink/checkpoints"}   # -D options
+```
+
+- **`remote`** works with standalone and session clusters. The `flink` client runs SqlRunner,
+  which builds the job graph and submits it. The job files sit next to `run.sh` in `job/`, and
+  secrets come from the client's environment.
+- **`yarn-application`** ships `job/` with the application. Its jars and Python files are copied
+  into `job/` and referenced relatively.
+
+**Not generated:** managed services.
+- **Amazon Managed Service for Apache Flink** runs your own application jar. Use the
+  `flink-run` files with a jar that bundles `cascade-runtime.jar` and `job/`.
+- **Confluent Cloud for Apache Flink** accepts only SQL statements: no custom jars, no plans,
+  its own catalog of tables. `pipeline.sql` is plain Flink SQL that you can adapt.
+- **Ververica Platform** deployments are, like the operator's, a jar plus arguments. That's the
+  session target's shape, but there's no generator for Ververica's API.
 
 ## Schema import
 

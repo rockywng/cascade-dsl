@@ -16,7 +16,9 @@ import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.PlanReference;
 import org.apache.flink.table.api.StatementSet;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.catalog.Column;
 import org.apache.flink.table.catalog.ResolvedSchema;
@@ -121,7 +123,9 @@ public final class Main {
         if (extra != null) {
             conf.addAll(extra);
         }
-        return TableEnvironment.create(
+        // a StreamTableEnvironment, so process models (DataStream code) can run between SQL views
+        return StreamTableEnvironment.create(
+                StreamExecutionEnvironment.getExecutionEnvironment(conf),
                 EnvironmentSettings.newInstance().inStreamingMode().withConfiguration(conf).build());
     }
 
@@ -138,11 +142,13 @@ public final class Main {
     }
 
     /** Executes DDL/SET statements; returns INSERT statements for a statement set. */
-    private static List<String> setup(TableEnvironment tEnv, List<String> stmts) {
+    private static List<String> setup(TableEnvironment tEnv, List<String> stmts) throws Exception {
         List<String> inserts = new ArrayList<>();
         for (String s : stmts) {
             Matcher m = SET.matcher(s);
-            if (m.matches()) {
+            if (dev.cascade.runner.Processes.isDirective(s)) {
+                dev.cascade.runner.Processes.apply((StreamTableEnvironment) tEnv, s);
+            } else if (m.matches()) {
                 tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));
             } else if (s.regionMatches(true, 0, "INSERT", 0, 6)) {
                 inserts.add(s.endsWith(";") ? s.substring(0, s.length() - 1) : s);

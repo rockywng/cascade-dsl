@@ -14,6 +14,9 @@ on:
       cycles:
         description: times each kind of failure is injected
         default: "3"
+      extra:
+        description: more soak.py flags (e.g. --rescale --cdc-edge-cases --customers 5000 --partitions 4)
+        default: ""
 
 jobs:
   soak:
@@ -34,3 +37,4 @@ jobs:
           python integration/soak.py
           --minutes ${{ github.event.inputs.minutes || '45' }}
           --cycles ${{ github.event.inputs.cycles || '3' }}
+          ${{ github.event.inputs.extra || '--rescale --cdc-edge-cases --customers 2000 --partitions 2' }}

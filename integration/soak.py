@@ -39,17 +39,20 @@ from run import Failed, ok, step
 
 BASE = datetime(2026, 1, 1, 10, 0, 0)
 CUSTOMERS = [f"c{i}" for i in range(50)]
+PROBE = "probe"  # --cdc-edge-cases: a customer whose CDC change is made while the replication slot is gone
+SLOT = "shop_it_customers"  # the Postgres CDC slot cascade derives for source customers of shop_it
 SEGMENTS = ["smb", "enterprise", "mid"]
 
 
 # --- pipeline ---------------------------------------------------------------------------------
 
-def write_pipeline(delivery: str = "exactly-once") -> str:
+def write_pipeline(delivery: str = "exactly-once", parallelism: int = 1) -> str:
     """The integration pipeline, with the revenue sink writing exactly-once (Kafka transactions)."""
     with open(os.path.join(it.HERE, "pipeline", "pipeline.yaml")) as f:
         text = f.read()
     text = text.replace("    topic: revenue\n", f"    topic: revenue\n    delivery: {delivery}\n")
-    d = os.path.join(it.WORK, "pipeline-soak")
+    text = text.replace("parallelism: 1}", f"parallelism: {parallelism}}}")
+    d = os.path.join(it.WORK, "pipeline-soak" + ("" if parallelism == 1 else f"-p{parallelism}"))
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
     with open(os.path.join(d, "pipeline.yaml"), "w") as f:
@@ -127,6 +130,9 @@ class CustomerChanges:
         i = 0
         while not self.stop.wait(4):
             c = CUSTOMERS[(i * 7) % len(CUSTOMERS)]
+            if c == PROBE:
+                i += 1
+                continue  # the slot-loss probe's segment is set only by that step
             seg = SEGMENTS[i % len(SEGMENTS)]
             ts = self.load.event_time().strftime("%Y-%m-%d %H:%M:%S")
             try:
@@ -230,6 +236,44 @@ def restart_postgres():
     it.compose("restart", "postgres", timeout=300)
 
 
+def schema_change():
+    """A column added to the CDC table mid-stream: the declared schema ignores it; changes keep flowing."""
+    it.psql("ALTER TABLE customers ADD COLUMN IF NOT EXISTS note TEXT")
+    it.psql("UPDATE customers SET note = 'after schema change' WHERE customer_id = 'c1'")
+
+
+class Rescaler:
+    """stop-with-savepoint and resubmit at the other parallelism (1 <-> 2), under load."""
+
+    def __init__(self, packages: dict):
+        self.packages = packages  # parallelism -> runner args
+        self.current = 1
+
+    def __call__(self, jid: str) -> str:
+        out = it.flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", jid)
+        m = re.search(r"Savepoint completed\. Path: (\S+)", out)
+        if not m:
+            raise Failed("stop-with-savepoint for rescale failed:\n" + out[-2000:])
+        self.current = 2 if self.current == 1 else 1
+        it.submit(f"soak-p{self.current}", self.packages[self.current], savepoint=m.group(1))
+        return f"parallelism {3 - self.current} -> {self.current}"
+
+
+def slot_loss(jid: str, args: list, load) -> str:
+    """The replication slot disappears while the job is stopped (a database failover or an operator
+    'cleaning up'); a customer changes in that gap. Does the change ever reach the job?"""
+    out = it.flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", jid)
+    m = re.search(r"Savepoint completed\. Path: (\S+)", out)
+    if not m:
+        raise Failed("stop-with-savepoint before slot loss failed:\n" + out[-2000:])
+    it.psql(f"SELECT pg_drop_replication_slot('{SLOT}')")
+    ts = load.event_time().strftime("%Y-%m-%d %H:%M:%S")
+    it.psql(f"INSERT INTO customers VALUES ('{PROBE}', 'probe-seg', '{ts}') ON CONFLICT (customer_id) "
+            f"DO UPDATE SET segment = EXCLUDED.segment, updated_at = EXCLUDED.updated_at")
+    it.submit("soak", args, savepoint=m.group(1))
+    return "slot dropped while stopped; probe customer changed in the gap"
+
+
 def kill_taskmanager_twice():
     kill_taskmanager()
     time.sleep(8)
@@ -318,6 +362,16 @@ def check_results(expected_ltv: dict, expected_windows: dict, max_ts: datetime):
     ok(f"exactly-once revenue sink: {len(rows)} rows, no duplicates, all {len(closed)} closed windows exact")
 
 
+def check_probe():
+    """The probe customer's change was made while the slot was gone; orders after it carry its segment
+    only if the change reached the job."""
+    segments = {json.loads(line)["segment"] for line in consume_all("revenue", committed=True)}
+    if "probe-seg" not in segments:
+        raise Failed("a CDC change made while the replication slot was gone never reached the job: on restore "
+                     "the connector created a new slot at the current position (silent data loss)")
+    ok("the change made while the replication slot was gone reached the job")
+
+
 # --- main -------------------------------------------------------------------------------------
 
 def main():
@@ -327,6 +381,11 @@ def main():
     ap.add_argument("--cycles", type=int, default=1, help="times each kind of failure is injected")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--customers", type=int, default=50, help="key space (keyed state grows with it)")
+    ap.add_argument("--partitions", type=int, default=1, help="partitions of the orders topic")
+    ap.add_argument("--rescale", action="store_true", help="also rescale 1 <-> 2 under load")
+    ap.add_argument("--cdc-edge-cases", action="store_true",
+                    help="also change the CDC table's schema, and lose the replication slot while stopped")
     ap.add_argument("--delivery", default="exactly-once", choices=["exactly-once", "at-least-once"],
                     help="revenue sink guarantee (at-least-once is a control: the duplicate check must fail)")
     a = ap.parse_args()
@@ -334,11 +393,21 @@ def main():
     code = 1
     load = changes = None
     try:
+        CUSTOMERS[:] = [f"c{i}" for i in range(a.customers)] + ([PROBE] if a.cdc_edge_cases else [])
         it.build(a.skip_build)
         it.start()
-        step(f"soak: {a.minutes:g} minutes at {a.rate} orders/s, with failures")
+        if a.partitions > 1:
+            it.kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--alter",
+                     "--topic", "orders", "--partitions", str(a.partitions))
+        step(f"soak: {a.minutes:g} minutes at {a.rate} orders/s, {a.customers} customers, "
+             f"{a.partitions} partition(s), with failures")
         project = write_pipeline(a.delivery)
         args = it.package("soak", project)
+        rescaler = None
+        if a.rescale:
+            p2 = write_pipeline(a.delivery, parallelism=2)
+            rescaler = Rescaler({1: args, 2: it.package("soak-p2", p2, previous="soak")})
+            rescaler.packages[1] = it.package("soak-p1", project, previous="soak-p2")
         it.submit("soak", args)
         wait_healthy("job started", since_checkpoints=0)
         load, changes = Load(a.rate), None
@@ -353,6 +422,15 @@ def main():
                  ("Postgres restarted (CDC connection drops)", restart_postgres),
                  ("stop-with-savepoint and resubmit under load", None),
                  ("TaskManager killed twice in a row", kill_taskmanager_twice)]
+        if rescaler:
+            kinds.append(("rescale under load", rescaler))
+        if a.cdc_edge_cases:
+            kinds.append(("CDC table schema change (ADD COLUMN)", schema_change))
+            def lose_slot(jid):
+                if rescaler:
+                    rescaler.current = 1
+                return slot_loss(jid, args, load)
+            kinds.append(("replication slot lost while stopped", lose_slot))
         n = len(kinds) * a.cycles
         schedule = [((k + 1) / (n + 1), *kinds[k % len(kinds)]) for k in range(n)]
         total = a.minutes * 60
@@ -367,7 +445,12 @@ def main():
                 m = re.search(r"Savepoint completed\. Path: (\S+)", out)
                 if not m:
                     raise Failed("stop-with-savepoint under load failed:\n" + out[-2000:])
-                it.submit("soak", args, savepoint=m.group(1))
+                it.submit(f"soak-p{rescaler.current}" if rescaler else "soak",
+                          rescaler.packages[rescaler.current] if rescaler else args, savepoint=m.group(1))
+                wait_healthy(f"after {name}", since_checkpoints=0)
+            elif action is rescaler or name.startswith("replication slot"):  # these stop and resubmit
+                what = action(before["jid"])
+                ok(what)
                 wait_healthy(f"after {name}", since_checkpoints=0)
             else:
                 action()
@@ -388,6 +471,8 @@ def main():
            f"job {info.get('state')}, {info.get('completed')} checkpoints, {info.get('failed')} failed")
         expected_ltv, expected_windows, max_ts = truth()
         check_results(expected_ltv, expected_windows, max_ts)
+        if a.cdc_edge_cases:
+            check_probe()
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0
     except (Failed, RuntimeError) as e:

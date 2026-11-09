@@ -270,6 +270,9 @@ def compile_plan(path: str, flink_home: str, out: str, env: str | None = None, l
     r = compile_pipeline(path, env)
     if r.lowered is None:
         raise PlanError("compilation failed:\n" + "\n".join(d.format() for d in r.diagnostics.errors))
+    if any(m.process for m in r.checked.pipeline.models.values()):
+        raise PlanError("this pipeline has process models: Flink can't compile a plan for DataStream code. "
+                        "Deploy without --plan-dir; give stateful process operators .uid(ctx.uid(...))")
     if r.checked.pipeline.mode == "batch":
         raise PlanError("batch pipelines have no compiled plan: Flink compiles plans for streaming jobs only, "
                         "and a batch run has no state to keep across upgrades. Deploy without --plan-dir.")

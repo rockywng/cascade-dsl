@@ -20,6 +20,7 @@ ASSERT_FN = "CASCADE_ASSERT"
 ASSERT_CLASS = "dev.cascade.runtime.AssertFunction"
 EXPECT_FN = "CASCADE_EXPECT"
 EXPECT_CLASS = "dev.cascade.runtime.ExpectFunction"
+PROCESS_DIRECTIVE = "-- @@process"  # dev.cascade.runner.Processes.DIRECTIVE
 SOURCE_IDENTITY_KEYS = {"connector", "topic", "table-name", "schema-name", "database-name", "hostname",
                         "catalog-database", "catalog-table", "path", "slot.name", "properties.group.id"}
 
@@ -204,9 +205,20 @@ def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
     def view(vname, sql, cmt=None):
         stmts.append(Stmt("view", vname, f"CREATE TEMPORARY VIEW {q(vname)} AS\n{sql};", comment=cmt))
 
+    if m.process is not None:
+        if "side_of" in m.process:
+            # registered by its process model's directive (under name, or name__raw with expectations)
+            if m.expectations:
+                raise AssertionError("side outputs take no expectations")
+            return
+        target = f"{name}__raw" if m.expectations else name
+        stmts.append(_process_directive(p, m, target, comment))
+        if not m.expectations:
+            return
+
     # contract casts for columns whose inferred type is unknown or differs
     casts = None
-    if m.columns is not None:
+    if m.columns is not None and m.process is None:
         inferred = c.inferred.get(name)
         need = []
         for i, col in enumerate(m.columns):
@@ -222,7 +234,8 @@ def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
         return
 
     base = f"{name}__raw"
-    view(base, body, comment)
+    if m.process is None:
+        view(base, body, comment)
     if casts is not None:
         view(f"{name}__typed", f"SELECT {', '.join(casts)}\nFROM {q(base)}")
         base = f"{name}__typed"
@@ -251,6 +264,30 @@ def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
             stmts.append(Stmt("insert", qname, query=f"SELECT *\nFROM {q(qview)}"))
 
 
+def _process_directive(p, m, view_name: str, comment: str) -> Stmt:
+    """`-- @@process {json}`: run by dev.cascade.runner.Processes in the runner and the local tools."""
+    import json
+    import os
+    pr = m.process
+    spec = {
+        "name": m.name, "view": view_name, "class": pr["class"],
+        "jar": os.path.abspath(os.path.join(p.root_dir, pr["jar"])) if pr.get("jar") else None,
+        "inputs": pr["inputs"], "key_by": pr.get("key_by") or [], "config": pr.get("config") or {},
+        "columns": [[col.name, col.type.text] for col in m.columns or []],
+        "changelog": pr.get("changelog", "append"), "primary_key": pr.get("primary_key") or [],
+        "event_time": pr.get("event_time"),
+        "side_outputs": {side: {"view": next((n for n, x in p.models.items() if x.process and
+                                              x.process.get("side_of") == m.name and x.process.get("side") == side),
+                                             f"{m.name}_{side}"), "columns": [[col.name, col.type.text]
+                                                                        for col in v["columns"]],
+                                "event_time": v.get("event_time")}
+                         for side, v in (pr.get("side_outputs") or {}).items()},
+    }
+    if spec["jar"] is None:
+        del spec["jar"]
+    return Stmt("process", m.name, f"{PROCESS_DIRECTIVE} {json.dumps(spec, sort_keys=True)}", comment=comment)
+
+
 # --- manifest ----------------------------------------------------------------------------
 
 def _cols(columns: list[OutputColumn] | None):
@@ -275,7 +312,8 @@ def _manifest(c: Checked, sql: str) -> dict:
         # name-free: inputs are referred to by position (their schemas are part of the state_id), so
         # renaming a model or one of its inputs keeps every state_id: views are inlined, the plan
         # doesn't change
-        return h("model", normalize_sql(_unnamed_sql(c, n)),
+        logic = _unnamed_sql(c, n) if m.process is not None else normalize_sql(_unnamed_sql(c, n))
+        return h("model", logic,
                  [(e.check, e.on_violation) for e in m.expectations], _cols(p.relations[n].columns))
 
     def upstream_of(n):
@@ -377,7 +415,12 @@ def _manifest(c: Checked, sql: str) -> dict:
 
 def _unnamed_sql(c: Checked, name: str) -> str:
     """The model's SQL with each referenced source/model replaced by its input position."""
+    import json
     import re
+    from .analyze import process_identity
+    m = c.pipeline.models[name]
+    if m.process is not None:
+        return json.dumps(process_identity(m, c.pipeline.relations[name].inputs), sort_keys=True)
     sql = c.pipeline.models[name].sql
     a = c.analyses.get(name)
     if a is None:

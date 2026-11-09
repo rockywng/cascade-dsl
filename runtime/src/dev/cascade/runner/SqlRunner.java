@@ -4,7 +4,11 @@ import org.apache.flink.table.api.CompiledPlan;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.PlanReference;
 import org.apache.flink.table.api.StatementSet;
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.bridge.java.StreamStatementSet;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.TableResult;
 
 import java.nio.charset.StandardCharsets;
@@ -60,6 +64,15 @@ public final class SqlRunner {
                 case "--statements":
                     statements = args[++i];
                     break;
+                case "--setup-b64": // scripts inline, for jobs that can't be given files (session jobs)
+                    setup = tempFile("setup", args[++i]);
+                    break;
+                case "--plan-b64":
+                    plan = tempFile("plan", args[++i]);
+                    break;
+                case "--statements-b64":
+                    statements = tempFile("statements", args[++i]);
+                    break;
                 case "--validate":
                     validate = true;
                     break;
@@ -86,11 +99,19 @@ public final class SqlRunner {
             }
         }
         EnvironmentSettings.Builder settings = EnvironmentSettings.newInstance();
-        TableEnvironment tEnv =
-                TableEnvironment.create((batch ? settings.inBatchMode() : settings.inStreamingMode()).build());
+        StreamExecutionEnvironment senv = StreamExecutionEnvironment.getExecutionEnvironment();
+        if (batch) {
+            senv.setRuntimeMode(RuntimeExecutionMode.BATCH);
+        }
+        StreamTableEnvironment tEnv = StreamTableEnvironment.create(
+                senv, (batch ? settings.inBatchMode() : settings.inStreamingMode()).build());
+        boolean processes = false;
         for (String stmt : setupStmts) {
             Matcher m = SET.matcher(stmt);
-            if (m.matches()) {
+            if (Processes.isDirective(stmt)) {
+                Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
+                processes = true;
+            } else if (m.matches()) {
                 tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));
             } else {
                 tEnv.executeSql(stripSemicolon(stmt));
@@ -108,7 +129,7 @@ public final class SqlRunner {
                 result.await();
             }
         } else {
-            StatementSet set = tEnv.createStatementSet();
+            StreamStatementSet set = tEnv.createStatementSet();
             for (String stmt : split(substitute(read(statements), env))) {
                 set.addInsertSql(stripSemicolon(stmt));
             }
@@ -117,11 +138,29 @@ public final class SqlRunner {
                 System.out.println("cascade: statements OK");
                 return;
             }
+            if (processes) {
+                // SQL and DataStream parts form one job: attach the inserts to the stream graph
+                set.attachAsDataStream();
+                String name = tEnv.getConfig().getConfiguration().getString("pipeline.name", "cascade");
+                if (await) {
+                    senv.execute(name);
+                } else {
+                    senv.executeAsync(name);
+                }
+                return;
+            }
             TableResult result = set.execute();
             if (await) {
                 result.await();
             }
         }
+    }
+
+    static String tempFile(String name, String base64) throws Exception {
+        java.nio.file.Path f = Files.createTempFile("cascade-" + name, ".txt");
+        Files.write(f, java.util.Base64.getDecoder().decode(base64));
+        f.toFile().deleteOnExit();
+        return f.toString();
     }
 
     static String read(String path) throws Exception {
@@ -133,7 +172,7 @@ public final class SqlRunner {
         for (String part : text.split("(?m)^" + Pattern.quote(SEPARATOR) + "\\s*$")) {
             String s = part.trim();
             // drop leading comment lines
-            while (s.startsWith("--")) {
+            while (s.startsWith("--") && !Processes.isDirective(s)) {
                 int nl = s.indexOf('\n');
                 s = nl < 0 ? "" : s.substring(nl + 1).trim();
             }

@@ -95,8 +95,11 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     c, lowered = r.checked, r.lowered
     p = c.pipeline
     cfg = dict(p.deploy or {})
+    target = str(cfg.get("target", "kubernetes"))
+    if target not in TARGETS:
+        raise DeployError(f"unknown deploy target '{target}' (one of: {', '.join(TARGETS)})")
     image = image or cfg.get("image")
-    if not image:
+    if target == "kubernetes" and not image:
         raise DeployError("no runtime image: set `deploy.image` or pass --image")
     name = resource_name(p.name, p.env)
     secrets = sorted(p.secrets)
@@ -108,8 +111,12 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     secret_name = cfg.get("secrets") or f"{name}-secrets"
 
     os.makedirs(out, exist_ok=True)
-    setup = [_in_image(st) for st in lowered.statements if st.kind != "insert"]
+    rewrite = _in_image if target != "flink-run" else (lambda st: _job_local(st, out))
+    setup = [rewrite(st) for st in lowered.statements if st.kind != "insert"]
     files = {"setup.sql": _header(r, "setup") + script(setup)}
+    if plan_dir and any(m.process for m in p.models.values()):
+        raise DeployError("pipelines with process models deploy as statements (a compiled plan can't contain "
+                          "DataStream code); drop --plan-dir")
     if plan_dir and p.mode == "batch":
         raise DeployError("batch pipelines deploy as statements (Flink compiles plans for streaming jobs only); "
                           "drop --plan-dir")
@@ -132,6 +139,9 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
         args = ["--setup", f"{JOB_DIR}/setup.sql", "--statements", f"{JOB_DIR}/statements.sql"]
         mode = "statements"
 
+    if target == "flink-run":
+        return _flink_run(r, out, files, mode, secrets, cfg)
+
     labels = {"app.kubernetes.io/name": name, "app.kubernetes.io/managed-by": "cascade",
               "cascade.dev/pipeline": p.name, **({"cascade.dev/environment": p.env} if p.env else {}),
               **{str(k): str(v) for k, v in (cfg.get("labels") or {}).items()}}
@@ -144,6 +154,8 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     job_cm = f"{name}-job-{_content_hash(files)}"
     py_files = python_files(p) if python_functions(p) else None
     py_cm_name = f"{name}-python-{_content_hash(py_files)}" if py_files else None
+    if target == "session":
+        return _session_job(r, out, name, meta(name), files, mode, secrets, cfg)
     configmap = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta(job_cm), "data": files}
     deployment = _flink_deployment(r, name, meta(name), image, args, secret_name, cfg, job_cm, py_cm_name)
     resources = ["configmap.yaml", "flinkdeployment.yaml"]
@@ -172,6 +184,131 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     return {"name": name, "mode": mode, "secrets": secrets, "secret_name": secret_name, "out": out}
 
 
+TARGETS = ("kubernetes", "session", "flink-run")
+
+
+def _job_args(files: dict, mode: str, inline: bool) -> list[str]:
+    """SqlRunner arguments: files next to the runner, or the scripts themselves (base64) when the
+    job can't be given files (a FlinkSessionJob runs on a shared cluster)."""
+    import base64
+    second = "plan" if mode == "plan" else "statements"
+    fname = "plan.json" if mode == "plan" else "statements.sql"
+    if inline:
+        enc = lambda t: base64.b64encode(t.encode()).decode()  # noqa: E731
+        return ["--setup-b64", enc(files["setup.sql"]), f"--{second}-b64", enc(files[fname])]
+    return ["--setup", "job/setup.sql", f"--{second}", f"job/{fname}"]
+
+
+def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mode: str, secrets: list,
+                 cfg: dict) -> dict:
+    """A FlinkSessionJob on an existing (operator-managed) session cluster."""
+    p = r.checked.pipeline
+    cluster = cfg.get("session_cluster")
+    jar = cfg.get("jar_uri")
+    if not cluster or not jar:
+        raise DeployError("target: session needs deploy.session_cluster (the FlinkDeployment running the session "
+                          "cluster) and deploy.jar_uri (where the operator fetches cascade-runtime.jar: https://, "
+                          "s3://, ...)")
+    from .udfs import python_functions
+    if python_functions(p):
+        raise DeployError("Python UDFs need their files on the cluster; a session job can't ship them. "
+                          "Use target: kubernetes")
+    sc = p.scaling
+    job = {
+        "apiVersion": "flink.apache.org/v1beta1", "kind": "FlinkSessionJob", "metadata": metadata,
+        "spec": {
+            "deploymentName": cluster,
+            "job": {"jarURI": jar, "entryClass": RUNNER, "args": _job_args(files, mode, inline=True),
+                    "parallelism": (sc.parallelism if sc and sc.parallelism else 1),
+                    "upgradeMode": cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint"),
+                    "state": "running"},
+            **({"flinkConfiguration": {str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()}}
+               if cfg.get("flink_config") else {}),
+        },
+    }
+    with open(os.path.join(out, "flinksessionjob.yaml"), "w") as f:
+        f.write(_dump(job))
+    notes = ["# Session cluster requirements for this job (it shares the cluster's image and pods):",
+             "#   connector jars: " + (", ".join(sorted(r.lowered.manifest["artifacts"])) or "none"),
+             "#   secrets as environment variables on the JobManager and TaskManagers: "
+             + (", ".join(env_name(s) for s in secrets) or "none")]
+    jars = [m.process["jar"] for m in p.models.values() if m.process and m.process.get("jar")]
+    jars += [f.jar for f in p.functions.values() if f.language == "java" and f.jar]
+    if jars:
+        notes.append("#   in the image's usrlib: " + ", ".join(sorted({os.path.basename(j) for j in jars})))
+    if any(k.connection in p.connections and p.connections[k.connection].type == "jdbc" for k in p.sinks.values()):
+        notes.append("#   WARNING: a JDBC sink's database outage shuts down the whole TaskManager (CD215): every "
+                     "job on it fails over")
+    with open(os.path.join(out, "REQUIREMENTS"), "w") as f:
+        f.write("\n".join(notes) + "\n")
+    with open(os.path.join(out, "kustomization.yaml"), "w") as f:
+        f.write(_dump({"apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization",
+                       "resources": ["flinksessionjob.yaml"]}))
+    return {"name": name, "mode": mode, "secrets": secrets, "secret_name": None, "out": out, "target": "session"}
+
+
+def _job_local(st: Stmt, out: str) -> Stmt:
+    """flink-run: copy the job's jars and Python files into out/job and refer to them relatively."""
+    import shutil as _sh
+    job = os.path.join(out, "job")
+    os.makedirs(job, exist_ok=True)
+    if st.kind == "function" and st.options.get("jar"):
+        jar = st.options["jar"]
+        _sh.copy(jar, job)
+        target = f"job/{os.path.basename(jar)}"
+        return Stmt(st.kind, st.name, st.sql.replace(_sql_lit(jar), _sql_lit(target)), st.comment,
+                    options={"jar": target})
+    if st.kind == "set" and st.name == "python.files":
+        _sh.copytree(st.options[st.name], os.path.join(job, "python"), dirs_exist_ok=True)
+        return Stmt("set", st.name, "SET 'python.files' = 'job/python';", options={st.name: "job/python"})
+    if st.kind == "process":
+        from .lower import PROCESS_DIRECTIVE
+        spec = json.loads(st.sql[len(PROCESS_DIRECTIVE):])
+        if spec.get("jar"):
+            _sh.copy(spec["jar"], job)
+            spec["jar"] = f"job/{os.path.basename(spec['jar'])}"
+        return Stmt(st.kind, st.name, f"{PROCESS_DIRECTIVE} {json.dumps(spec, sort_keys=True)}", st.comment)
+    return st
+
+
+def _flink_run(r: Result, out: str, files: dict, mode: str, secrets: list, cfg: dict) -> dict:
+    """flink-run: a run.sh around `flink run`, for standalone/remote session clusters (the client runs
+    the job's main and submits the job graph) and YARN application mode (the job dir is shipped)."""
+    run = cfg.get("run") or {}
+    how = str(run.get("mode", "remote"))
+    if how not in ("remote", "yarn-application"):
+        raise DeployError("deploy.run.mode must be remote or yarn-application")
+    job = os.path.join(out, "job")
+    os.makedirs(job, exist_ok=True)
+    for fname, text in files.items():
+        with open(os.path.join(job, fname), "w") as f:
+            f.write(text)
+    args = " ".join(_job_args(files, mode, inline=False))
+    opts = [f"-D{k}={v}" for k, v in sorted((cfg.get("flink_config") or {}).items())]
+    if how == "yarn-application":
+        opts = ["-t yarn-application", "-Dyarn.ship-files=job"] + opts
+    elif run.get("jobmanager"):
+        opts = [f"-m {run['jobmanager']}"] + opts
+    lines = ["#!/usr/bin/env bash",
+             f"# Submit {r.checked.pipeline.name} with `flink run` ({how}). Generated by cascade {__version__}.",
+             "# Needs: FLINK_HOME (a Flink distribution whose lib/ has the connector jars:",
+             "#   " + (", ".join(sorted(r.lowered.manifest["artifacts"])) or "none") + ")",
+             "#   CASCADE_RUNTIME_JAR (runtime/target/cascade-runtime.jar)",
+             ("#   secrets in the environment: " + ", ".join(env_name(s) for s in secrets)) if secrets else
+             "#   (no secrets)",
+             "set -euo pipefail",
+             'cd "$(dirname "$0")"',
+             ': "${FLINK_HOME:?set FLINK_HOME}"',
+             ': "${CASCADE_RUNTIME_JAR:?set CASCADE_RUNTIME_JAR to cascade-runtime.jar}"',
+             f'exec "$FLINK_HOME/bin/flink" run {" ".join(opts)} -c {RUNNER} "$CASCADE_RUNTIME_JAR" {args} "$@"'.replace("  ", " ")]
+    path = os.path.join(out, "run.sh")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o755)
+    return {"name": r.checked.pipeline.name, "mode": mode, "secrets": secrets, "secret_name": None, "out": out,
+            "target": "flink-run"}
+
+
 def _in_image(st: Stmt) -> Stmt:
     """Rewrite local paths in setup statements to where the image / pod has the files."""
     if st.kind == "function" and st.options.get("jar"):
@@ -181,6 +318,12 @@ def _in_image(st: Stmt) -> Stmt:
                     options={"jar": target})
     if st.kind == "set" and st.name == "python.files":
         return Stmt("set", st.name, f"SET 'python.files' = '{PYTHON_DIR}';", options={st.name: PYTHON_DIR})
+    if st.kind == "process":
+        from .lower import PROCESS_DIRECTIVE
+        spec = json.loads(st.sql[len(PROCESS_DIRECTIVE):])
+        if spec.get("jar"):
+            spec["jar"] = f"{USRLIB}/{os.path.basename(spec['jar'])}"
+        return Stmt(st.kind, st.name, f"{PROCESS_DIRECTIVE} {json.dumps(spec, sort_keys=True)}", st.comment)
     return st
 
 
@@ -368,6 +511,10 @@ def dockerfile(r: Result, cfg: dict) -> str:
     for f in p.functions.values():
         if f.language == "java" and f.jar:
             lines.append(f"COPY {os.path.join(project, f.jar)} {USRLIB}/{os.path.basename(f.jar)}")
+    for m in p.models.values():
+        if m.process and m.process.get("jar") and m.copy_of is None:
+            jar = m.process["jar"]
+            lines.append(f"COPY {os.path.join(project, jar)} {USRLIB}/{os.path.basename(jar)}")
     for jar in cfg.get("jars") or []:
         lines.append(f"COPY {jar} {USRLIB}/{os.path.basename(str(jar))}")
     return "\n".join(lines) + "\n"

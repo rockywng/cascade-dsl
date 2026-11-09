@@ -58,6 +58,27 @@ def _connector_type(p: Pipeline, src) -> str | None:
     return src.connection if src.connection in CATALOG else None
 
 
+def _model_refs(model):
+    """What a model reads: SQL references, or a process model's declared inputs."""
+    if model.process is not None:
+        from .sqlscan import Ref
+        names = [model.process["side_of"]] if "side_of" in model.process else model.process.get("inputs") or []
+        return [Ref(n, None, 0) for n in names]
+    return _refs(model.sql)
+
+
+def _rewrite_model(model, mapping: dict) -> None:
+    if model.process is not None:
+        pr = dict(model.process)
+        if "side_of" in pr:
+            pr["side_of"] = mapping.get(pr["side_of"], pr["side_of"])
+        else:
+            pr["inputs"] = [mapping.get(n, n) for n in pr.get("inputs") or []]
+        model.process = pr
+    else:
+        model.sql = _rewrite(model.sql, mapping)
+
+
 def apply(p: Pipeline, diags: Diagnostics) -> None:
     """Rewrite the pipeline in place (before analysis)."""
     for m in [m for m in p.models.values() if m.backfill]:
@@ -69,8 +90,7 @@ def apply(p: Pipeline, diags: Diagnostics) -> None:
             if n in seen:
                 continue
             seen.add(n)
-            sql = p.models[n].sql
-            for r in _refs(sql):
+            for r in _model_refs(p.models[n]):
                 if r.name in p.models and r.name not in seen:
                     models.append(r.name)
                     stack.append(r.name)
@@ -78,7 +98,7 @@ def apply(p: Pipeline, diags: Diagnostics) -> None:
                     sources.append(r.name)
         # event-time temporal joins over CDC in the backfilled branch: with an idle timeout, the fact
         # history (instantly available) can outrun the CDC snapshot (which takes a while to start)
-        cdc_versioned = sorted({r.name for n in seen for r in _refs(p.models[n].sql)
+        cdc_versioned = sorted({r.name for n in seen for r in _model_refs(p.models[n])
                                 if r.temporal and r.name in p.sources
                                 and (_connector_type(p, p.sources[r.name]) or "").endswith("-cdc")
                                 and p.sources[r.name].event_time is not None})
@@ -111,7 +131,7 @@ def apply(p: Pipeline, diags: Diagnostics) -> None:
                 ep["startup"] = "earliest"
                 if ep.get("group_id"):
                     ep["group_id"] = f"{ep['group_id']}.backfill.{m.name}"
-            elif ctype in ("postgres-cdc", "mysql-cdc"):
+            elif ctype and ctype.endswith("-cdc"):
                 ep["startup"] = "initial"
                 if ctype == "mysql-cdc" and ep.pop("server_id", None) is not None:
                     diags.warning("CD371", f"model '{m.name}': the backfill copy of '{s}' needs its own MySQL "
@@ -126,12 +146,12 @@ def apply(p: Pipeline, diags: Diagnostics) -> None:
             orig = p.models[u]
             c = copy.deepcopy(orig)
             c.name, c.copy_of, c.backfill, c.scaling = u + sfx, u, False, None
-            c.sql = _rewrite(orig.sql, mapping)
+            _rewrite_model(c, mapping)
             c.expectations = [Expectation(e.name, e.check, "drop" if e.on_violation == "quarantine"
                                           else e.on_violation, e.loc) for e in orig.expectations]
             c.description = f"backfill copy of '{u}' for '{m.name}'"
             p.models[c.name] = c
-        m.sql = _rewrite(m.sql, mapping)
+        _rewrite_model(m, mapping)
         diags.info("CD370", f"model '{m.name}' backfills: it reads its own copies of "
                    f"{', '.join(copied_sources) or 'no sources'} from the beginning"
                    + (f" and recomputes {', '.join(models)}" if models else ""), m.loc, node=m.name,

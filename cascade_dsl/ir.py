@@ -115,6 +115,9 @@ class Model:
     backfill: bool = False  # read own copies of the sources from the beginning (see backfill.py)
     loc: Location | None = None
     copy_of: str | None = None  # generated backfill copy of this model
+    # process model (DataStream code): {class, jar, inputs, key_by, config, changelog, primary_key,
+    # event_time, side_outputs}; a side output relation: {side_of, side}
+    process: dict | None = None
 
 
 @dataclass

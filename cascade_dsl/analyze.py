@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 
 from .connectors import CATALOG, ConnectorSpec, LowerCtx, build_options, spec_for
 from .diagnostics import Diagnostics, Location
-from .ir import OutputColumn, Pipeline, RelationInfo
-from .sqlscan import (Analysis, SqlSyntaxError, analyze_sql, infer_relation, line_of,
+from .ir import OutputColumn, Pipeline, RelationInfo, StatefulOp
+from .sqlscan import (Analysis, Ref, SqlSyntaxError, analyze_sql, infer_relation, line_of,
                       referenced_columns)
 from .types import TypeParseError, parse_type
 from .util import h, normalize_sql
@@ -270,6 +270,20 @@ def _check_models(c: Checked):
     p, d = c.pipeline, c.diagnostics
     deps: dict[str, list[str]] = {}
     for m in p.models.values():
+        if m.process is not None:
+            ins = [m.process["side_of"]] if "side_of" in m.process else list(m.process.get("inputs") or [])
+            c.analyses[m.name] = Analysis(refs=[Ref(n, None, 0) for n in ins])
+            inputs = []
+            for n in ins:
+                if n in p.sinks:
+                    d.error("CD302", f"model '{m.name}' reads from sink '{n}'; sinks are write-only", m.loc, node=m.name)
+                elif n not in p.relation_names() or n == m.name:
+                    d.error("CD302", f"process model '{m.name}': unknown input '{n}'", m.loc, node=m.name,
+                            hint=_suggest(n, p.relation_names()))
+                elif n not in inputs:
+                    inputs.append(n)
+            deps[m.name] = inputs
+            continue
         if not m.sql.strip():
             continue
         try:
@@ -325,6 +339,9 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
     p, d = c.pipeline, c.diagnostics
     m, a = p.models[name], c.analyses[name]
     rels = p.relations
+    if m.process is not None:
+        _analyze_process(c, name, inputs)
+        return
 
     kinds = {op.kind for op in a.ops}
     for fn, table, col, pos in a.windows:
@@ -414,6 +431,43 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
                               upsert_key=_upsert_key(p, a, inputs))
 
 
+def _analyze_process(c: Checked, name: str, inputs: list[str]):
+    """A process model's output is what it declares: columns, changelog, key and time attribute."""
+    p, d = c.pipeline, c.diagnostics
+    m, pr = p.models[name], p.models[name].process
+    columns = [OutputColumn(col.name, col.type) for col in (m.columns or [])]
+    names = {col.name for col in columns}
+    side = "side_of" in pr
+    et = pr.get("event_time")
+    if et and et not in names:
+        d.error("CD142", f"process model '{name}': event_time '{et}' is not a declared column", m.loc, node=name)
+    elif et and not next(col for col in columns if col.name == et).type.is_temporal:
+        d.error("CD142", f"process model '{name}': event_time '{et}' must be a TIMESTAMP column", m.loc, node=name)
+    pk = [] if side else list(pr.get("primary_key") or [])
+    for k in pk:
+        if k not in names:
+            d.error("CD142", f"process model '{name}': primary_key column '{k}' is not declared", m.loc, node=name)
+    if not side:
+        for n in inputs:
+            cols = {col.name for col in (p.relations[n].columns or [])} if n in p.relations else set()
+            for k in pr.get("key_by") or []:
+                if cols and k not in cols:
+                    d.error("CD141", f"process model '{name}': key_by column '{k}' is not a column of input '{n}'",
+                            m.loc, node=name)
+        if p.mode == "streaming":
+            d.info("CD140", f"process model '{name}': Flink can't compile a plan for DataStream code, so the "
+                   "pipeline deploys as statements and upgrade checks don't cover this model's state; give its "
+                   "stateful operators .uid(ctx.uid(...))", m.loc, node=name)
+    changelog = "updating" if pr.get("changelog", "append") != "append" and not side else "append"
+    if p.mode == "batch":
+        changelog = "append"
+    _check_expectations(c, m, columns, changelog)
+    p.relations[name] = RelationInfo(
+        columns=columns, rowtime={et} if et else set(), changelog=changelog, inputs=inputs,
+        stateful_ops=[] if side else [StatefulOp("process", True, f"process {pr['class']}")],
+        upsert_key=pk or None)
+
+
 def _upsert_key(p: Pipeline, a: Analysis, inputs: list[str]) -> list[str] | None:
     """Output names of a statically provable unique key: GROUP BY keys, or a CDC source key passed through."""
     renames: dict[str, str] = {}
@@ -441,6 +495,18 @@ def _upsert_key(p: Pipeline, a: Analysis, inputs: list[str]) -> list[str] | None
     return None if any(x is None for x in out) else out
 
 
+def process_identity(m, inputs: list[str] | None = None) -> list:
+    """The parts of a process model that define what it computes (inputs by position if given)."""
+    pr = m.process
+    if "side_of" in pr:
+        return ["side", pr["side"], pr.get("event_time")]
+    ins = [f"_input{i}" for i in range(len(inputs))] if inputs is not None else pr["inputs"]
+    return [pr["class"], ins, pr.get("key_by"), sorted(pr.get("config", {}).items()), pr.get("changelog"),
+            pr.get("primary_key"), pr.get("event_time"),
+            sorted((k, [(c.name, c.type.text) for c in v["columns"]], v.get("event_time"))
+                   for k, v in pr.get("side_outputs", {}).items())]
+
+
 def model_fingerprint(p: Pipeline, name: str, inputs: list[str],
                       input_columns: dict[str, list[OutputColumn] | None]) -> str:
     """Identity of a model's output schema: its SQL, contract and input schemas (base types)."""
@@ -450,6 +516,8 @@ def model_fingerprint(p: Pipeline, name: str, inputs: list[str],
         cols = input_columns.get(i)
         ins.append((i, [(col.name, col.type.with_nullable(True).text if col.type else None) for col in cols or []]))
     contract = [(col.name, col.type.text) for col in m.columns] if m.columns else None
+    if m.process is not None:
+        return h("process", process_identity(m), contract, ins)
     sql_up = m.sql.upper()
     fns = sorted((f.name, f.language, f.class_name, f.file, f.function, f.returns.text if f.returns else None)
                  for f in p.functions.values() if f.name.upper() in sql_up)

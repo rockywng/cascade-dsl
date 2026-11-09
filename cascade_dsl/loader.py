@@ -27,11 +27,11 @@ TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "en
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict"}
-MODEL_KEYS = {"sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling",
+MODEL_KEYS = {"process", "sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling",
               "backfill"}
 DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
                "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
-               "jars", "pod_template"}
+               "jars", "pod_template", "target", "session_cluster", "jar_uri", "run"}
 SCALING_KEYS = {"max_parallelism", "parallelism", "min", "max", "target_utilization", "max_lag", "autoscale"}
 
 
@@ -246,6 +246,15 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         ctx.check_name(mname, "model", doc["models"])
         m = ctx.require_mapping(m, f"model '{mname}'", doc["models"], mname)
         models[mname] = _load_model(mname, m, ctx, root)
+        pr = models[mname].process
+        for side, spec in (pr or {}).get("side_outputs", {}).items():
+            sname = f"{mname}_{side}"  # each side output is a relation of its own
+            if sname in doc["models"]:
+                diags.error("CD101", f"side output '{side}' of model '{mname}' collides with model '{sname}'",
+                            ctx.loc(m, "process"))
+            models[sname] = Model(name=sname, sql="", sql_loc=None, columns=spec["columns"], expectations=[],
+                                  description=f"side output '{side}' of process model '{mname}'", loc=ctx.loc(m),
+                                  process={"side_of": mname, "side": side, "event_time": spec.get("event_time")})
 
     sinks = {}
     for kname, k in ctx.require_mapping(doc.get("sinks"), "sinks", doc, "sinks").items():
@@ -504,8 +513,13 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
     what = f"model '{name}'"
     ctx.check_keys(m, MODEL_KEYS, what)
     sql, sql_loc = "", None
-    if ("sql" in m) == ("sql_file" in m):
-        ctx.diags.error("CD011", f"{what} must have exactly one of 'sql' or 'sql_file'", ctx.loc(m))
+    process = None
+    if "process" in m:
+        if "sql" in m or "sql_file" in m:
+            ctx.diags.error("CD011", f"{what}: a process model has no 'sql'", ctx.loc(m, "process"))
+        process = _load_process(name, m, ctx, root)
+    elif ("sql" in m) == ("sql_file" in m):
+        ctx.diags.error("CD011", f"{what} must have exactly one of 'sql', 'sql_file' or 'process'", ctx.loc(m))
     elif "sql" in m:
         sql = str(m["sql"])
         # block scalars start on the line after the key
@@ -554,7 +568,44 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
         scaling=_load_scaling(ctx.require_mapping(m["scaling"], f"{what}.scaling", m, "scaling"), ctx,
                               {"min", "max"}, f"{what}.scaling") if m.get("scaling") is not None else None,
         loc=ctx.loc(m),
+        process=process,
     )
+
+
+PROCESS_KEYS = {"class", "jar", "inputs", "key_by", "config", "changelog", "primary_key", "event_time",
+                "side_outputs"}
+
+
+def _load_process(name, m, ctx: _Ctx, root: str) -> dict | None:
+    what = f"model '{name}'.process"
+    pr = ctx.require_mapping(m.get("process"), what, m, "process")
+    ctx.check_keys(pr, PROCESS_KEYS, what)
+    if "columns" not in m:
+        ctx.diags.error("CD005", f"model '{name}': a process model must declare its output `columns`", ctx.loc(m))
+    for k in ("class", "inputs"):
+        if not pr.get(k):
+            ctx.diags.error("CD005", f"{what} is missing '{k}'", ctx.loc(pr))
+    changelog = str(pr.get("changelog", "append"))
+    if changelog not in ("append", "upsert", "retract"):
+        ctx.diags.error("CD006", f"{what}.changelog must be append, upsert or retract", ctx.loc(pr, "changelog"))
+    pk = _str_list(pr.get("primary_key"), ctx, pr, "primary_key", "primary_key")
+    if changelog == "upsert" and not pk:
+        ctx.diags.error("CD005", f"{what}: changelog upsert needs a primary_key", ctx.loc(pr, "changelog"))
+    sides = {}
+    for side, spec in ctx.require_mapping(pr.get("side_outputs"), f"{what}.side_outputs", pr, "side_outputs").items():
+        spec = ctx.require_mapping(spec, f"{what}.side_outputs.{side}", pr["side_outputs"], side)
+        ctx.check_keys(spec, {"columns", "event_time"}, f"{what}.side_outputs.{side}")
+        ctx.check_name(side, "side output", pr["side_outputs"])
+        sides[str(side)] = {"columns": _load_columns(spec.get("columns"), ctx, spec, "columns", f"side output '{side}'"),
+                            "event_time": spec.get("event_time")}
+    jar = pr.get("jar")
+    if jar is not None and not os.path.exists(os.path.join(root, str(jar))):
+        ctx.diags.warning("CD164", f"{what}: jar '{jar}' does not exist (build it first)", ctx.loc(pr, "jar"))
+    return {"class": str(pr.get("class", "")), "jar": str(jar) if jar is not None else None,
+            "inputs": _str_list(pr.get("inputs"), ctx, pr, "inputs", "inputs"),
+            "key_by": _str_list(pr.get("key_by"), ctx, pr, "key_by", "key_by"),
+            "config": {str(k): str(v) for k, v in ctx.require_mapping(pr.get("config"), "config", pr, "config").items()},
+            "changelog": changelog, "primary_key": pk, "event_time": pr.get("event_time"), "side_outputs": sides}
 
 
 def _load_sink(name, k, ctx: _Ctx) -> Sink:

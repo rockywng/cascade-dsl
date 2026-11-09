@@ -547,7 +547,13 @@ def main():
         changes.stop.set()
         load.thread.join(timeout=60)
         changes.thread.join(timeout=30)
-        it.produce("orders", [load.order(load.seq + 600)])  # +60s of event time closes the last windows
+        # +60s of event time closes the last windows -- on every partition: a partition without it holds
+        # event time back until its idle timeout (60 s for Kafka sources). Distinct keys spread the
+        # closing orders over the partitions (the console producer can't pick one).
+        closing = [load.order(load.seq + 600 + k) for k in range(50)]
+        it.kafka("/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server", "kafka:9092", "--topic", "orders",
+                 "--property", "parse.key=true", "--property", "key.separator=|",
+                 input="".join(f"close-{k}|{json.dumps(o)}\n" for k, o in enumerate(closing)))
         info = job_info()
         ok(f"produced {load.seq} orders ({load.restarts} producer restarts), {changes.count} customer changes; "
            f"job {info.get('state')}, {info.get('completed')} checkpoints, {info.get('failed')} failed")

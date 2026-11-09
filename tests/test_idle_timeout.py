@@ -87,3 +87,35 @@ class IdleTimeoutTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatermarkOptionsTest(unittest.TestCase):
+    def test_custom_expression(self):
+        r = compiled(replace=("    event_time: {column: ts, max_out_of_orderness: 5s}\n",
+                              "    event_time: {column: ts, watermark: \"ts - INTERVAL '1' MINUTE\"}\n"))
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        self.assertIn("WATERMARK FOR `ts` AS ts - INTERVAL '1' MINUTE", r.lowered.sql)
+
+    def test_expression_and_delay_are_exclusive(self):
+        r = compiled(replace=("    event_time: {column: ts, max_out_of_orderness: 5s}\n",
+                              "    event_time: {column: ts, max_out_of_orderness: 5s, watermark: ts}\n"))
+        self.assertIn("CD005", r.diagnostics.codes())
+
+    def test_alignment_and_emit_on_kafka(self):
+        r = compiled(replace=("    event_time: {column: ts, max_out_of_orderness: 5s}\n",
+                              "    event_time: {column: ts, max_out_of_orderness: 5s, emit: on_event, "
+                              "alignment: {group: g1, max_drift: 30s}}\n"))
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        o = r.checked.options["orders"]
+        self.assertEqual((o["scan.watermark.alignment.group"], o["scan.watermark.alignment.max-drift"],
+                          o["scan.watermark.emit.strategy"]), ("g1", "30000 ms", "on-event"))
+
+    def test_alignment_needs_push_down(self):
+        r = compiled(replace=("    event_time: updated_at\n",
+                              "    event_time: {column: updated_at, alignment: {group: g, max_drift: 1s}}\n"))
+        self.assertIn("CD110", r.diagnostics.codes())
+
+    def test_source_watermark_needs_support(self):
+        r = compiled(replace=("    event_time: {column: ts, max_out_of_orderness: 5s}\n",
+                              "    event_time: {column: ts, watermark: source}\n"))
+        self.assertIn("CD111", r.diagnostics.codes())

@@ -440,7 +440,8 @@ def _load_source(name, s, ctx: _Ctx) -> Source:
             et_d.line, et_d.key_lines = s.key_lines.get("event_time", 0), {}
             et = et_d
         et = ctx.require_mapping(et, "event_time", s, "event_time")
-        ctx.check_keys(et, {"column", "max_out_of_orderness", "idle_timeout"}, f"{what}.event_time")
+        ctx.check_keys(et, {"column", "max_out_of_orderness", "idle_timeout", "watermark", "alignment", "emit"},
+                       f"{what}.event_time")
         try:
             delay = parse_duration_ms(et.get("max_out_of_orderness", "0s"))
         except ValueError as e:
@@ -452,7 +453,28 @@ def _load_source(name, s, ctx: _Ctx) -> Source:
                 idle = parse_duration_ms(et.get("idle_timeout"))
             except ValueError as e:
                 ctx.diags.error("CD006", str(e), ctx.loc(et, "idle_timeout"))
-        event_time = EventTime(str(et.get("column", "")), delay, ctx.loc(et), idle)
+        alignment = None
+        if et.get("alignment") is not None:
+            al = ctx.require_mapping(et.get("alignment"), "alignment", et, "alignment")
+            ctx.check_keys(al, {"group", "max_drift", "update_interval"}, f"{what}.event_time.alignment")
+            try:
+                alignment = {"group": str(al.get("group", "")),
+                             "max_drift_ms": parse_duration_ms(al.get("max_drift", "0s")),
+                             "update_interval_ms": (parse_duration_ms(al["update_interval"])
+                                                    if al.get("update_interval") is not None else None)}
+            except ValueError as e:
+                ctx.diags.error("CD006", str(e), ctx.loc(et, "alignment"))
+            if alignment and (not alignment["group"] or not alignment["max_drift_ms"]):
+                ctx.diags.error("CD005", f"{what}.event_time.alignment needs 'group' and 'max_drift'",
+                                ctx.loc(et, "alignment"))
+        emit = et.get("emit")
+        if emit is not None and emit not in ("on_event", "on_periodic"):
+            ctx.diags.error("CD006", f"{what}.event_time.emit must be on_event or on_periodic", ctx.loc(et, "emit"))
+        expression = str(et["watermark"]).strip() if et.get("watermark") is not None else None
+        if expression and "max_out_of_orderness" in et:
+            ctx.diags.error("CD005", f"{what}.event_time: give either 'watermark' or 'max_out_of_orderness'",
+                            ctx.loc(et, "watermark"))
+        event_time = EventTime(str(et.get("column", "")), delay, ctx.loc(et), idle, expression, alignment, emit)
     endpoint = {k: v for k, v in s.items() if k not in SOURCE_COMMON}
     return Source(
         name=name, connection=str(s.get("connection", "")), endpoint=endpoint,

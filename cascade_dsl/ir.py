@@ -27,6 +27,9 @@ class EventTime:
     max_out_of_orderness_ms: int
     loc: Location | None = None
     idle_timeout_ms: int | None = None  # None: never idle
+    expression: str | None = None  # custom WATERMARK expression ('source' = SOURCE_WATERMARK())
+    alignment: dict | None = None  # {group, max_drift_ms, update_interval_ms}
+    emit: str | None = None  # on_event | on_periodic
 
 
 @dataclass

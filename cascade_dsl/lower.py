@@ -136,8 +136,14 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
             extra.append(f"{q(s.processing_time)} AS PROCTIME()")
         if s.event_time:
             et = q(s.event_time.column)
-            extra.append(f"WATERMARK FOR {et} AS {et} - {interval(s.event_time.max_out_of_orderness_ms)}"
-                         if s.event_time.max_out_of_orderness_ms else f"WATERMARK FOR {et} AS {et}")
+            expr = s.event_time.expression
+            if expr == "source":
+                extra.append(f"WATERMARK FOR {et} AS SOURCE_WATERMARK()")
+            elif expr:
+                extra.append(f"WATERMARK FOR {et} AS {expr}")
+            else:
+                extra.append(f"WATERMARK FOR {et} AS {et} - {interval(s.event_time.max_out_of_orderness_ms)}"
+                             if s.event_time.max_out_of_orderness_ms else f"WATERMARK FOR {et} AS {et}")
         if s.primary_key:
             extra.append(f"PRIMARY KEY ({', '.join(map(q, s.primary_key))}) NOT ENFORCED")
         stmts.append(Stmt("source", s.name, comment=f"source: {s.name}" + (f" -- {s.description}" if s.description else ""),
@@ -260,8 +266,11 @@ def _manifest(c: Checked, sql: str) -> dict:
         if n in p.sources:
             s = p.sources[n]
             ident = {k: v for k, v in c.options[n].items() if k in SOURCE_IDENTITY_KEYS}
-            return h("source", ident, s.event_time.column if s.event_time else None,
-                     s.event_time.max_out_of_orderness_ms if s.event_time else None)
+            parts = ["source", ident, s.event_time.column if s.event_time else None,
+                     s.event_time.max_out_of_orderness_ms if s.event_time else None]
+            if s.event_time and s.event_time.expression:  # only when set: existing hashes stay stable
+                parts.append(s.event_time.expression)
+            return h(*parts)
         m = p.models[n]
         # name-free: inputs are referred to by position (their schemas are part of the state_id), so
         # renaming a model or one of its inputs keeps every state_id: views are inlined, the plan

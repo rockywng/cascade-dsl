@@ -52,6 +52,7 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     _check_connections(c)
     _check_sources(c)
     _check_idle_timeouts(c)
+    _check_watermark_options(c)
     _check_models(c)
     _check_sinks(c)
     _check_quarantine(c)
@@ -167,10 +168,39 @@ WATERMARK_PUSHDOWN = {"kafka", "upsert-kafka"}  # connectors that take a per-sou
 # down through an idle timeout, and would hold event time back forever. Long enough that a broker
 # restart or a restore doesn't let other sources overtake the stream.
 KAFKA_DEFAULT_IDLE_MS = 60_000
+SOURCE_WATERMARK = {"cascade-fixture"}  # catalog connectors implementing SupportsSourceWatermark
 
 
 def _is_zero_duration(v) -> bool:
     return str(v).strip().replace(" ", "") in ("0", "0ms", "0s")
+
+
+def _check_watermark_options(c: Checked):
+    """Alignment and emit strategy are per-source WITH options that only watermark push-down sources take."""
+    p, d = c.pipeline, c.diagnostics
+    for s in p.sources.values():
+        et = s.event_time
+        if not et or s.name not in c.options:
+            continue
+        opts = c.options[s.name]
+        connector = opts.get("connector")
+        custom = p.connections.get(s.connection) is not None and p.connections[s.connection].type == "custom"
+        if (et.alignment or et.emit) and connector not in WATERMARK_PUSHDOWN and not custom:
+            d.error("CD110", f"source '{s.name}': watermark alignment and emit strategy need a connector with "
+                    f"watermark push-down ({', '.join(sorted(WATERMARK_PUSHDOWN))}); '{connector}' has none",
+                    et.loc, node=s.name)
+            continue
+        if et.alignment:
+            opts.setdefault("scan.watermark.alignment.group", et.alignment["group"])
+            opts.setdefault("scan.watermark.alignment.max-drift", f"{et.alignment['max_drift_ms']} ms")
+            if et.alignment.get("update_interval_ms"):
+                opts.setdefault("scan.watermark.alignment.update-interval", f"{et.alignment['update_interval_ms']} ms")
+        if et.emit:
+            opts.setdefault("scan.watermark.emit.strategy", et.emit.replace("_", "-"))
+        if et.expression == "source" and connector not in SOURCE_WATERMARK and not custom:
+            d.error("CD111", f"source '{s.name}': watermark: source (SOURCE_WATERMARK()) needs a connector that "
+                    f"emits its own watermarks; '{connector}' doesn't", et.loc, node=s.name,
+                    hint="use max_out_of_orderness or a watermark expression")
 
 
 def _check_idle_timeouts(c: Checked):

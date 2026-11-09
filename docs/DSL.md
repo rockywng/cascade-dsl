@@ -136,6 +136,14 @@ sources:
       column: order_ts
       max_out_of_orderness: 5s  # -> WATERMARK FOR order_ts AS order_ts - INTERVAL '5' SECOND
       idle_timeout: 30s         # optional; see "Idle sources" below
+      # instead of max_out_of_orderness, any watermark expression, or `source` for
+      # SOURCE_WATERMARK() (connectors that emit their own watermarks; CD111 otherwise):
+      # watermark: "order_ts - INTERVAL '1' MINUTE"
+      emit: on_periodic         # or on_event (watermark push-down connectors: Kafka)
+      alignment:                # watermark alignment across sources of one group (Kafka; CD110)
+        group: shop
+        max_drift: 30s
+        update_interval: 1s     # optional
     processing_time: proc       # optional: adds `proc AS PROCTIME()`
     primary_key: [order_id]     # required for CDC / versioned tables
     options: {...}              # raw Flink WITH options, applied last

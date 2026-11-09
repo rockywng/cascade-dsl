@@ -71,11 +71,53 @@ modes. Zero-config connectors (`datagen`, `print`, `blackhole`) can be used dire
 | type | source | sink modes | notes |
 |---|---|---|---|
 | `kafka` | ✓ (changelog with CDC formats) | append, upsert | upsert sinks lower to `upsert-kafka` |
-| `postgres-cdc`, `mysql-cdc` | ✓ updating | — | requires `primary_key` |
+| `postgres-cdc`, `mysql-cdc`, `oracle-cdc`, `sqlserver-cdc`, `db2-cdc` | ✓ updating | — | requires `primary_key`; `table: schema.table` |
+| `mongodb-cdc` | ✓ updating | — | `database`, `collection`; key `_id` |
 | `iceberg` | ✓ (streaming read) | append, upsert | `table: db.table` |
 | `jdbc` | ✓ (lookup joins) | append, upsert | |
 | `filesystem` | ✓ | append | `path`, many formats |
+| `kinesis` | ✓ | append | `stream_arn`; `region` on the connection |
+| `dynamodb` | — | append, upsert | upserts put by key and delete on retraction |
+| `elasticsearch` | — | append, upsert | Elasticsearch 7 API (also OpenSearch 1.x); key = document id |
+| `paimon`, `hudi` | ✓ (changelog when keyed) | append, upsert | `path` under the connection's `base_path`; Paimon tables must exist |
+| `delta` | — | append | `table_path` |
+| `custom` | ✓ | as declared | any Flink SQL connector, see below |
 | `datagen` / `print` / `blackhole` | dev | dev | |
+
+Every connector's jar version defaults to the one tested with Flink 2.3 (`TESTED_VERSIONS` in
+`cascade_dsl/connectors.py`). `deploy.artifacts` overrides it. `tests/test_connector_smoke.py`
+plans a job against each real jar, which checks option names and binary compatibility. Kafka,
+Postgres CDC and JDBC also run end to end in `integration/`.
+
+`cascade fetch-jars <project>` downloads a pipeline's connector jars into `~/.cache/cascade/jars`.
+It prints a `CASCADE_EXTRA_JARS=...` line; with that set, `cascade plan`, `test` and `verify` work
+locally for any connector.
+
+### Custom connectors
+
+For a Flink SQL connector the catalog doesn't have:
+
+```yaml
+connections:
+  ch:
+    type: custom
+    connector: clickhouse                 # the Flink 'connector' option (its factory identifier)
+    artifacts: ["com.example:flink-connector-clickhouse:1.2.3"]   # jars for the runtime image
+    changelog: append                     # as a source: append | updating | by_format
+    sink_modes: [append, upsert]          # default [append]
+    requires_primary_key: false
+    properties: {url: "clickhouse://ch:8123", password: "${secret:ch/pw}"}   # raw WITH options
+```
+
+On sources and sinks, every key besides the common ones (`from`, `mode`, `columns`, ...) is passed
+through as a raw `WITH` option. Keys that look like credentials must be `${secret:...}` references
+(CD201).
+
+**Not in the catalog, because no Flink 2.x release exists** (checked on Maven Central in November
+2026): Pulsar, Google Pub/Sub, HBase, MongoDB (non-CDC), OpenSearch 2. **ClickHouse** publishes a
+2.x jar with no SQL factory (DataStream only); use a [process model](#process-models) for it.
+**Redis** has no Apache connector at all. Any of them works as `type: custom` once a 2.x-compatible
+build exists.
 
 ## Sources
 

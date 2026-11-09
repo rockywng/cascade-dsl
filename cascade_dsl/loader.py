@@ -214,11 +214,26 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
     for cname, c in ctx.require_mapping(doc.get("connections"), "connections", doc, "connections").items():
         ctx.check_name(cname, "connection", doc["connections"])
         c = ctx.require_mapping(c, f"connection '{cname}'", doc["connections"], cname)
-        ctx.check_keys(c, {"type", "properties"}, f"connection '{cname}'")
+        custom_keys = {"connector", "artifacts", "changelog", "sink_modes", "requires_primary_key"}
+        ctx.check_keys(c, {"type", "properties"} | (custom_keys if c.get("type") == "custom" else set()),
+                       f"connection '{cname}'")
         if "type" not in c:
             diags.error("CD005", f"connection '{cname}' is missing 'type'", ctx.loc(c))
         props = subst(ctx.require_mapping(c.get("properties"), "properties", c, "properties"), c, "properties")
-        connections[cname] = Connection(cname, str(c.get("type", "")), props, ctx.loc(c))
+        custom = {k: c[k] for k in custom_keys if k in c}
+        if c.get("type") == "custom":
+            if not c.get("connector"):
+                diags.error("CD005", f"custom connection '{cname}' is missing 'connector' (the Flink "
+                            "'connector' option, e.g. 'clickhouse')", ctx.loc(c))
+            arts = c.get("artifacts") or []
+            if not isinstance(arts, list) or any(len(str(a).split(":")) != 3 for a in arts):
+                diags.error("CD005", f"custom connection '{cname}': artifacts must be a list of Maven "
+                            "coordinates 'group:artifact:version'", ctx.loc(c, "artifacts"))
+                custom["artifacts"] = []
+            if c.get("changelog", "append") not in ("append", "updating", "by_format"):
+                diags.error("CD005", f"custom connection '{cname}': changelog must be append, updating or "
+                            "by_format", ctx.loc(c, "changelog"))
+        connections[cname] = Connection(cname, str(c.get("type", "")), props, ctx.loc(c), custom)
 
     sources = {}
     for sname, s in ctx.require_mapping(doc.get("sources"), "sources", doc, "sources").items():

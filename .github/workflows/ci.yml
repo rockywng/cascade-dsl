@@ -67,6 +67,7 @@ jobs:
       - name: All tests, including real Flink jobs
         run: |
           export FLINK_HOME=~/flink-${FLINK_VERSION}
+          export CASCADE_CONNECTOR_SMOKE=1   # plan against every catalog connector's real jar
           PYTHONPATH=.:tests python -m unittest discover -s tests -v
       - name: Example test suites
         run: |

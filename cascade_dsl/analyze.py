@@ -12,7 +12,7 @@ import difflib
 import re
 from dataclasses import dataclass, field
 
-from .connectors import CATALOG, ConnectorSpec, LowerCtx, build_options
+from .connectors import CATALOG, ConnectorSpec, LowerCtx, build_options, spec_for
 from .diagnostics import Diagnostics, Location
 from .ir import OutputColumn, Pipeline, RelationInfo
 from .sqlscan import (Analysis, SqlSyntaxError, analyze_sql, infer_relation, line_of,
@@ -80,7 +80,7 @@ def _connector(c: Checked, conn_name: str, loc, node: str) -> tuple[ConnectorSpe
     p, d = c.pipeline, c.diagnostics
     if conn_name in p.connections:
         conn = p.connections[conn_name]
-        return CATALOG.get(conn.type), conn.properties
+        return spec_for(conn.type, conn), conn.properties
     # built-in zero-config connectors may be referenced directly (connection: datagen)
     spec = CATALOG.get(conn_name)
     if spec is not None and not spec.connection:
@@ -145,13 +145,14 @@ def _check_sources(c: Checked):
                 if spec.source_requires_pk and not s.primary_key:
                     d.error("CD104", f"source '{s.name}' ({spec.type}) requires a primary_key", s.loc,
                             hint="CDC sources are keyed changelogs; declare the table's primary key", node=s.name)
-                changelog = "updating" if spec.source_is_changelog(s.format) else "append"
+                changelog = "updating" if spec.source_is_changelog(s.format, bool(s.primary_key)) else "append"
                 if changelog == "updating" and not s.primary_key and spec.type == "kafka":
                     d.warning("CD107", f"changelog source '{s.name}' has no primary_key; Flink cannot "
                               "normalize duplicate change events", s.loc, node=s.name)
                 opts, problems = build_options(
                     spec, "source", props, s.endpoint, s.format, "append",
-                    LowerCtx(p.name, s.name, s.connection, s.primary_key), s.options)
+                    LowerCtx(p.name, s.name, s.connection, s.primary_key), s.options,
+                    conn=p.connections.get(s.connection))
                 _report_option_problems(c, problems, s.loc, s.name)
                 c.options[s.name] = opts
         p.relations[s.name] = RelationInfo(columns=out_cols, rowtime=rowtime, changelog=changelog,
@@ -311,7 +312,8 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
     for r in a.refs:
         if r.temporal and r.name in p.sources:
             src = p.sources[r.name]
-            spec = CATALOG.get(p.connections[src.connection].type) if src.connection in p.connections else None
+            spec = spec_for(p.connections[src.connection].type, p.connections[src.connection]) \
+                if src.connection in p.connections else None
             if spec is not None and spec.type == "jdbc":
                 continue  # lookup join
             if not src.primary_key:
@@ -523,7 +525,8 @@ def _check_sinks(c: Checked):
                 d.error("CD404", f"connector '{spec.type}' does not support mode '{k.mode}'", k.loc, node=k.name,
                         hint=f"supported modes: {', '.join(sorted(spec.sink_modes))}")
             opts, problems = build_options(spec, "sink", props, k.endpoint, k.format, k.mode,
-                                           LowerCtx(p.name, k.name, k.connection, k.primary_key), k.options)
+                                           LowerCtx(p.name, k.name, k.connection, k.primary_key), k.options,
+                                           conn=p.connections.get(k.connection))
             _report_option_problems(c, problems, k.loc, k.name)
             c.options[k.name] = opts
         if spec is not None and spec.type == "jdbc":
@@ -629,7 +632,8 @@ def _check_quarantine(c: Checked):
                         for k, v in q.endpoint.items()}
             node = f"{m.name}__quarantine"
             opts, problems = build_options(spec, "sink", props, endpoint, q.format, "append",
-                                           LowerCtx(p.name, node, q.connection, []), {})
+                                           LowerCtx(p.name, node, q.connection, []), {},
+                                           conn=p.connections.get(q.connection))
             _report_option_problems(c, problems, q.loc, "quarantine")
             c.options[node] = opts
 

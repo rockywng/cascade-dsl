@@ -37,7 +37,7 @@ class ConnectorSpec:
     formats: set | None = None  # None = connector has no 'format' option
     default_format: str | None = None
     sink_modes: set = field(default_factory=lambda: {"append"})
-    source_changelog: str = "append"  # append | updating | by_format
+    source_changelog: str = "append"  # append | updating | by_format | by_primary_key
     source_requires_pk: bool = False
     artifact: str | None = None
     # connection properties -> extra Maven coordinates (e.g. JDBC dialect module and driver)
@@ -46,9 +46,11 @@ class ConnectorSpec:
     # (role, mode, fmt, options, ctx) -> mutate options; return list of (code, message) problems
     finish: Callable | None = None
 
-    def source_is_changelog(self, fmt: str | None) -> bool:
+    def source_is_changelog(self, fmt: str | None, has_pk: bool = False) -> bool:
         if self.source_changelog == "by_format":
             return fmt in CDC_FORMATS
+        if self.source_changelog == "by_primary_key":  # lakehouse tables: keyed tables are upsert tables
+            return has_pk
         return self.source_changelog == "updating"
 
 
@@ -149,6 +151,35 @@ def _fs_finish(role, mode, fmt, opts, ctx: LowerCtx):
 
 CATALOG: dict[str, ConnectorSpec] = {}
 
+# Connector versions tested with the Flink version the project targets (2.3). `cascade deploy` uses them
+# when the deploy block's `artifacts:` doesn't pin one. Ones marked "smoke" are checked by planning a job
+# against the real jar (tests/test_connector_smoke.py); the rest also run end to end in integration/.
+TESTED_VERSIONS = {
+    "org.apache.flink:flink-sql-connector-kafka": "5.0.0-2.2",
+    "org.apache.flink:flink-sql-connector-postgres-cdc": "3.7.0-2.2",
+    "org.apache.flink:flink-sql-connector-mysql-cdc": "3.7.0-2.2",           # smoke
+    "org.apache.flink:flink-sql-connector-oracle-cdc": "3.7.0-2.2",          # smoke
+    "org.apache.flink:flink-sql-connector-sqlserver-cdc": "3.7.0-2.2",       # smoke
+    "org.apache.flink:flink-sql-connector-db2-cdc": "3.7.0-2.2",             # smoke
+    "org.apache.flink:flink-sql-connector-mongodb-cdc": "3.7.0-2.2",         # smoke
+    "org.apache.flink:flink-connector-jdbc-core": "4.1.0-2.2",
+    "org.apache.flink:flink-connector-jdbc-postgres": "4.1.0-2.2",
+    "org.apache.flink:flink-connector-jdbc-mysql": "4.1.0-2.2",
+    "org.postgresql:postgresql": "42.7.14",
+    "com.mysql:mysql-connector-j": "9.5.0",
+    "org.apache.hadoop:hadoop-client-api": "3.4.2",
+    "org.apache.hadoop:hadoop-client-runtime": "3.4.2",
+    "io.openlineage:openlineage-java": "1.32.0",
+    "io.openlineage:openlineage-sql-java": "1.32.0",
+    "org.apache.flink:flink-sql-connector-aws-kinesis-streams": "6.0.1-2.0",  # smoke
+    "org.apache.flink:flink-sql-connector-dynamodb": "6.0.1-2.0",             # smoke
+    "org.apache.flink:flink-sql-connector-elasticsearch7": "4.0.0-2.0",       # smoke
+    "org.apache.paimon:paimon-flink-2.2": "2.1.0",                            # smoke
+    "org.apache.hudi:hudi-flink2.0-bundle": "1.2.1",                          # smoke
+    "io.delta:delta-flink": "4.3.1",                                          # smoke
+    "org.apache.iceberg:iceberg-flink-runtime-2.3": "1.12.0",  # needs Hadoop and a catalog: not smoked
+}
+
 
 def register(spec: ConnectorSpec):
     CATALOG[spec.type] = spec
@@ -203,8 +234,157 @@ for _db, _port in (("postgres", 5432), ("mysql", 3306)):
         },
         source_changelog="updating", source_requires_pk=True,
         artifact=f"org.apache.flink:flink-sql-connector-{_db}-cdc",
+        # Flink CDC's MySQL jar doesn't bundle the driver (GPL): without it the source can't be created
+        extra_artifacts=(lambda props: ["com.mysql:mysql-connector-j"]) if _db == "mysql" else None,
         finish=_pg_finish if _db == "postgres" else _db_table_finish("database-name", "table-name"),
     ))
+
+_CDC_COMMON = {
+    "hostname": Prop("hostname", required=True),
+    "username": Prop("username", required=True),
+    "password": Prop("password", required=True, secret=True),
+}
+_CDC_STARTUP = Prop("scan.startup.mode", default="initial", values={"initial": "initial", "latest": "latest-offset"})
+
+
+def _incremental(finish=None):
+    def f(role, mode, fmt, opts, ctx):
+        problems = finish(role, mode, fmt, opts, ctx) if finish else []
+        opts.setdefault("scan.incremental.snapshot.enabled", "true")  # resumes from its offset on restore
+        return problems
+    return f
+
+
+def _passthrough_table(role, mode, fmt, opts, ctx):
+    full = opts.pop("__table", None)
+    if full is not None:
+        opts["table-name"] = full
+    return []
+
+
+register(ConnectorSpec(
+    type="oracle-cdc", roles={"source"},
+    doc="Oracle change data capture via Flink CDC (LogMiner). Emits an updating changelog.",
+    connection={**_CDC_COMMON, "port": Prop("port", default=1521), "database": Prop("database-name", required=True)},
+    source={"table": Prop("__table", required=True, doc="schema.table"), "startup": _CDC_STARTUP},
+    source_changelog="updating", source_requires_pk=True,
+    artifact="org.apache.flink:flink-sql-connector-oracle-cdc",
+    finish=_incremental(_db_table_finish("schema-name", "table-name")),
+))
+for _db, _port, _doc in (("sqlserver", 1433, "SQL Server"), ("db2", 50000, "Db2")):
+    register(ConnectorSpec(
+        type=f"{_db}-cdc", roles={"source"},
+        doc=f"{_doc} change data capture via Flink CDC. Emits an updating changelog.",
+        connection={**_CDC_COMMON, "port": Prop("port", default=_port),
+                    "database": Prop("database-name", required=True)},
+        source={"table": Prop("__table", required=True, doc="schema.table"), "startup": _CDC_STARTUP},
+        source_changelog="updating", source_requires_pk=True,
+        artifact=f"org.apache.flink:flink-sql-connector-{_db}-cdc",
+        finish=_incremental(_passthrough_table),
+    ))
+register(ConnectorSpec(
+    type="mongodb-cdc", roles={"source"},
+    doc="MongoDB change streams via Flink CDC. Emits an updating changelog keyed by _id.",
+    connection={"hosts": Prop("hosts", required=True), "username": Prop("username"),
+                "password": Prop("password", secret=True), "scheme": Prop("scheme"),
+                "connection_options": Prop("connection.options")},
+    source={"database": Prop("database", required=True), "collection": Prop("collection", required=True),
+            "startup": _CDC_STARTUP},
+    source_changelog="updating", source_requires_pk=True,
+    artifact="org.apache.flink:flink-sql-connector-mongodb-cdc",
+    finish=_incremental(),
+))
+
+
+def _kinesis_finish(role, mode, fmt, opts, ctx):
+    return []
+
+
+register(ConnectorSpec(
+    type="kinesis", roles={"source", "sink"},
+    doc="Amazon Kinesis Data Streams (connector 6.x, enhanced fan-out off by default).",
+    connection={"region": Prop("aws.region", required=True)},
+    source={"stream_arn": Prop("stream.arn", required=True),
+            "startup": Prop("source.init.position", default="latest",
+                            values={"earliest": "TRIM_HORIZON", "latest": "LATEST"})},
+    sink={"stream_arn": Prop("stream.arn", required=True),
+          "partition_key": Prop("sink.partitioner", doc="'random' or a column-based partitioner")},
+    formats=STREAM_FORMATS - CDC_FORMATS | {"debezium-json"}, default_format="json",
+    source_changelog="by_format",
+    artifact="org.apache.flink:flink-sql-connector-aws-kinesis-streams",
+))
+register(ConnectorSpec(
+    type="dynamodb", roles={"sink"},
+    doc="Amazon DynamoDB. Upsert sinks put by primary key and delete on retraction.",
+    connection={"region": Prop("aws.region", required=True)},
+    sink={"table": Prop("table-name", required=True)},
+    sink_modes={"append", "upsert"},
+    artifact="org.apache.flink:flink-sql-connector-dynamodb",
+))
+
+
+def _es_finish(role, mode, fmt, opts, ctx):
+    opts["connector"] = "elasticsearch-7"
+    return []
+
+
+register(ConnectorSpec(
+    type="elasticsearch", roles={"sink"},
+    doc="Elasticsearch 7 (and OpenSearch 1.x, which speaks its API). Upsert sinks use the primary key "
+        "as document id.",
+    connection={"hosts": Prop("hosts", required=True), "username": Prop("username"),
+                "password": Prop("password", secret=True), "path_prefix": Prop("connection.path-prefix")},
+    sink={"index": Prop("index", required=True), "delivery": Prop("sink.delivery-guarantee", default="at-least-once",
+          values={"at-least-once": "at-least-once", "none": "none"})},
+    formats={"json"}, default_format="json", sink_modes={"append", "upsert"},
+    artifact="org.apache.flink:flink-sql-connector-elasticsearch7",
+    finish=_es_finish,
+))
+
+
+def _lake_finish(streaming: dict):
+    def f(role, mode, fmt, opts, ctx):
+        base = opts.pop("__base_path", None)
+        if base and "path" in opts and "://" not in str(opts["path"]) and not str(opts["path"]).startswith("/"):
+            opts["path"] = str(base).rstrip("/") + "/" + str(opts["path"]).lstrip("/")
+        if role == "source":
+            for k, v in streaming.items():
+                opts.setdefault(k, v)
+        return []
+    return f
+
+
+register(ConnectorSpec(
+    type="paimon", roles={"source", "sink"},
+    doc="Apache Paimon tables by path. The table must exist (create it with a Paimon catalog); keyed tables "
+        "(primary_key) are upsert tables and read as changelogs.",
+    connection={"base_path": Prop("__base_path")},
+    source={"path": Prop("path", required=True)},
+    sink={"path": Prop("path", required=True)},
+    sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
+    # Paimon publishes one jar per Flink minor; 2.1.0 has none for 2.3 yet, and the 2.2 build runs on 2.3
+    artifact="org.apache.paimon:paimon-flink-2.2",
+    finish=_lake_finish({}),
+))
+register(ConnectorSpec(
+    type="hudi", roles={"source", "sink"},
+    doc="Apache Hudi tables. Sources read the table as a stream of commits.",
+    connection={"base_path": Prop("__base_path")},
+    source={"path": Prop("path", required=True)},
+    sink={"path": Prop("path", required=True),
+          "table_type": Prop("table.type", default="cow", values={"cow": "COPY_ON_WRITE", "mor": "MERGE_ON_READ"})},
+    sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
+    artifact="org.apache.hudi:hudi-flink2.0-bundle",
+    # the bundle expects Hadoop on the classpath (Configuration, FileSystem); Flink's image has none
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime"],
+    finish=_lake_finish({"read.streaming.enabled": "true"}),
+))
+register(ConnectorSpec(
+    type="delta", roles={"sink"},
+    doc="Delta Lake tables (sink only; the Delta connector has no SQL source).",
+    sink={"table_path": Prop("table_path", required=True)},
+    artifact="io.delta:delta-flink",
+))
 
 register(ConnectorSpec(
     type="iceberg", roles={"source", "sink"},
@@ -280,9 +460,52 @@ register(ConnectorSpec(type="blackhole", roles={"sink"}, sink_modes={"append", "
                        doc="Discards all rows (benchmarks)."))
 
 
+register(ConnectorSpec(
+    type="custom", roles={"source", "sink"},
+    doc="Any Flink SQL connector the catalog doesn't know: `connector` names its factory, `artifacts` "
+        "lists its jars (group:artifact:version), `properties` and source/sink keys are raw WITH options.",
+))
+
+SECRET_KEY_RE = re.compile(r"(password|secret|token|credential|private[._-]?key|jaas)", re.I)
+
+
+def spec_for(conn_type: str, conn=None) -> ConnectorSpec | None:
+    """The catalog entry for a connection; a `custom` connection gets a spec built from its settings."""
+    base = CATALOG.get(conn_type)
+    if conn_type != "custom" or conn is None:
+        return base
+    cu = conn.custom
+    arts = [str(a) for a in cu.get("artifacts") or []]
+    return ConnectorSpec(
+        type="custom", roles={"source", "sink"}, formats=None,
+        sink_modes=set(cu.get("sink_modes") or ["append"]),
+        source_changelog=str(cu.get("changelog", "append")),
+        source_requires_pk=bool(cu.get("requires_primary_key", False)),
+        extra_artifacts=lambda props, arts=arts: arts,
+        doc=base.doc if base else "",
+    )
+
+
+def _custom_options(conn, role, connection_props, endpoint, fmt, passthrough):
+    problems = []
+    opts = {"connector": str(conn.custom.get("connector", ""))}
+    for k, v in {**connection_props, **endpoint}.items():
+        if SECRET_KEY_RE.search(str(k)) and not SECRET_RE.match(str(v)):
+            problems.append(("CD201", f"'{k}' looks like a secret and must be a ${{secret:...}} reference, "
+                             "not a literal value", k))
+        opts[str(k)] = v
+    if fmt:
+        opts["format"] = fmt
+    opts.update(passthrough)
+    return {k: str(v) for k, v in opts.items()}, problems
+
+
 def build_options(spec: ConnectorSpec, role: str, connection_props: dict, endpoint: dict,
-                  fmt: str | None, mode: str, ctx: LowerCtx, passthrough: dict) -> tuple[dict, list]:
+                  fmt: str | None, mode: str, ctx: LowerCtx, passthrough: dict,
+                  conn=None) -> tuple[dict, list]:
     """Map DSL properties to Flink WITH options. Returns (options, [(code, message, key)])."""
+    if spec.type == "custom":
+        return _custom_options(conn, role, connection_props, endpoint, fmt, passthrough)
     problems: list[tuple[str, str, str | None]] = []
     opts: dict = {"connector": spec.type}
 

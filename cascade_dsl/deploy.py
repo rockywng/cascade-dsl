@@ -24,6 +24,7 @@ import yaml
 
 from . import __version__
 from .compiler import Result
+from .connectors import TESTED_VERSIONS
 from .jvm import script
 from .lower import Stmt
 from .udfs import python_files, python_functions
@@ -339,7 +340,9 @@ def dockerfile(r: Result, cfg: dict) -> str:
         coord = coord.format(flink_minor=flink_minor)
         group, artifact = coord.split(":")[:2]
         arg = re.sub(r"[^A-Z0-9]", "_", artifact.upper()) + "_VERSION"
-        default = versions.get(coord)
+        pinned = coord.split(":")[2] if coord.count(":") == 2 else None  # custom connectors pin versions
+        coord = f"{group}:{artifact}"
+        default = pinned or versions.get(coord) or TESTED_VERSIONS.get(coord)
         lines.append(f"# {coord}" + ("" if default else f" (pass --build-arg {arg}=<version>)"))
         lines.append(f"ARG {arg}" + (f"={default}" if default else ""))
         url = (f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}/${{{arg}}}/"

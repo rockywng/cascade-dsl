@@ -35,6 +35,8 @@ class Connection:
     type: str
     properties: dict
     loc: Location | None = None
+    # type: custom only: connector, artifacts, changelog, sink_modes, requires_primary_key
+    custom: dict = field(default_factory=dict)
 
 
 @dataclass

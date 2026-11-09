@@ -91,6 +91,8 @@ class Tools:
         cp = [self.tools_jar, runtime_jar(), os.path.join(self.flink_home, "lib", "*")]
         # Python UDF support lives in opt/ in the Flink distribution
         cp += sorted(glob.glob(os.path.join(self.flink_home, "opt", "flink-python*.jar")))[:1]
+        # connector jars that aren't in FLINK_HOME/lib, e.g. from `cascade fetch-jars`
+        cp += [j for j in os.environ.get("CASCADE_EXTRA_JARS", "").split(os.pathsep) if j]
         cp = os.pathsep.join(cp)
         cmd = [java, *self._java_opts(),
                f"-Dlog4j.configurationFile={os.path.join(REPO, 'runtime', 'tools', 'log4j2.properties')}",

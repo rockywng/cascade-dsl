@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from . import __version__
 from .analyze import Checked, aligned_parallelisms
-from .connectors import CATALOG, SECRET_RE
+from .connectors import CATALOG, SECRET_RE, spec_for
 from .ir import OutputColumn, Pipeline
 from .util import h, normalize_sql
 
@@ -298,8 +298,8 @@ def _manifest(c: Checked, sql: str) -> dict:
         }
         if is_source:
             s = p.sources[n]
-            spec = CATALOG.get(p.connections[s.connection].type) if s.connection in p.connections \
-                else CATALOG.get(s.connection)
+            spec = spec_for(p.connections[s.connection].type, p.connections[s.connection]) \
+                if s.connection in p.connections else CATALOG.get(s.connection)
             node["connector"] = spec.type if spec else None
             node["options"] = c.options[n]
         nodes[n] = node
@@ -324,7 +324,7 @@ def _manifest(c: Checked, sql: str) -> dict:
 
     artifacts = set()
     for conn in p.connections.values():
-        spec = CATALOG.get(conn.type)
+        spec = spec_for(conn.type, conn)
         if spec and spec.artifact:
             artifacts.add(spec.artifact)
         if spec and spec.extra_artifacts:

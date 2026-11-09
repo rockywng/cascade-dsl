@@ -31,7 +31,7 @@ def _failed(result, strict: bool) -> bool:
 
 
 def cmd_validate(args) -> int:
-    r = compile_pipeline(args.path, args.env, emit=False)
+    r = compile_pipeline(args.path, args.env)
     _print_diags(r, args.verbose, args.json)
     return 1 if _failed(r, args.strict) else 0
 
@@ -53,7 +53,7 @@ def cmd_compile(args) -> int:
 
 def cmd_graph(args) -> int:
     from .lower import mermaid
-    r = compile_pipeline(args.path, args.env, emit=False)
+    r = compile_pipeline(args.path, args.env)
     if r.checked is None or r.diagnostics.has_errors:
         _print_diags(r, False, False)
         return 1
@@ -283,6 +283,28 @@ def cmd_import_schema(args) -> int:
     return 0
 
 
+def cmd_fetch_jars(args) -> int:
+    from .compiler import compile_pipeline
+    from .deploy import DEFAULT_FLINK
+    from .jars import FetchError, fetch
+    r = compile_pipeline(args.path, args.env)
+    if not r.ok:
+        _print_diags(r, False, False)
+        return 1
+    deploy = r.checked.pipeline.deploy or {}
+    flink = str(deploy.get("flink_version", DEFAULT_FLINK))
+    try:
+        paths = fetch(r.lowered.manifest["artifacts"], ".".join(flink.split(".")[:2]),
+                      {str(k): str(v) for k, v in (deploy.get("artifacts") or {}).items()})
+    except FetchError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    for p in paths:
+        print(p, file=sys.stderr)
+    print(f"export CASCADE_EXTRA_JARS={os.pathsep.join(paths)}")
+    return 0
+
+
 def cmd_connectors(args) -> int:
     for spec in sorted(CATALOG.values(), key=lambda s: s.type):
         print(f"{spec.type}  [{', '.join(sorted(spec.roles))}]  {spec.doc}")
@@ -386,6 +408,11 @@ def main(argv=None) -> int:
     sp.add_argument("--avsc")
     sp.add_argument("--source", help="wrap the columns in a source block with this name")
     sp.set_defaults(fn=cmd_import_schema)
+
+    sp = sub.add_parser("fetch-jars", help="download the pipeline's connector jars; prints CASCADE_EXTRA_JARS")
+    sp.add_argument("path")
+    sp.add_argument("--env")
+    sp.set_defaults(fn=cmd_fetch_jars)
 
     sp = sub.add_parser("connectors", help="list available connectors and their properties")
     sp.set_defaults(fn=cmd_connectors)

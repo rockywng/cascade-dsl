@@ -236,7 +236,8 @@ def package(version: str, project: str, previous: str | None = None) -> str:
     return fd["spec"]["job"]["args"]
 
 
-def submit(version: str, args: list[str], savepoint: str | None = None, expect_secret_error=False):
+def submit(version: str, args: list[str], savepoint: str | None = None, expect_secret_error=False,
+           env: dict | None = None):
     args = [a.replace("/opt/cascade/job", f"/jobs/{version}") for a in args]
     sp = ["-s", savepoint] if savepoint else []
     if expect_secret_error:
@@ -247,7 +248,7 @@ def submit(version: str, args: list[str], savepoint: str | None = None, expect_s
         ok("without CASCADE_SECRET_CRM_PASSWORD the runner refuses to start and names the secret")
         return
     flink_cli("run", "-d", *sp, "-c", "dev.cascade.runner.SqlRunner", "/opt/flink/usrlib/cascade-runtime.jar",
-              *args, env={"CASCADE_SECRET_CRM_PASSWORD": SECRET})
+              *args, env={"CASCADE_SECRET_CRM_PASSWORD": SECRET, **(env or {})})
     jobs = wait_for("job RUNNING", running_jobs, timeout=90)
     ok(f"{version} submitted through SqlRunner" + (f" from {savepoint.rsplit('/', 1)[-1]}" if savepoint else "")
        + f": job {jobs[0][:8]} RUNNING")

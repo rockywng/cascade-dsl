@@ -121,3 +121,23 @@ sinks:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlotGuardTest(unittest.TestCase):
+    def test_postgres_cdc_sources_get_a_restore_guard(self):
+        import json
+        r = compiled("""
+pipeline: g
+connections:
+  db: {type: postgres-cdc, properties: {hostname: h, database: d, username: u, password: "${secret:crm/password}"}}
+sources:
+  t: {connection: db, table: public.t, columns: {id: BIGINT NOT NULL}, primary_key: [id]}
+sinks:
+  out: {from: t, connection: print, mode: upsert, primary_key: [id]}
+""")
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        g = next(s for s in r.lowered.statements if s.kind == "guard")
+        spec = json.loads(g.sql[len("-- @@require-slot"):])
+        self.assertEqual((spec["slot"], spec["password_env"], spec["source"]),
+                         ("g_t", "CASCADE_SECRET_CRM_PASSWORD", "t"))
+        self.assertNotIn("password", spec)  # the secret itself never lands in the script

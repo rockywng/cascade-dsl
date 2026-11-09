@@ -21,6 +21,7 @@ ASSERT_CLASS = "dev.cascade.runtime.AssertFunction"
 EXPECT_FN = "CASCADE_EXPECT"
 EXPECT_CLASS = "dev.cascade.runtime.ExpectFunction"
 PROCESS_DIRECTIVE = "-- @@process"  # dev.cascade.runner.Processes.DIRECTIVE
+SLOT_GUARD = "-- @@require-slot"  # dev.cascade.runner.Guards.REQUIRE_SLOT
 SOURCE_IDENTITY_KEYS = {"connector", "topic", "table-name", "schema-name", "database-name", "hostname",
                         "catalog-database", "catalog-table", "path", "slot.name", "properties.group.id"}
 
@@ -151,6 +152,11 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
                           columns=[(col.name, col.type.text) for col in s.columns], extra=extra,
                           options=c.options.get(s.name, {})))
 
+    for s in p.sources.values():
+        guard = _slot_guard(c, s)
+        if guard is not None:
+            stmts.append(guard)
+
     for name in c.order:
         _lower_model(c, name, stmts, partial)
 
@@ -262,6 +268,26 @@ def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
             cols += [("_violated_expectation", "STRING"), ("_quarantined_at", "TIMESTAMP_LTZ(3)")]
             stmts.append(Stmt("quarantine", qname, columns=cols, options=c.options[qname]))
             stmts.append(Stmt("insert", qname, query=f"SELECT *\nFROM {q(qview)}"))
+
+
+def _slot_guard(c: Checked, s) -> Stmt | None:
+    """`-- @@require-slot {json}`: on restore, SqlRunner refuses to start when a Postgres CDC source's
+    replication slot is gone (the connector would silently resume from a new slot; dev.cascade.runner.Guards)."""
+    import json
+    opts = c.options.get(s.name) or {}
+    if opts.get("connector") != "postgres-cdc" or c.pipeline.mode == "batch" or "slot.name" not in opts:
+        return None
+    pw = opts.get("password", "")
+    spec = {"source": s.name, "slot": opts["slot.name"], "hostname": opts.get("hostname"),
+            "port": opts.get("port", "5432"), "database": opts.get("database-name"), "username": opts.get("username")}
+    m = SECRET_RE.match(pw)
+    if m:
+        from .deploy import env_name
+        spec["password_env"] = env_name(pw[len("${secret:"):-1])
+    else:
+        spec["password"] = pw
+    return Stmt("guard", s.name, f"{SLOT_GUARD} {json.dumps(spec, sort_keys=True)}",
+                comment=f"on restore: replication slot of {s.name} must still exist")
 
 
 def _process_directive(p, m, view_name: str, comment: str) -> Stmt:

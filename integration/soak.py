@@ -268,10 +268,23 @@ def slot_loss(jid: str, args: list, load) -> str:
         raise Failed("stop-with-savepoint before slot loss failed:\n" + out[-2000:])
     it.psql(f"SELECT pg_drop_replication_slot('{SLOT}')")
     ts = load.event_time().strftime("%Y-%m-%d %H:%M:%S")
-    it.psql(f"INSERT INTO customers VALUES ('{PROBE}', 'probe-seg', '{ts}') ON CONFLICT (customer_id) "
-            f"DO UPDATE SET segment = EXCLUDED.segment, updated_at = EXCLUDED.updated_at")
-    it.submit("soak", args, savepoint=m.group(1))
-    return "slot dropped while stopped; probe customer changed in the gap"
+    probe = (f"INSERT INTO customers VALUES ('{PROBE}', 'probe-seg', '{ts}') ON CONFLICT (customer_id) "
+             f"DO UPDATE SET segment = EXCLUDED.segment, updated_at = EXCLUDED.updated_at")
+    it.psql(probe)
+    # the runner must refuse: restoring would resume from a new slot and skip the probe's change
+    sub = [a.replace("/opt/cascade/job", "/jobs/soak") for a in args]
+    out = it.flink_cli("run", "-d", "-s", m.group(1), "-c", "dev.cascade.runner.SqlRunner",
+                       "/opt/flink/usrlib/cascade-runtime.jar", *sub,
+                       env={"CASCADE_SECRET_CRM_PASSWORD": it.SECRET}, check=False)
+    if f"replication slot '{SLOT}' of CDC source 'customers' is gone" not in out:
+        raise Failed("the runner restored although the replication slot was gone (changes in the gap would be "
+                     "lost silently):\n" + out[-2000:])
+    ok("the runner refused to restore: the replication slot is gone")
+    # the runbook: accept the gap explicitly, then replay what changed in it (here: the probe's row)
+    it.submit("soak", args, savepoint=m.group(1), env={"CASCADE_ALLOW_SLOT_LOSS": "1"})
+    time.sleep(5)
+    it.psql(probe.replace("'probe-seg', '", "'probe-seg', '").replace(ts, load.event_time().strftime("%Y-%m-%d %H:%M:%S")))
+    return "slot dropped while stopped: refused, then restored with the gap accepted and the change replayed"
 
 
 def kill_taskmanager_twice():

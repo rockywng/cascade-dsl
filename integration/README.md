@@ -147,6 +147,16 @@ The soak found:
      a reader with no partition, and only an idle timeout lets it stand down.
    - **The job-wide option raises CD108.**
 
+The extended soak (`--rescale --cdc-edge-cases --customers 2000 --partitions 2`) found:
+
+10. **A lost replication slot silently drops CDC changes.** The test stops the job with a
+    savepoint, drops the Postgres slot and changes a customer, then restores. Flink CDC 3.7
+    created a new slot at the current position and carried on: the change never arrived, with
+    no error. SqlRunner now checks, on restore, that each Postgres CDC source's slot exists and
+    refuses to start otherwise. The soak asserts the refusal, then follows the runbook: accept
+    the gap with `CASCADE_ALLOW_SLOT_LOSS=1` and replay the change. Rescaling 1 to 2 under load,
+    an `ADD COLUMN` on the CDC table, 2,001 keys and two partitions all came through exact.
+
 The upgrade matrix (`tests/test_upgrade_matrix.py`, stand-in connectors, 15 kinds of upgrade)
 found more. These are disagreements between `check-upgrade`, the pin report and real restores, all
 fixed:

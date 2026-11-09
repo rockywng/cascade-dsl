@@ -102,6 +102,17 @@ modes. Zero-config connectors (`datagen`, `print`, `blackhole`) can be used dire
 | `custom` | ✓ | as declared | any Flink SQL connector, see below |
 | `datagen` / `print` / `blackhole` | dev | dev | |
 
+**Postgres CDC and lost replication slots.** A source restored from a savepoint resumes from the
+position its replication slot holds. If the slot is gone, for example after a database failover
+or a cleanup, Flink CDC silently creates a new one at the current position. Every change in
+between is lost, with no error; the soak test reproduced this.
+
+So when restoring, SqlRunner first checks that each Postgres CDC source's slot still exists. If
+it's gone, the runner refuses to start and names the slot. To recover, choose one:
+- **Start the source fresh:** deploy without the savepoint, or backfill the models that read it.
+- **Accept the gap:** set `CASCADE_ALLOW_SLOT_LOSS=1`, then replay the rows that changed during
+  it (touch them in Postgres).
+
 Every connector's jar version defaults to the one tested with Flink 2.3 (`TESTED_VERSIONS` in
 `cascade_dsl/connectors.py`). `deploy.artifacts` overrides it. `tests/test_connector_smoke.py`
 plans a job against each real jar, which checks option names and binary compatibility. Kafka,
@@ -785,7 +796,8 @@ the data itself, not something missing from the compiler.
   - failures, rescaling, CDC schema changes and slot loss
   - thousands of keys and multiple partitions
 
-  It runs on a CI runner. State in the tens of GBs, high parallelism and sustained high
+  The slot-loss case found silent data loss in Flink CDC, which the runner now refuses (see
+  "Postgres CDC and lost replication slots"). It runs on a CI runner. State in the tens of GBs, high parallelism and sustained high
   throughput need a real cluster; run `soak.py` there with `--rate`, `--customers` and
   `--partitions` scaled up.
 

@@ -146,7 +146,9 @@ public final class Main {
         List<String> inserts = new ArrayList<>();
         for (String s : stmts) {
             Matcher m = SET.matcher(s);
-            if (dev.cascade.runner.Processes.isDirective(s)) {
+            if (dev.cascade.runner.Guards.isGuard(s)) {
+                continue; // local runs use stand-in sources
+            } else if (dev.cascade.runner.Processes.isDirective(s)) {
                 dev.cascade.runner.Processes.apply((StreamTableEnvironment) tEnv, s);
             } else if (m.matches()) {
                 tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));

@@ -106,9 +106,14 @@ public final class SqlRunner {
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(
                 senv, (batch ? settings.inBatchMode() : settings.inStreamingMode()).build());
         boolean processes = false;
+        boolean restoring = !senv.getConfiguration()
+                .getOptional(org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH)
+                .orElse("").isEmpty();
         for (String stmt : setupStmts) {
             Matcher m = SET.matcher(stmt);
-            if (Processes.isDirective(stmt)) {
+            if (Guards.isGuard(stmt)) {
+                Guards.check(stmt, restoring && !validate, env);
+            } else if (Processes.isDirective(stmt)) {
                 Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
                 processes = true;
             } else if (m.matches()) {
@@ -172,7 +177,7 @@ public final class SqlRunner {
         for (String part : text.split("(?m)^" + Pattern.quote(SEPARATOR) + "\\s*$")) {
             String s = part.trim();
             // drop leading comment lines
-            while (s.startsWith("--") && !Processes.isDirective(s)) {
+            while (s.startsWith("--") && !Processes.isDirective(s) && !Guards.isGuard(s)) {
                 int nl = s.indexOf('\n');
                 s = nl < 0 ? "" : s.substring(nl + 1).trim();
             }

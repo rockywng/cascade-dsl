@@ -337,6 +337,23 @@ class SinkSafetyTest(unittest.TestCase):
         self.assertEqual(url_of("jdbc:postgresql://db/x?tcpKeepAlive=false"), "jdbc:postgresql://db/x?tcpKeepAlive=false")
         self.assertEqual(url_of("jdbc:mysql://db/x"), "jdbc:mysql://db/x")
 
+    def test_the_same_source_compiles_to_the_same_sql_wherever_it_is(self):
+        """The generated SQL named the source by its path relative to the working directory, so one
+        pipeline pushed from two checkouts (or built server side in temp dirs) got two versions."""
+        import tempfile
+        src = "pipeline: same\nsources:\n  s: {connection: datagen, columns: {k: STRING}}\n" \
+              "sinks:\n  out: {from: s, connection: blackhole}\n"
+        sqls = []
+        for _ in range(2):
+            d = tempfile.mkdtemp()
+            with open(os.path.join(d, "pipeline.yaml"), "w") as f:
+                f.write(src)
+            r = compile_pipeline(d, None)
+            self.assertTrue(r.ok, [x.format() for x in r.diagnostics.errors])
+            sqls.append(r.lowered.sql)
+        self.assertEqual(sqls[0], sqls[1])
+        self.assertIn("from pipeline.yaml", sqls[0].splitlines()[0])
+
 
 if __name__ == "__main__":
     unittest.main()

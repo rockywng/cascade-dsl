@@ -141,3 +141,31 @@ sinks:
         self.assertEqual((spec["slot"], spec["password_env"], spec["source"]),
                          ("g_t", "CASCADE_SECRET_CRM_PASSWORD", "t"))
         self.assertNotIn("password", spec)  # the secret itself never lands in the script
+
+
+class SlotLossHealingTest(unittest.TestCase):
+    PIPE = """
+pipeline: g
+connections:
+  db: {type: postgres-cdc, properties: {hostname: h, database: d, username: u, password: "${secret:crm/password}"}}
+sources:
+  t: {connection: db, table: public.t, columns: {id: BIGINT NOT NULL}, primary_key: [id]POLICY}
+sinks:
+  out: {from: t, connection: print, mode: upsert, primary_key: [id]}
+"""
+
+    def test_resnapshot_compiles_to_the_healing_source(self):
+        import json
+        r = compiled(self.PIPE.replace("POLICY", ", on_slot_loss: resnapshot"))
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        o = r.checked.options["t"]
+        self.assertEqual((o["connector"], o["delegate"], o["slot.name"]), ("cascade-healing-cdc", "postgres-cdc", "g_t"))
+        g = next(s for s in r.lowered.statements if s.kind == "guard")
+        self.assertEqual(json.loads(g.sql[len("-- @@require-slot"):])["on_slot_loss"], "resnapshot")
+
+    def test_refuse_is_the_default_and_batch_reads_plain_cdc(self):
+        self.assertEqual(compiled(self.PIPE.replace("POLICY", "")).checked.options["t"]["connector"], "postgres-cdc")
+        r = compiled("mode: batch\n" + self.PIPE.replace("POLICY", ", on_slot_loss: resnapshot"))
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        self.assertEqual(r.checked.options["t"]["connector"], "postgres-cdc")
+        self.assertNotIn("delegate", r.checked.options["t"])

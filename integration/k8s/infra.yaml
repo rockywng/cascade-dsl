@@ -52,7 +52,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16
+          image: postgres:17
           args: ["-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8"]
           env:
             - {name: POSTGRES_USER, value: flink}

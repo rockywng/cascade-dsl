@@ -797,6 +797,8 @@ def _check_batch(c: Checked):
         custom = s.connection in p.connections and p.connections[s.connection].type == "custom"
         if custom:
             continue  # the user's options decide boundedness
+        if connector == "cascade-healing-cdc":  # a batch run has no slot to lose
+            connector = opts["connector"] = opts.pop("delegate")
         bounded = BATCH_SOURCE.get(connector, {})
         if bounded is None:
             d.error("CD120", f"source '{s.name}': connector '{connector}' has no bounded read, so it can't be "

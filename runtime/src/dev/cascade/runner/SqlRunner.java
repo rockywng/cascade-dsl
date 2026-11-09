@@ -109,10 +109,13 @@ public final class SqlRunner {
         boolean restoring = !senv.getConfiguration()
                 .getOptional(org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH)
                 .orElse("").isEmpty();
-        for (String stmt : setupStmts) {
+        // replication slots first: a lost one is refused or moved to a new generation (slot.name)
+        Map<String, String> slots = validate ? new java.util.HashMap<>() : Guards.resolve(setupStmts, restoring, env);
+        for (String raw : setupStmts) {
+            String stmt = Guards.rename(raw, slots);
             Matcher m = SET.matcher(stmt);
             if (Guards.isGuard(stmt)) {
-                Guards.check(stmt, restoring && !validate, env);
+                continue;
             } else if (Processes.isDirective(stmt)) {
                 Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
                 processes = true;

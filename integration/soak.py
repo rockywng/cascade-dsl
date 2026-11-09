@@ -46,10 +46,27 @@ SEGMENTS = ["smb", "enterprise", "mid"]
 
 # --- pipeline ---------------------------------------------------------------------------------
 
-def write_pipeline(delivery: str = "exactly-once", parallelism: int = 1) -> str:
-    """The integration pipeline, with the revenue sink writing exactly-once (Kafka transactions)."""
+def write_pipeline(delivery: str = "exactly-once", parallelism: int = 1, heal: bool = False) -> str:
+    """The integration pipeline, with the revenue sink writing exactly-once (Kafka transactions).
+    `heal`: the customers source re-snapshots on slot loss, and customers per segment go to Postgres."""
     with open(os.path.join(it.HERE, "pipeline", "pipeline.yaml")) as f:
         text = f.read()
+    if heal:
+        text = text.replace("    primary_key: [customer_id]\n    # the CDC source",
+                            "    primary_key: [customer_id]\n    on_slot_loss: resnapshot\n    # the CDC source", 1)
+        text = text.replace("\nsinks:\n", """
+  customers_per_segment:
+    sql: SELECT COALESCE(segment, 'none') AS segment, COUNT(*) AS customers FROM customers GROUP BY COALESCE(segment, 'none')
+
+sinks:
+  segment_counts:
+    from: customers_per_segment
+    connection: warehouse
+    table: segment_counts
+    mode: upsert
+    primary_key: [segment]
+""", 1)
+        assert "on_slot_loss: resnapshot" in text and "segment_counts:" in text
     text = text.replace("    topic: revenue\n", f"    topic: revenue\n    delivery: {delivery}\n")
     text = text.replace("parallelism: 1}", f"parallelism: {parallelism}}}")
     d = os.path.join(it.WORK, "pipeline-soak" + ("" if parallelism == 1 else f"-p{parallelism}"))
@@ -259,6 +276,51 @@ class Rescaler:
         return f"parallelism {3 - self.current} -> {self.current}"
 
 
+def current_slots() -> list[str]:
+    """The customers source's slot and any generations the runner moved it to (`<slot>_g<time>`)."""
+    return [r[0] for r in it.psql(f"SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE '{SLOT}%'")]
+
+
+def slot_loss_healed(jid: str, args: list, version: str) -> str:
+    """on_slot_loss: resnapshot. The slot disappears while the job is stopped and customers change,
+    arrive and leave in the gap; the runner moves the source to a new slot generation, the source
+    re-snapshots and reconciles: downstream must equal Postgres again (checked at the end)."""
+    out = it.flink_cli("stop", "--savepointPath", "file:///flink-data/savepoints", jid)
+    m = re.search(r"Savepoint completed\. Path: (\S+)", out)
+    if not m:
+        raise Failed("stop-with-savepoint before slot loss failed:\n" + out[-2000:])
+    for slot in current_slots():
+        it.psql(f"SELECT pg_drop_replication_slot('{slot}')")
+    existing = [r[0] for r in it.psql(f"SELECT customer_id FROM customers WHERE customer_id <> '{PROBE}' "
+                                      "ORDER BY customer_id LIMIT 4")]
+    if len(existing) < 4:
+        raise Failed(f"expected at least 4 customers before the slot-loss step, got {existing}")
+    moved, gone = existing[:2], existing[2:]
+    it.psql(f"UPDATE customers SET segment = 'gap' WHERE customer_id IN ('{moved[0]}', '{moved[1]}')")
+    it.psql("INSERT INTO customers VALUES ('gap-new', 'gap', '2026-01-01 00:00:00') ON CONFLICT DO NOTHING")
+    it.psql(f"DELETE FROM customers WHERE customer_id IN ('{gone[0]}', '{gone[1]}')")
+    it.submit(version, args, savepoint=m.group(1))
+    slots = current_slots()
+    if not slots or slots == [SLOT]:
+        raise Failed(f"expected the runner to move the source to a new slot generation, slots: {slots}")
+    return f"slot dropped while stopped: healed onto {slots[0]} (re-snapshot + reconcile)"
+
+
+def check_segment_counts():
+    truth = {r[0]: int(r[1]) for r in it.psql("SELECT COALESCE(segment, 'none'), count(*) FROM customers GROUP BY 1")}
+
+    def converged():
+        got = {r[0]: int(r[1]) for r in it.psql("SELECT segment, customers FROM segment_counts WHERE customers > 0")}
+        return got if got == truth else None
+    try:
+        it.wait_for("customers per segment to converge", converged, timeout=180, every=5)
+    except Failed:
+        got = {r[0]: int(r[1]) for r in it.psql("SELECT segment, customers FROM segment_counts")}
+        raise Failed(f"customers per segment differ from Postgres after slot-loss healing: {got} vs {truth}")
+    ok(f"customers per segment equal Postgres after healed slot losses ({sum(truth.values())} customers, "
+       f"{len(truth)} segments)")
+
+
 def slot_loss(jid: str, args: list, load) -> str:
     """The replication slot disappears while the job is stopped (a database failover or an operator
     'cleaning up'); a customer changes in that gap. Does the change ever reach the job?"""
@@ -266,7 +328,8 @@ def slot_loss(jid: str, args: list, load) -> str:
     m = re.search(r"Savepoint completed\. Path: (\S+)", out)
     if not m:
         raise Failed("stop-with-savepoint before slot loss failed:\n" + out[-2000:])
-    it.psql(f"SELECT pg_drop_replication_slot('{SLOT}')")
+    for slot in current_slots():
+        it.psql(f"SELECT pg_drop_replication_slot('{slot}')")
     ts = load.event_time().strftime("%Y-%m-%d %H:%M:%S")
     probe = (f"INSERT INTO customers VALUES ('{PROBE}', 'probe-seg', '{ts}') ON CONFLICT (customer_id) "
              f"DO UPDATE SET segment = EXCLUDED.segment, updated_at = EXCLUDED.updated_at")
@@ -399,6 +462,8 @@ def main():
     ap.add_argument("--rescale", action="store_true", help="also rescale 1 <-> 2 under load")
     ap.add_argument("--cdc-edge-cases", action="store_true",
                     help="also change the CDC table's schema, and lose the replication slot while stopped")
+    ap.add_argument("--slot-loss", default="refuse", choices=["refuse", "resnapshot"],
+                    help="with --cdc-edge-cases: the customers source's on_slot_loss policy")
     ap.add_argument("--delivery", default="exactly-once", choices=["exactly-once", "at-least-once"],
                     help="revenue sink guarantee (at-least-once is a control: the duplicate check must fail)")
     a = ap.parse_args()
@@ -414,11 +479,12 @@ def main():
                      "--topic", "orders", "--partitions", str(a.partitions))
         step(f"soak: {a.minutes:g} minutes at {a.rate} orders/s, {a.customers} customers, "
              f"{a.partitions} partition(s), with failures")
-        project = write_pipeline(a.delivery)
+        heal = a.cdc_edge_cases and a.slot_loss == "resnapshot"
+        project = write_pipeline(a.delivery, heal=heal)
         args = it.package("soak", project)
         rescaler = None
         if a.rescale:
-            p2 = write_pipeline(a.delivery, parallelism=2)
+            p2 = write_pipeline(a.delivery, parallelism=2, heal=heal)
             rescaler = Rescaler({1: args, 2: it.package("soak-p2", p2, previous="soak")})
             rescaler.packages[1] = it.package("soak-p1", project, previous="soak-p2")
         it.submit("soak", args)
@@ -440,6 +506,9 @@ def main():
         if a.cdc_edge_cases:
             kinds.append(("CDC table schema change (ADD COLUMN)", schema_change))
             def lose_slot(jid):
+                if heal:
+                    version = f"soak-p{rescaler.current}" if rescaler else "soak"
+                    return slot_loss_healed(jid, rescaler.packages[rescaler.current] if rescaler else args, version)
                 if rescaler:
                     rescaler.current = 1
                 return slot_loss(jid, args, load)
@@ -484,7 +553,9 @@ def main():
            f"job {info.get('state')}, {info.get('completed')} checkpoints, {info.get('failed')} failed")
         expected_ltv, expected_windows, max_ts = truth()
         check_results(expected_ltv, expected_windows, max_ts)
-        if a.cdc_edge_cases:
+        if heal:
+            check_segment_counts()
+        elif a.cdc_edge_cases:
             check_probe()
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0

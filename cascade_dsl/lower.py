@@ -275,11 +275,14 @@ def _slot_guard(c: Checked, s) -> Stmt | None:
     replication slot is gone (the connector would silently resume from a new slot; dev.cascade.runner.Guards)."""
     import json
     opts = c.options.get(s.name) or {}
-    if opts.get("connector") != "postgres-cdc" or c.pipeline.mode == "batch" or "slot.name" not in opts:
+    pg = opts.get("connector") == "postgres-cdc" or opts.get("delegate") == "postgres-cdc"
+    if not pg or c.pipeline.mode == "batch" or "slot.name" not in opts:
         return None
     pw = opts.get("password", "")
     spec = {"source": s.name, "slot": opts["slot.name"], "hostname": opts.get("hostname"),
-            "port": opts.get("port", "5432"), "database": opts.get("database-name"), "username": opts.get("username")}
+            "port": opts.get("port", "5432"), "database": opts.get("database-name"), "username": opts.get("username"),
+            "plugin": opts.get("decoding.plugin.name", "pgoutput"),
+            "on_slot_loss": "resnapshot" if opts.get("connector") == "cascade-healing-cdc" else "refuse"}
     m = SECRET_RE.match(pw)
     if m:
         from .deploy import env_name

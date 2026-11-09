@@ -26,7 +26,7 @@ services:
       retries: 30
 
   postgres:
-    image: postgres:16
+    image: postgres:17
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8"]
     environment:
       POSTGRES_USER: flink

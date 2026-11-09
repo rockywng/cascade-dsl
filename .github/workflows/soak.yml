@@ -22,6 +22,11 @@ jobs:
   soak:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # what a lost replication slot does: refuse to restore, or re-snapshot and reconcile
+        slot_loss: [refuse, resnapshot]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,3 +43,4 @@ jobs:
           --minutes ${{ github.event.inputs.minutes || '45' }}
           --cycles ${{ github.event.inputs.cycles || '3' }}
           ${{ github.event.inputs.extra || '--rescale --cdc-edge-cases --customers 2000 --partitions 2' }}
+          --slot-loss ${{ matrix.slot_loss }}

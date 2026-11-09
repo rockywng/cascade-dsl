@@ -16,3 +16,9 @@ CREATE TABLE customer_ltv (
 INSERT INTO customers VALUES
   ('c1', 'smb',        '2026-01-01 09:00:00'),
   ('c2', 'enterprise', '2026-01-01 09:00:00');
+
+-- soak --slot-loss resnapshot: customers per segment, compared against this table's truth
+CREATE TABLE segment_counts (
+  segment   TEXT PRIMARY KEY,
+  customers BIGINT
+);

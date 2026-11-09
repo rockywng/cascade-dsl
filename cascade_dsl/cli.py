@@ -259,7 +259,11 @@ def cmd_deploy(args) -> int:
     if info["mode"] == "statements":
         print("  note: without --plan-dir the job is planned at startup and operator UIDs are not pinned; "
               "use `cascade plan` for upgrades that must keep state", file=sys.stderr)
-    if info["secrets"]:
+    if info["secrets"] and not info.get("secret_name"):
+        from .deploy import env_name
+        print("  needs these environment variables where the job runs: "
+              + ", ".join(sorted(env_name(s) for s in info["secrets"])), file=sys.stderr)
+    elif info["secrets"]:
         print(f"  needs Secret '{info['secret_name']}' with keys: "
               + ", ".join(sorted(secret_key(s) for s in info["secrets"])) + " (see secret.template.yaml)",
               file=sys.stderr)

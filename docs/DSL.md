@@ -107,11 +107,63 @@ position its replication slot holds. If the slot is gone, for example after a da
 or a cleanup, Flink CDC silently creates a new one at the current position. Every change in
 between is lost, with no error; the soak test reproduced this.
 
-So when restoring, SqlRunner first checks that each Postgres CDC source's slot still exists. If
-it's gone, the runner refuses to start and names the slot. To recover, choose one:
-- **Start the source fresh:** deploy without the savepoint, or backfill the models that read it.
-- **Accept the gap:** set `CASCADE_ALLOW_SLOT_LOSS=1`, then replay the rows that changed during
-  it (touch them in Postgres).
+The changes in the gap can't be read back: a new slot only streams what happens after it was
+created, and Postgres releases the WAL behind a dropped slot. So cascade does two things.
+
+**Making slot loss rare.** At every start, SqlRunner checks each Postgres CDC source's slot:
+- **On a fresh start against Postgres 17+,** it creates the slot with `failover = true`. A failover
+  slot follows a failover to a standby, provided the standby syncs slots: `sync_replication_slots
+  = on` on the standby and `synchronized_standby_slots` on the primary, which is your DBA's
+  configuration. On older Postgres the connector creates an ordinary slot.
+- **A slot Postgres invalidated** (`wal_status = lost`, past `max_slot_wal_keep_size`) counts as gone.
+- **Every start logs each slot's WAL status and lag,** and warns at `unreserved` (about to be
+  invalidated).
+
+The runner only runs at start, so alert on slots between starts too:
+
+```sql
+SELECT slot_name, active, wal_status,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
+FROM pg_replication_slots;   -- alert on wal_status <> 'reserved', or lag above your budget
+```
+
+**When a slot is gone on restore, `on_slot_loss` on the source decides:**
+
+```yaml
+sources:
+  customers:
+    connection: crm
+    table: public.customers
+    primary_key: [customer_id]
+    on_slot_loss: resnapshot      # default: refuse
+```
+
+- **`refuse`** (default): the runner refuses to start and names the slot. Recover by starting the
+  source fresh (deploy without the savepoint, or backfill the models that read it), or by setting
+  `CASCADE_ALLOW_SLOT_LOSS=1` and replaying the rows that changed in the gap.
+- **`resnapshot`**: the source heals itself.
+  - **New slot generation.** The runner moves the source to a new slot, named `<slot>_g<time>`
+    and created as a failover slot.
+  - **Fresh snapshot.** The source sees that its saved position belongs to another generation,
+    so it drops that position, re-reads the table, and streams on from the new slot. All
+    downstream state is kept.
+  - **Reconcile step.** A step between the source and the rest of the job keeps the last row of
+    every key. It turns the re-read into exact changes against what downstream already has:
+    unchanged rows produce nothing, changed rows become updates, new rows become inserts. Once
+    the snapshot is complete, it deletes the keys that vanished during the gap.
+
+  This was tested against Postgres 17 with updates, inserts, deletes and delete-then-reinsert in the
+  gap, then a TaskManager failover, a normal restore, and a second loss. The aggregates downstream
+  matched Postgres exactly each time. The nightly soak repeats it under load.
+
+  What `resnapshot` can't restore: intermediate versions. A row changed twice in the gap arrives
+  as its final version, which only matters to event-time temporal joins over history. The cost is
+  state for one copy of the table, as with a keyed upsert source. It compiles to
+  `cascade-healing-cdc`, which wraps `postgres-cdc` and needs its incremental snapshot reader (on
+  by default).
+
+The slot checks run in SqlRunner, which every deploy target uses. Running `pipeline.sql` through the
+SQL client skips them.
 
 Every connector's jar version defaults to the one tested with Flink 2.3 (`TESTED_VERSIONS` in
 `cascade_dsl/connectors.py`). `deploy.artifacts` overrides it. `tests/test_connector_smoke.py`

@@ -154,7 +154,10 @@ The extended soak (`--rescale --cdc-edge-cases --customers 2000 --partitions 2`)
     created a new slot at the current position and carried on: the change never arrived, with
     no error. SqlRunner now checks, on restore, that each Postgres CDC source's slot exists and
     refuses to start otherwise. The soak asserts the refusal, then follows the runbook: accept
-    the gap with `CASCADE_ALLOW_SLOT_LOSS=1` and replay the change. Rescaling 1 to 2 under load,
+    the gap with `CASCADE_ALLOW_SLOT_LOSS=1` and replay the change. With `on_slot_loss: resnapshot`
+    (`soak.py --slot-loss resnapshot`), the source heals itself: it moves to a new failover slot
+    generation, re-snapshots, and reconciles. Customers per segment must equal Postgres after
+    updates, inserts and deletes in the gap. The nightly soak runs both policies. Rescaling 1 to 2 under load,
     an `ADD COLUMN` on the CDC table, 2,001 keys and two partitions all came through exact.
 
 The upgrade matrix (`tests/test_upgrade_matrix.py`, stand-in connectors, 15 kinds of upgrade)

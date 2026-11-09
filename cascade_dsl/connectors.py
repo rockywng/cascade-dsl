@@ -121,6 +121,10 @@ def _pg_finish(role, mode, fmt, opts, ctx: LowerCtx):
     # savepoint (seen in integration/run.py with Flink CDC 3.7): every upgrade would re-emit every row.
     # The incremental reader resumes from the saved LSN.
     opts.setdefault("scan.incremental.snapshot.enabled", "true")
+    if opts.pop("__on_slot_loss", "refuse") == "resnapshot":
+        # dev.cascade.cdc.HealingCdcFactory: the CDC source behind a slot-generation tag and a reconcile step
+        opts["delegate"] = opts["connector"]
+        opts["connector"] = "cascade-healing-cdc"
     return problems
 
 
@@ -237,7 +241,10 @@ for _db, _port in (("postgres", 5432), ("mysql", 3306)):
             "startup": Prop("scan.startup.mode", default="initial",
                             values={"initial": "initial", "latest": "latest-offset"}),
             **({"slot_name": Prop("slot.name"),
-                "decoding_plugin": Prop("decoding.plugin.name", default="pgoutput")}
+                "decoding_plugin": Prop("decoding.plugin.name", default="pgoutput"),
+                "on_slot_loss": Prop("__on_slot_loss", values={"refuse": "refuse", "resnapshot": "resnapshot"},
+                                     doc="when the replication slot is gone on restore: refuse to start, or "
+                                         "re-snapshot and reconcile downstream state")}
                if _db == "postgres" else {"server_id": Prop("server-id")}),
         },
         source_changelog="updating", source_requires_pk=True,

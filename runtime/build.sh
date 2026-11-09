@@ -9,6 +9,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 rm -rf "$here/target" && mkdir -p "$here/target/runtime" "$here/target/tools"
 javac --release 11 -nowarn -cp "$FLINK_HOME/lib/*" -d "$here/target/runtime" \
   $(find "$here/src" -name '*.java')
+cp -r "$here/META-INF" "$here/target/runtime/"
 jar cf "$here/target/cascade-runtime.jar" -C "$here/target/runtime" .
 javac --release 11 -nowarn -cp "$FLINK_HOME/lib/*:$here/target/runtime" -d "$here/target/tools" \
   $(find "$here/tools" -name '*.java')

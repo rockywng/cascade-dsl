@@ -58,7 +58,8 @@ public final class Guards {
                             + "resume from a new slot at the current position and silently lose every change "
                             + "since the savepoint. Start this source fresh instead (deploy without the savepoint, "
                             + "or backfill the models that read it), or set CASCADE_ALLOW_SLOT_LOSS=1 to accept "
-                            + "the gap.");
+                            + "the gap. (If the source is new in this version, deploy with `cascade plan "
+                            + "--previous`, which knows that it has no slot yet.)");
                 }
             }
         }

@@ -112,7 +112,8 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
 
     os.makedirs(out, exist_ok=True)
     rewrite = _in_image if target != "flink-run" else (lambda st: _job_local(st, out))
-    setup = [rewrite(st) for st in lowered.statements if st.kind != "insert"]
+    keep_guard = _guard_filter(plan_dir)
+    setup = [rewrite(st) for st in lowered.statements if st.kind != "insert" and (st.kind != "guard" or keep_guard(st))]
     files = {"setup.sql": _header(r, "setup") + script(setup)}
     if plan_dir and any(m.process for m in p.models.values()):
         raise DeployError("pipelines with process models deploy as statements (a compiled plan can't contain "
@@ -185,6 +186,20 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
 
 
 TARGETS = ("kubernetes", "session", "flink-run")
+
+
+def _guard_filter(plan_dir: str | None):
+    """Replication-slot guards apply to sources that resume from the savepoint. `cascade plan
+    --previous` knows which those are; a source new in this version has no slot yet."""
+    path = os.path.join(plan_dir, "restore.json") if plan_dir else None
+    if not path or not os.path.exists(path):
+        return lambda st: True
+    with open(path) as f:
+        info = json.load(f)
+    if not info.get("previous"):
+        return lambda st: True  # a first plan: nothing restores, the guards stay inert
+    restored = set(info.get("restored_sources") or [])
+    return lambda st: st.name in restored
 
 
 def _job_args(files: dict, mode: str, inline: bool) -> list[str]:

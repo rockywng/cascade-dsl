@@ -172,6 +172,8 @@ class PinReport:
     # replaced sink operators without declared state (most sinks keep none; a transactional
     # exactly-once writer does, and would lose its pending transactions)
     dropped_sinks: list[str] = field(default_factory=list)
+    # sources whose scan operator keeps its UID, i.e. resumes from the savepoint
+    restored_sources: list[str] = field(default_factory=list)
 
     @property
     def restorable(self) -> bool:
@@ -228,6 +230,8 @@ def pin_uids(old: dict, new: dict, allow_drift: bool = True, tag: str | None = N
             if is_stateful(node):
                 report.new_stateful.append(_label(node))
         node["configuration"] = conf
+    report.restored_sources = sorted({_table_name(new_nodes[i]) for i in assignment
+                                      if new_nodes[i]["type"].startswith("stream-exec-table-source-scan")})
     # A new operator that needs history only misses it if one of its sources resumes from the
     # savepoint. Behind new sources (e.g. a backfill copy) it reads from their startup position.
     if old_nodes:  # a first deployment has no "before"

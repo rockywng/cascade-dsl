@@ -204,6 +204,10 @@ def cmd_plan(args) -> int:
         f.write(script(setup))
     with open(os.path.join(args.out, "operators.json"), "w") as f:
         json.dump(ops, f, indent=2)
+    with open(os.path.join(args.out, "restore.json"), "w") as f:
+        # which sources resume from the previous version's savepoint (deploy keeps their restore guards)
+        json.dump({"previous": args.previous, "restored_sources": report.restored_sources if report else []}, f,
+                  indent=2)
     if report is not None:
         _print_pin_report(report)
     print("vertices:", file=sys.stderr)

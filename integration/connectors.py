@@ -90,11 +90,12 @@ class Job:
         self.proc = None
         self.log = os.path.join(self.dir, "job.log")
 
-    def _cmd(self, wait: bool) -> list[str]:
+    def _cmd(self, wait: bool, restore: str | None = None) -> list[str]:
         cp = os.pathsep.join([RUNTIME, os.path.join(it.FLINK_BASE, "lib", "*"), *self.jars])
         return ["java", "--add-opens=java.base/java.util=ALL-UNNAMED", "--add-opens=java.base/java.lang=ALL-UNNAMED",
                 "-cp", cp, "dev.cascade.runner.SqlRunner", "--setup", os.path.join(self.dir, "setup.sql"),
-                "--statements", os.path.join(self.dir, "statements.sql")] + (["--await"] if wait else [])
+                "--statements", os.path.join(self.dir, "statements.sql")] + (["--await"] if wait else []) \
+            + (["--restore", restore] if restore else [])
 
     def run(self, timeout=600):
         """A bounded job, to completion."""
@@ -105,11 +106,20 @@ class Job:
         if p.returncode != 0:
             raise Failed(f"job in {self.dir} failed:\n{_error(p.stdout + p.stderr)}")
 
-    def start(self):
+    def start(self, restore: str | None = None):
         """A streaming job, in the background (stop() ends it)."""
-        self.out = open(self.log, "w")
-        self.proc = subprocess.Popen(self._cmd(True), stdout=self.out, stderr=subprocess.STDOUT,
+        self.out = open(self.log, "a")
+        self.proc = subprocess.Popen(self._cmd(True, restore), stdout=self.out, stderr=subprocess.STDOUT,
                                      env={**os.environ, **SECRETS})
+
+    def latest_checkpoint(self) -> str:
+        cps = []
+        for root, dirs, files in os.walk(os.path.join(self.dir, "checkpoints")):
+            if "_metadata" in files and os.path.basename(root).startswith("chk-"):
+                cps.append((int(os.path.basename(root)[4:]), root))
+        if not cps:
+            raise Failed(f"no completed checkpoint under {self.dir}/checkpoints")
+        return "file://" + max(cps)[1]
 
     def check_alive(self):
         if self.proc is not None and self.proc.poll() is not None:
@@ -144,7 +154,8 @@ def converge(what: str, actual, expected, job: Job | None = None, timeout=180):
 
 # --- CDC sources ---------------------------------------------------------------------------------
 
-def mirror_case(name: str, connection: str, source: str, columns: str, key: str, truth, change, setup_results):
+def mirror_case(name: str, connection: str, source: str, columns: str, key: str, truth, change, setup_results,
+                batch: bool = True):
     """Snapshot + live changes (streaming), then a bounded snapshot (batch): Postgres must mirror the source."""
     table = name.replace("-", "_")
     setup_results(table)
@@ -171,11 +182,33 @@ sinks:
         converge(f"{name}: inserts, updates and deletes mirrored", mirror, truth(), job)
     finally:
         job.stop()
+    if not batch:
+        r = compile_once("mode: batch\n" + text, name + "-batch-check")
+        if "CD120" not in r.diagnostics.codes():
+            raise Failed(f"{name}: expected batch mode to be refused (CD120)")
+        ok(f"{name}: batch mode is refused at compile time (CD120), as Flink can't run it")
+        return
     setup_results(table + "_batch")
     batch = Job(name + "-batch", "mode: batch\n" + text.replace(f"table: {table},", f"table: {table}_batch,"))
     batch.run()
     converge(f"{name}: batch snapshot equals the source",
              lambda: sorted(tuple(r) for r in results(f"SELECT * FROM {table}_batch ORDER BY 1")), truth())
+
+
+def compile_once(text: str, name: str):
+    d = os.path.join(WORK, name)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    with open(os.path.join(d, "pipeline.yaml"), "w") as f:
+        f.write(text)
+    return compile_pipeline(d)
+
+
+def mysql_ready() -> bool:
+    try:
+        return "1" in sh("mysql", "mysql", "-uroot", "-ppw", "-N", "-e", "SELECT 1")
+    except Failed:
+        return False
 
 
 def pg_table(sql_cols: str):
@@ -186,14 +219,28 @@ def pg_table(sql_cols: str):
 
 def case_mysql():
     sql = lambda q: sh("mysql", "mysql", "-uroot", "-ppw", "-N", "-B", "app", "-e", q)  # noqa: E731
-    it.wait_for("MySQL", lambda: "1" in sh("mysql", "mysql", "-uroot", "-ppw", "-N", "-e", "SELECT 1", check=False),
-                timeout=180)
+    it.wait_for("MySQL", mysql_ready, timeout=240, every=3)
     sql("DROP TABLE IF EXISTS items; CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(20), qty INT); "
         "INSERT INTO items VALUES (1,'a',5),(2,'b',7),(3,'c',9)")
     truth = lambda: sorted(tuple(line.split("\t")) for line in sql("SELECT id, name, qty FROM items").splitlines())  # noqa: E731
     mirror_case("mysql-cdc", '{type: mysql-cdc, properties: {hostname: localhost, port: 13306, username: root, '
                 'password: "${secret:pw}"}}', "    table: app.items", "{id: INT NOT NULL, name: STRING, qty: INT}",
                 "id", truth,
+                lambda: sql("INSERT INTO items VALUES (4,'d',1); UPDATE items SET qty = 70 WHERE id = 2; "
+                            "DELETE FROM items WHERE id = 3"),
+                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"))
+
+
+def case_postgres():
+    sql = lambda q: sh("postgres", "psql", "-U", "postgres", "-d", "app", "-tAF", "\t", "-c", q)  # noqa: E731
+    if "app" not in sh("postgres", "psql", "-U", "postgres", "-tAc", "SELECT datname FROM pg_database"):
+        sh("postgres", "psql", "-U", "postgres", "-c", "CREATE DATABASE app")
+    sql("DROP TABLE IF EXISTS items; CREATE TABLE items (id INT PRIMARY KEY, name TEXT, qty INT); "
+        "ALTER TABLE items REPLICA IDENTITY FULL; INSERT INTO items VALUES (1,'a',5),(2,'b',7),(3,'c',9)")
+    truth = lambda: sorted(tuple(line.split("\t")) for line in sql("SELECT id, name, qty FROM items").splitlines())  # noqa: E731
+    mirror_case("postgres-cdc", '{type: postgres-cdc, properties: {hostname: localhost, port: 15432, '
+                'database: app, username: postgres, password: "${secret:pw}"}}', "    table: public.items",
+                "{id: INT NOT NULL, name: STRING, qty: INT}", "id", truth,
                 lambda: sql("INSERT INTO items VALUES (4,'d',1); UPDATE items SET qty = 70 WHERE id = 2; "
                             "DELETE FROM items WHERE id = 3"),
                 pg_table("id INT PRIMARY KEY, name TEXT, qty INT"))
@@ -216,7 +263,7 @@ def case_sqlserver():
                 "{id: INT NOT NULL, name: STRING, qty: INT}", "id", truth,
                 lambda: sql("INSERT INTO dbo.items VALUES (4,'d',1); UPDATE dbo.items SET qty = 70 WHERE id = 2; "
                             "DELETE FROM dbo.items WHERE id = 3"),
-                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"))
+                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"), batch=False)
 
 
 def case_mongodb():
@@ -237,7 +284,7 @@ def case_mongodb():
                 "{_id: STRING NOT NULL, name: STRING, qty: INT}", "_id", truth,
                 lambda: js("const c = db.getSiblingDB('app').items; c.insertOne({_id: '4', name: 'd', qty: 1}); "
                            "c.updateOne({_id: '2'}, {$set: {qty: 70}}); c.deleteOne({_id: '3'})"),
-                pg_table("_id TEXT PRIMARY KEY, name TEXT, qty INT"))
+                pg_table("_id TEXT PRIMARY KEY, name TEXT, qty INT"), batch=False)
 
 
 # --- sinks (and read-backs) ------------------------------------------------------------------------
@@ -357,9 +404,107 @@ def case_delta():
     converge("delta: 100 rows committed to the Delta log", rows, 100)
 
 
-CASES = {"mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,
+# --- lost change history: loud failure, or silent loss? -------------------------------------------
+
+def history_loss_case(name: str, connection: str, source: str, seed, lose, truth):
+    """A CDC source whose change history disappears while the job is down (MySQL: binlog purged; SQL
+    Server: change table cleaned up). Restored from its last checkpoint, it must either fail loudly or
+    still deliver the lost change. Running on without it is silent data loss."""
+    table = name.replace("-", "_")
+    pg_table("id INT PRIMARY KEY, v TEXT")(table)
+    seed()
+    job = Job(name, f"""
+pipeline: {table}
+flink:
+  config:
+    execution.checkpointing.interval: 1s
+    execution.checkpointing.dir: "file://{os.path.join(WORK, name, 'checkpoints')}"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+connections:
+  src: {connection}{RESULTS}
+sources:
+  items:
+    connection: src
+{source}
+    columns: {{id: INT NOT NULL, v: STRING}}
+    primary_key: [id]
+sinks:
+  out: {{from: items, connection: results, table: {table}, mode: upsert, primary_key: [id]}}
+""")
+    mirror = lambda: sorted(tuple(r) for r in results(f"SELECT id, v FROM {table} ORDER BY 1"))  # noqa: E731
+    job.start()
+    try:
+        converge(f"{name}: mirrored before the outage", mirror, truth(), job)
+        time.sleep(6)  # a checkpoint after the snapshot and stream switch
+    finally:
+        job.stop()
+    checkpoint = job.latest_checkpoint()
+    lose()  # a change while the job is down, then its history is destroyed
+    job.start(restore=checkpoint)
+    deadline = time.time() + 120
+    try:
+        while time.time() < deadline:
+            if job.proc.poll() is not None:
+                with open(job.log) as f:
+                    ok(f"{name}: restored without the lost history, the source failed loudly: "
+                       + (_error(f.read()).splitlines() or ["?"])[-1][:240])
+                return
+            if mirror() == truth():
+                ok(f"{name}: the change made while its history was lost still arrived")
+                return
+            time.sleep(3)
+        raise Failed(f"{name}: SILENT DATA LOSS: restored after its change history was lost, the job keeps "
+                     f"running without the change (mirror {mirror()} vs source {truth()})")
+    finally:
+        job.stop()
+
+
+def case_mysql_binlog_purge():
+    sql = lambda q: sh("mysql", "mysql", "-uroot", "-ppw", "-N", "-B", "app", "-e", q)  # noqa: E731
+    it.wait_for("MySQL", mysql_ready, timeout=240, every=3)
+
+    def seed():
+        sql("DROP TABLE IF EXISTS hist; CREATE TABLE hist (id INT PRIMARY KEY, v VARCHAR(20)); "
+            "INSERT INTO hist VALUES (1,'a'),(2,'b')")
+
+    def lose():
+        sql("INSERT INTO hist VALUES (3,'made while down'); FLUSH BINARY LOGS")
+        current = sql("SHOW BINARY LOG STATUS").split("\t")[0].strip()
+        sql(f"PURGE BINARY LOGS TO '{current}'")
+    history_loss_case("mysql-binlog-purged", '{type: mysql-cdc, properties: {hostname: localhost, port: 13306, '
+                      'username: root, password: "${secret:pw}"}}', "    table: app.hist", seed, lose,
+                      lambda: sorted(tuple(x.split("\t")) for x in sql("SELECT id, v FROM hist").splitlines()))
+
+
+def case_sqlserver_cleanup():
+    def sql(q, db="app"):
+        return sh("sqlserver", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-P",
+                  "Cascade-pw1", "-d", db, "-h", "-1", "-W", "-s", "\t", "-Q", "SET NOCOUNT ON; " + q)
+    it.wait_for("SQL Server", lambda: "1" in sql("SELECT 1", db="master"), timeout=240, every=5)
+    sql("IF DB_ID('app') IS NULL CREATE DATABASE app", db="master")
+
+    def seed():
+        sql("IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = 'app') = 0 EXEC sys.sp_cdc_enable_db; "
+            "IF OBJECT_ID('dbo.hist') IS NULL BEGIN CREATE TABLE dbo.hist (id INT PRIMARY KEY, v NVARCHAR(20)); "
+            "EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'hist', @role_name = NULL; END; "
+            "DELETE FROM dbo.hist; INSERT INTO dbo.hist VALUES (1,'a'),(2,'b')")
+
+    def lose():
+        sql("INSERT INTO dbo.hist VALUES (3,'made while down')")
+        time.sleep(8)  # the capture job copies it into the change table
+        sql("DECLARE @lsn binary(10) = sys.fn_cdc_get_max_lsn(); "
+            "EXEC sys.sp_cdc_cleanup_change_table @capture_instance = 'dbo_hist', @low_water_mark = @lsn, "
+            "@threshold = 5000")
+    history_loss_case("sqlserver-cleaned-up", '{type: sqlserver-cdc, properties: {hostname: localhost, port: 11433, '
+                      'username: sa, password: "${secret:mssql}", database: app}}', "    table: dbo.hist", seed, lose,
+                      lambda: sorted(tuple(x.strip() for x in line.split("\t"))
+                                     for line in sql("SELECT id, v FROM dbo.hist").splitlines() if line.strip()))
+
+
+CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,
          "elasticsearch": case_elasticsearch, "dynamodb": case_dynamodb, "kinesis": case_kinesis,
-         "hudi": case_hudi, "delta": case_delta}
+         "hudi": case_hudi, "delta": case_delta, "mysql-binlog-purged": case_mysql_binlog_purge,
+         "sqlserver-cleaned-up": case_sqlserver_cleanup}
 
 
 def prepare():
@@ -388,6 +533,7 @@ def main():
     try:
         step("systems: " + ", ".join(sorted({"postgres"} | {n.split("-")[0] for n in names})))
         services = {"mysql-cdc": "mysql", "sqlserver-cdc": "sqlserver", "mongodb-cdc": "mongo",
+                    "mysql-binlog-purged": "mysql", "sqlserver-cleaned-up": "sqlserver",
                     "elasticsearch": "elasticsearch", "dynamodb": "dynamodb", "kinesis": "kinesis"}
         dc("up", "-d", "postgres", *sorted({services[n] for n in names if n in services}), timeout=1200)
         it.wait_for("Postgres", lambda: results("SELECT 1"), timeout=60)

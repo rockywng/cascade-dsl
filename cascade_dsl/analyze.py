@@ -775,8 +775,9 @@ def _check_pipeline(c: Checked):
 BATCH_SOURCE = {
     "kafka": {"scan.bounded.mode": "latest-offset"},   # everything in the topic when the job starts
     "postgres-cdc": {"scan.startup.mode": "snapshot"}, "mysql-cdc": {"scan.startup.mode": "snapshot"},
-    "oracle-cdc": {"scan.startup.mode": "snapshot"}, "sqlserver-cdc": {"scan.startup.mode": "snapshot"},
-    "db2-cdc": {"scan.startup.mode": "snapshot"}, "mongodb-cdc": {"scan.startup.mode": "snapshot"},
+    # integration/connectors.py: SQL Server CDC has no snapshot startup mode, and MongoDB CDC declares a
+    # changelog even in snapshot mode, which Flink's batch planner rejects; Oracle and Db2 are unverified
+    "sqlserver-cdc": None, "mongodb-cdc": None, "oracle-cdc": None, "db2-cdc": None,
     "iceberg": {"streaming": "false"}, "hudi": {"read.streaming.enabled": "false"},
     "paimon": {}, "filesystem": {}, "jdbc": {}, "datagen": {},
     "kinesis": None,
@@ -801,12 +802,13 @@ def _check_batch(c: Checked):
             connector = opts["connector"] = opts.pop("delegate")
         bounded = BATCH_SOURCE.get(connector, {})
         if bounded is None:
-            d.error("CD120", f"source '{s.name}': connector '{connector}' has no bounded read, so it can't be "
-                    "used in a batch pipeline", s.loc, node=s.name)
+            d.error("CD120", f"source '{s.name}': connector '{connector}' has no bounded read Flink's batch mode "
+                    "accepts, so it can't be used in a batch pipeline", s.loc, node=s.name)
             continue
         for k, v in bounded.items():
             opts[k] = v
-        if connector == "datagen" and "number-of-rows" not in opts:
+        sequence = any(k.startswith("fields.") and k.endswith(".kind") and v == "sequence" for k, v in opts.items())
+        if connector == "datagen" and "number-of-rows" not in opts and not sequence:
             d.error("CD120", f"source '{s.name}': datagen in a batch pipeline needs number_of_rows", s.loc,
                     node=s.name)
         if connector == "upsert-kafka" and "scan.bounded.mode" in opts:

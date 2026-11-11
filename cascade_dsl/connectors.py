@@ -311,14 +311,33 @@ register(ConnectorSpec(
 ))
 
 
-def _kinesis_finish(role, mode, fmt, opts, ctx):
+_AWS_CONNECTION = {
+    "region": Prop("aws.region", required=True),
+    "endpoint": Prop("aws.endpoint", doc="override, e.g. a VPC endpoint or a local emulator"),
+    "access_key_id": Prop("__aws_key", secret=True, doc="static credentials (default: the AWS default chain)"),
+    "secret_access_key": Prop("__aws_secret", secret=True),
+}
+
+
+def _aws_finish(role, mode, fmt, opts, ctx):
+    key, secret = opts.pop("__aws_key", None), opts.pop("__aws_secret", None)
+    if key or secret:
+        if not (key and secret):
+            return [("CD209", "access_key_id and secret_access_key go together")]
+        opts["aws.credentials.provider"] = "BASIC"
+        opts["aws.credentials.provider.basic.accesskeyid"] = key
+        opts["aws.credentials.provider.basic.secretkey"] = secret
     return []
+
+
+def _kinesis_finish(role, mode, fmt, opts, ctx):
+    return _aws_finish(role, mode, fmt, opts, ctx)
 
 
 register(ConnectorSpec(
     type="kinesis", roles={"source", "sink"},
     doc="Amazon Kinesis Data Streams (connector 6.x, enhanced fan-out off by default).",
-    connection={"region": Prop("aws.region", required=True)},
+    connection=_AWS_CONNECTION,
     source={"stream_arn": Prop("stream.arn", required=True),
             "startup": Prop("source.init.position", default="latest",
                             values={"earliest": "TRIM_HORIZON", "latest": "LATEST"})},
@@ -327,14 +346,16 @@ register(ConnectorSpec(
     formats=STREAM_FORMATS - CDC_FORMATS | {"debezium-json"}, default_format="json",
     source_changelog="by_format",
     artifact="org.apache.flink:flink-sql-connector-aws-kinesis-streams",
+    finish=_kinesis_finish,
 ))
 register(ConnectorSpec(
     type="dynamodb", roles={"sink"},
     doc="Amazon DynamoDB. Upsert sinks put by primary key and delete on retraction.",
-    connection={"region": Prop("aws.region", required=True)},
+    connection=_AWS_CONNECTION,
     sink={"table": Prop("table-name", required=True)},
     sink_modes={"append", "upsert"},
     artifact="org.apache.flink:flink-sql-connector-dynamodb",
+    finish=_aws_finish,
 ))
 
 

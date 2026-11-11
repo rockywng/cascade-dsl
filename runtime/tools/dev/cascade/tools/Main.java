@@ -148,6 +148,8 @@ public final class Main {
             Matcher m = SET.matcher(s);
             if (dev.cascade.runner.Guards.isGuard(s)) {
                 continue; // local runs use stand-in sources
+            } else if (dev.cascade.runner.Tables.isEnsure(s)) {
+                dev.cascade.runner.Tables.ensure(tEnv, s); // planning a Paimon table needs it to exist
             } else if (dev.cascade.runner.Processes.isDirective(s)) {
                 dev.cascade.runner.Processes.apply((StreamTableEnvironment) tEnv, s);
             } else if (m.matches()) {

@@ -86,7 +86,7 @@ CASES = {
     "db2-cdc": cdc("db2-cdc", ", database: app", table="DB2INST1.ORDERS"),
     "mongodb-cdc": source_case("c: {type: mongodb-cdc, properties: {hosts: 'mongo:27017'}}",
                                "database: app\ncollection: orders", "{_id: STRING NOT NULL, v: STRING}", "_id"),
-    "paimon": sink_case("c: {type: paimon, properties: {base_path: 'file://{tmp}'}}", "path: out"),
+    "paimon": sink_case("c: {type: paimon, properties: {warehouse: 'file://{tmp}'}}", "table: shop.out"),
     "hudi": sink_case("c: {type: hudi, properties: {base_path: 'file://{tmp}'}}", "path: out"),
     "delta": sink_case("c: {type: delta}", "table_path: 'file://{tmp}/out'", mode="append"),
 }
@@ -110,9 +110,7 @@ class ConnectorSmokeTest(unittest.TestCase):
                     try:
                         compile_plan(root, FLINK, os.path.join(root, "plan.json"))
                     except PlanError as e:
-                        # Paimon's factory loaded and accepted the options, then looked for the table
-                        if not (name == "paimon" and "Please create table first" in str(e)):
-                            self.fail(f"{name}: {str(e)[-1500:]}")
+                        self.fail(f"{name}: {str(e)[-1500:]}")
                     finally:
                         if old is None:
                             os.environ.pop("CASCADE_EXTRA_JARS", None)

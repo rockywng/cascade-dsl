@@ -90,11 +90,11 @@ sinks:
         text = """
 pipeline: lake
 connections:
-  lake: {type: paimon, properties: {base_path: "s3://lake"}}
+  lake: {type: paimon, properties: {warehouse: "s3://lake"}}
 sources:
   t:
     connection: lake
-    path: db.db/t
+    table: db.t
     columns: {id: BIGINT NOT NULL, v: BIGINT}
     PK
 models:

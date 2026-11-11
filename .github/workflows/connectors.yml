@@ -32,3 +32,8 @@ jobs:
       - run: pip install pyyaml
       - name: Connectors end to end
         run: python integration/connectors.py ${{ github.event.inputs.only && format('--only {0}', github.event.inputs.only) || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: connector-logs
+          path: integration/.work/connectors/**/job.log

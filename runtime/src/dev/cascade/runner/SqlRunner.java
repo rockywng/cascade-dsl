@@ -128,6 +128,8 @@ public final class SqlRunner {
             Matcher m = SET.matcher(stmt);
             if (Guards.isGuard(stmt)) {
                 continue;
+            } else if (Tables.isEnsure(stmt)) {
+                Tables.ensure(tEnv, stmt);
             } else if (Processes.isDirective(stmt)) {
                 Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
                 processes = true;
@@ -192,7 +194,7 @@ public final class SqlRunner {
         for (String part : text.split("(?m)^" + Pattern.quote(SEPARATOR) + "\\s*$")) {
             String s = part.trim();
             // drop leading comment lines
-            while (s.startsWith("--") && !Processes.isDirective(s) && !Guards.isGuard(s)) {
+            while (s.startsWith("--") && !Processes.isDirective(s) && !Guards.isGuard(s) && !Tables.isEnsure(s)) {
                 int nl = s.indexOf('\n');
                 s = nl < 0 ? "" : s.substring(nl + 1).trim();
             }

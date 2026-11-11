@@ -390,17 +390,32 @@ def _lake_finish(streaming: dict):
     return f
 
 
+def _paimon_finish(role, mode, fmt, opts, ctx):
+    """`table: db.table` in a filesystem warehouse -> the table's path; the runner creates the table
+    (with the declared columns and key) if it doesn't exist (`-- @@ensure-table`, lower.py)."""
+    warehouse = str(opts.pop("__warehouse", "")).rstrip("/")
+    full = opts.pop("__table", None)
+    opts.pop("__table_options", None)
+    if full is not None:
+        parts = str(full).split(".")
+        if len(parts) != 2:
+            return [("CD212", f"table must be '<database>.<table>' (got '{full}')")]
+        opts["path"] = f"{warehouse}/{parts[0]}.db/{parts[1]}"
+    return []
+
+
 register(ConnectorSpec(
     type="paimon", roles={"source", "sink"},
-    doc="Apache Paimon tables by path. The table must exist (create it with a Paimon catalog); keyed tables "
-        "(primary_key) are upsert tables and read as changelogs.",
-    connection={"base_path": Prop("__base_path")},
-    source={"path": Prop("path", required=True)},
-    sink={"path": Prop("path", required=True)},
+    doc="Apache Paimon tables in a filesystem warehouse, created on first use with the declared columns and "
+        "key. Keyed tables (primary_key) are upsert tables and read as changelogs.",
+    connection={"warehouse": Prop("__warehouse", required=True, doc="file://, s3://, hdfs:// ...")},
+    source={"table": Prop("__table", required=True, doc="database.table")},
+    sink={"table": Prop("__table", required=True, doc="database.table"),
+          "table_options": Prop("__table_options", doc="Paimon table options when it is created, e.g. bucket")},
     sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
     # Paimon publishes one jar per Flink minor; 2.1.0 has none for 2.3 yet, and the 2.2 build runs on 2.3
     artifact="org.apache.paimon:paimon-flink-2.2",
-    finish=_lake_finish({}),
+    finish=_paimon_finish,
 ))
 register(ConnectorSpec(
     type="hudi", roles={"source", "sink"},
@@ -436,6 +451,8 @@ register(ConnectorSpec(
     sink={"table": Prop("__table", required=True, doc="database.table")},
     sink_modes={"append", "upsert"}, # Iceberg publishes one runtime jar per Flink minor version, e.g. iceberg-flink-runtime-2.0
     artifact="org.apache.iceberg:iceberg-flink-runtime-{flink_minor}",
+    # the runtime jar expects Hadoop on the classpath (catalogs, FileIO); Flink's image has none
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime"],
     finish=_iceberg_finish,
 ))
 

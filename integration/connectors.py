@@ -134,7 +134,7 @@ class Job:
 
 def _error(text: str) -> str:
     lines = [x for x in text.splitlines() if "Exception" in x or "Error" in x or "Caused by" in x]
-    return "\n".join(lines[:25]) or text[-3000:]
+    return "\n".join(lines[:25] + ["...", *text.splitlines()[-15:]]) if lines else text[-4000:]
 
 
 def converge(what: str, actual, expected, job: Job | None = None, timeout=180):
@@ -387,6 +387,44 @@ sinks:
     converge("hudi: written and read back (100 rows)", lambda: int(results("SELECT count(*) FROM hudi_items")[0][0]), 100)
 
 
+def lake_roundtrip(name: str, conn: str, sink_keys: str, source_keys: str, mode: str = "upsert"):
+    """Write 100 rows (batch), then read them back through the source (batch) into Postgres."""
+    table = name.replace("-", "_")
+    sink_job(name + "-sink", conn, sink_keys, mode=mode).run()
+    pg_table("id BIGINT PRIMARY KEY, name TEXT, qty INT")(table)
+    pk = "\n    primary_key: [id]" if mode == "upsert" else ""
+    Job(name + "-source", f"""
+pipeline: {table}_source
+mode: batch
+connections:
+  src: {conn}{RESULTS}
+sources:
+  items:
+    connection: src
+{source_keys}
+    columns: {{id: BIGINT NOT NULL, name: STRING, qty: INT}}{pk}
+sinks:
+  out: {{from: items, connection: results, table: {table}, mode: upsert, primary_key: [id]}}
+""").run()
+    converge(f"{name}: written and read back (100 rows)", lambda: int(results(f"SELECT count(*) FROM {table}")[0][0]),
+             100)
+
+
+def case_paimon():
+    wh = os.path.join(WORK, "lake", "paimon")
+    shutil.rmtree(wh, ignore_errors=True)
+    # the table doesn't exist yet: the runner creates it from the declared columns and key
+    lake_roundtrip("paimon", f"{{type: paimon, properties: {{warehouse: 'file://{wh}'}}}}",
+                   "table: shop.items, table_options: {bucket: '2'}", "    table: shop.items")
+
+
+def case_iceberg():
+    wh = os.path.join(WORK, "lake", "iceberg")
+    shutil.rmtree(wh, ignore_errors=True)
+    lake_roundtrip("iceberg", f"{{type: iceberg, properties: {{catalog_type: hadoop, warehouse: 'file://{wh}'}}}}",
+                   "table: shop.items", "    table: shop.items", mode="append")
+
+
 def case_delta():
     path = os.path.join(WORK, "lake", "delta_items")
     shutil.rmtree(path, ignore_errors=True)
@@ -453,8 +491,10 @@ sinks:
                 ok(f"{name}: the change made while its history was lost still arrived")
                 return
             time.sleep(3)
+        with open(job.log) as f:
+            log = f.read()
         raise Failed(f"{name}: SILENT DATA LOSS: restored after its change history was lost, the job keeps "
-                     f"running without the change (mirror {mirror()} vs source {truth()})")
+                     f"running without the change (mirror {mirror()} vs source {truth()}). Log:\n{_error(log)}")
     finally:
         job.stop()
 
@@ -503,7 +543,7 @@ def case_sqlserver_cleanup():
 
 CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,
          "elasticsearch": case_elasticsearch, "dynamodb": case_dynamodb, "kinesis": case_kinesis,
-         "hudi": case_hudi, "delta": case_delta, "mysql-binlog-purged": case_mysql_binlog_purge,
+         "hudi": case_hudi, "delta": case_delta, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
          "sqlserver-cleaned-up": case_sqlserver_cleanup}
 
 

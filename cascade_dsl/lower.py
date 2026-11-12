@@ -24,6 +24,7 @@ EXPECT_FN = "CASCADE_EXPECT"
 EXPECT_CLASS = "dev.cascade.runtime.ExpectFunction"
 PROCESS_DIRECTIVE = "-- @@process"  # dev.cascade.runner.Processes.DIRECTIVE
 SLOT_GUARD = "-- @@require-slot"  # dev.cascade.runner.Guards.REQUIRE_SLOT
+ENSURE_TABLE = "-- @@ensure-table"  # dev.cascade.runner.Tables.ENSURE
 SOURCE_IDENTITY_KEYS = {"connector", "topic", "table-name", "schema-name", "database-name", "hostname",
                         "catalog-database", "catalog-table", "path", "slot.name", "properties.group.id"}
 
@@ -152,6 +153,10 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
                              if s.event_time.max_out_of_orderness_ms else f"WATERMARK FOR {et} AS {et}")
         if s.primary_key:
             extra.append(f"PRIMARY KEY ({', '.join(map(q, s.primary_key))}) NOT ENFORCED")
+        ensure = _ensure_table(p, s.connection, s.endpoint, [(col.name, col.type.text) for col in s.columns],
+                               s.primary_key)
+        if ensure:
+            stmts.append(ensure)
         stmts.append(Stmt("source", s.name, comment=f"source: {s.name}" + (f" -- {s.description}" if s.description else ""),
                           columns=[(col.name, col.type.text) for col in s.columns], extra=extra,
                           options=c.options.get(s.name, {})))
@@ -170,6 +175,9 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
             cols = [(col.name, col.type.with_nullable(True).text if col.name not in k.primary_key
                      else col.type.with_nullable(False).text) for col in rel.columns]
             extra = [f"PRIMARY KEY ({', '.join(map(q, k.primary_key))}) NOT ENFORCED"] if k.primary_key else []
+            ensure = _ensure_table(p, k.connection, k.endpoint, cols, k.primary_key)
+            if ensure:
+                stmts.append(ensure)
             stmts.append(Stmt("sink", k.name, comment=f"sink: {k.name} <- {k.from_} ({k.mode})",
                               columns=cols, extra=extra, options=c.options[k.name]))
             select = ", ".join(q(col.name) for col in rel.columns)
@@ -272,6 +280,21 @@ def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
             cols += [("_violated_expectation", "STRING"), ("_quarantined_at", "TIMESTAMP_LTZ(3)")]
             stmts.append(Stmt("quarantine", qname, columns=cols, options=c.options[qname]))
             stmts.append(Stmt("insert", qname, query=f"SELECT *\nFROM {q(qview)}"))
+
+
+def _ensure_table(p, connection: str, endpoint: dict, columns: list, primary_key: list) -> Stmt | None:
+    """`-- @@ensure-table {json}`: a Paimon table is read and written by path, which needs it to exist;
+    the runner (dev.cascade.runner.Tables) creates it in its filesystem warehouse if it doesn't."""
+    import json
+    conn = p.connections.get(connection)
+    if conn is None or conn.type != "paimon" or "table" not in endpoint:
+        return None
+    db, _, table = str(endpoint["table"]).partition(".")
+    spec = {"catalog": {"type": "paimon", "warehouse": str(conn.properties.get("warehouse", ""))},
+            "database": db, "table": table, "columns": [list(c) for c in columns], "primary_key": list(primary_key),
+            "options": {str(k): str(v) for k, v in (endpoint.get("table_options") or {}).items()}}
+    return Stmt("ensure", f"{db}.{table}", f"{ENSURE_TABLE} {json.dumps(spec, sort_keys=True)}",
+                comment=f"create Paimon table {db}.{table} if it doesn't exist")
 
 
 def _slot_guard(c: Checked, s) -> Stmt | None:
@@ -409,6 +432,7 @@ def _manifest(c: Checked, sql: str) -> dict:
             artifacts.add(spec.artifact)
         if spec and spec.extra_artifacts:
             artifacts.update(spec.extra_artifacts(conn.properties))
+    artifacts |= c.extra_artifacts
     scaling = None
     if p.scaling:
         sc = p.scaling

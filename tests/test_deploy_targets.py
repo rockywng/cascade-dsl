@@ -77,7 +77,7 @@ class SessionTargetTest(unittest.TestCase):
 
 class FlinkRunTargetTest(unittest.TestCase):
     def test_run_script(self):
-        for block, want in (("{target: flink-run, run: {jobmanager: 'flink:8081'}}", "run -m flink:8081"),
+        for block, want in (("{target: flink-run, run: {jobmanager: 'flink:8081'}}", "run -m flink:8081 -d"),
                             ("{target: flink-run, run: {mode: yarn-application}}",
                              "run -t yarn-application -Dyarn.ship-files=job")):
             with self.subTest(block=block):

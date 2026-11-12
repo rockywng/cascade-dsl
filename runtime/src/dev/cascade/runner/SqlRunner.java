@@ -53,6 +53,7 @@ public final class SqlRunner {
         String statements = null;
         boolean validate = false;
         boolean await = false;
+        String restore = null;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--setup":
@@ -75,6 +76,9 @@ public final class SqlRunner {
                     break;
                 case "--validate":
                     validate = true;
+                    break;
+                case "--restore": // savepoint or retained checkpoint (what `flink run -s` passes)
+                    restore = args[++i];
                     break;
                 case "--await":
                     await = true; // block until the job finishes (batch runs; local tests)
@@ -100,11 +104,19 @@ public final class SqlRunner {
         }
         EnvironmentSettings.Builder settings = EnvironmentSettings.newInstance();
         StreamExecutionEnvironment senv = StreamExecutionEnvironment.getExecutionEnvironment();
+        if (restore != null) {
+            org.apache.flink.configuration.Configuration rc = new org.apache.flink.configuration.Configuration();
+            rc.set(org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH, restore);
+            senv.configure(rc);
+        }
         if (batch) {
             senv.setRuntimeMode(RuntimeExecutionMode.BATCH);
         }
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(
                 senv, (batch ? settings.inBatchMode() : settings.inStreamingMode()).build());
+        if (restore != null) { // the table planner builds the job from its own configuration too
+            tEnv.getConfig().set(org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH, restore);
+        }
         boolean processes = false;
         boolean restoring = !senv.getConfiguration()
                 .getOptional(org.apache.flink.configuration.StateRecoveryOptions.SAVEPOINT_PATH)
@@ -116,6 +128,8 @@ public final class SqlRunner {
             Matcher m = SET.matcher(stmt);
             if (Guards.isGuard(stmt)) {
                 continue;
+            } else if (Tables.isEnsure(stmt)) {
+                Tables.ensure(tEnv, stmt);
             } else if (Processes.isDirective(stmt)) {
                 Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
                 processes = true;
@@ -180,7 +194,7 @@ public final class SqlRunner {
         for (String part : text.split("(?m)^" + Pattern.quote(SEPARATOR) + "\\s*$")) {
             String s = part.trim();
             // drop leading comment lines
-            while (s.startsWith("--") && !Processes.isDirective(s) && !Guards.isGuard(s)) {
+            while (s.startsWith("--") && !Processes.isDirective(s) && !Guards.isGuard(s) && !Tables.isEnsure(s)) {
                 int nl = s.indexOf('\n');
                 s = nl < 0 ? "" : s.substring(nl + 1).trim();
             }

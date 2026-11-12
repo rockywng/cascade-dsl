@@ -55,11 +55,13 @@ services:
         OPENLINEAGE_JAVA_VERSION: 1.32.0
         OPENLINEAGE_SQL_JAVA_VERSION: 1.32.0
     command: jobmanager
-    ports: ["8081:8081"]
+    ports: ["8081:8081", "9249:9249"]
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         jobmanager.memory.process.size: 1024m
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
         execution.checkpointing.interval: 5s
         execution.checkpointing.dir: file:///flink-data/checkpoints
         execution.checkpointing.savepoint-dir: file:///flink-data/savepoints
@@ -82,9 +84,12 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
         state.backend.type: rocksdb
         taskmanager.numberOfTaskSlots: 4
         taskmanager.memory.process.size: 2048m
+    ports: ["9250:9249"]
     volumes:
       - ./.work/flink-data:/flink-data
     depends_on: [jobmanager]

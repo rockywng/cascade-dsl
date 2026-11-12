@@ -31,7 +31,7 @@ MODEL_KEYS = {"process", "sql", "sql_file", "columns", "expectations", "descript
               "backfill"}
 DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
                "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
-               "jars", "pod_template", "target", "session_cluster", "jar_uri", "run"}
+               "jars", "pod_template", "target", "session_cluster", "jar_uri", "run", "monitoring", "secrets_from"}
 SCALING_KEYS = {"max_parallelism", "parallelism", "min", "max", "target_utilization", "max_lag", "autoscale"}
 
 

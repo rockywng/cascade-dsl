@@ -193,3 +193,46 @@ class ProcessRunnerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(READY, "needs FLINK_HOME and runtime/build.sh")
+class ProcessRestoreTest(unittest.TestCase):
+    """No compiled plan for process models: restore-test runs the whole scripts and restores strictly."""
+
+    def test_restore_test_covers_process_state(self):
+        from cascade_dsl.plans import restore_test
+        d = tempfile.mkdtemp(prefix="cascade-process-restore-")
+        try:
+            old = os.path.join(d, "old")
+            shutil.copytree(EXAMPLE, old)
+            subprocess.run([os.path.join(old, "jobs", "build.sh")], check=True, capture_output=True,
+                           env={**os.environ, "FLINK_HOME": FLINK,
+                                "CASCADE_RUNTIME_JAR": os.path.join(TARGET, "cascade-runtime.jar")})
+            same = os.path.join(d, "config-only")
+            shutil.copytree(old, same)
+            self._edit(same, "config: {gap: PT30M}", "config: {gap: PT45M}")
+            res = restore_test(old, same, FLINK, seconds=4)
+            self.assertTrue(res.get("restored"), res.get("error", "")[-800:])
+            self.assertEqual(res["mode"], "statements")
+            # without the process model its keyed state has nowhere to go: strict restore must refuse
+            gone = os.path.join(d, "without-sessions")
+            shutil.copytree(old, gone)
+            with open(os.path.join(gone, "pipeline.yaml")) as f:
+                text = f.read()
+            head, _, _ = text.partition("models:")
+            with open(os.path.join(gone, "pipeline.yaml"), "w") as f:
+                f.write(head + "sinks:\n  raw: {from: clicks, connection: events, topic: raw_clicks}\n")
+            shutil.rmtree(os.path.join(gone, "tests"))
+            res = restore_test(old, gone, FLINK, seconds=4)
+            self.assertFalse(res.get("restored"))
+        finally:
+            shutil.rmtree(d)
+
+    @staticmethod
+    def _edit(project_dir, old, new):
+        path = os.path.join(project_dir, "pipeline.yaml")
+        with open(path) as f:
+            text = f.read()
+        assert old in text
+        with open(path, "w") as f:
+            f.write(text.replace(old, new))

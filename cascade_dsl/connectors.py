@@ -161,6 +161,18 @@ def _fs_finish(role, mode, fmt, opts, ctx: LowerCtx):
 
 CATALOG: dict[str, ConnectorSpec] = {}
 
+# Published connector jars that don't work as released, and the fix applied to them (by `cascade
+# fetch-jars` locally, and in the Dockerfile `cascade deploy` writes): resource files whose comment
+# lines must go. flink-sql-connector-dynamodb 6.0.x-2.0 shades the AWS SDK with an Apache licence header
+# added to its execution.interceptors file, which the SDK reads line by line as class names: every
+# DynamoDB client creation fails with ClassNotFoundException "# Licensed to the Apache Software
+# Foundation..." (found by integration/connectors.py).
+PATCHES = {
+    "org.apache.flink:flink-sql-connector-dynamodb": [
+        "org/apache/flink/connector/dynamodb/shaded/software/amazon/awssdk/services/dynamodb/execution.interceptors",
+    ],
+}
+
 # Connector versions tested with the Flink version the project targets (2.3). `cascade deploy` uses them
 # when the deploy block's `artifacts:` doesn't pin one. Ones marked "smoke" are checked by planning a job
 # against the real jar (tests/test_connector_smoke.py); the rest also run end to end in integration/.
@@ -177,6 +189,12 @@ TESTED_VERSIONS = {
     "org.apache.flink:flink-connector-jdbc-mysql": "4.1.0-2.2",
     "org.postgresql:postgresql": "42.7.14",
     "com.mysql:mysql-connector-j": "9.5.0",
+    "org.apache.flink:flink-connector-jdbc-sqlserver": "4.1.0-2.2",
+    "org.apache.flink:flink-connector-jdbc-oracle": "4.1.0-2.2",
+    "org.apache.flink:flink-connector-jdbc-db2": "4.1.0-2.2",
+    "com.microsoft.sqlserver:mssql-jdbc": "13.6.2.jre11",
+    "com.oracle.database.jdbc:ojdbc11": "23.26.4.0.0",
+    "com.ibm.db2:jcc": "12.1.5.0",
     "org.apache.hadoop:hadoop-client-api": "3.4.2",
     "org.apache.hadoop:hadoop-client-runtime": "3.4.2",
     "io.openlineage:openlineage-java": "1.32.0",
@@ -186,7 +204,7 @@ TESTED_VERSIONS = {
     "org.apache.flink:flink-sql-connector-elasticsearch7": "4.0.0-2.0",       # smoke
     "org.apache.paimon:paimon-flink-2.2": "2.1.0",                            # smoke
     "org.apache.hudi:hudi-flink2.0-bundle": "1.2.1",                          # smoke
-    "io.delta:delta-flink": "4.3.1",                                          # smoke
+    "commons-logging:commons-logging": "1.4.0",
     "org.apache.iceberg:iceberg-flink-runtime-2.3": "1.12.0",  # needs Hadoop and a catalog: not smoked
 }
 
@@ -311,14 +329,34 @@ register(ConnectorSpec(
 ))
 
 
-def _kinesis_finish(role, mode, fmt, opts, ctx):
+_AWS_CONNECTION = {
+    "region": Prop("aws.region", required=True),
+    "endpoint": Prop("aws.endpoint", doc="override, e.g. a VPC endpoint or a local emulator"),
+    "access_key_id": Prop("__aws_key", secret=True, doc="static credentials (default: the AWS default chain)"),
+    "secret_access_key": Prop("__aws_secret", secret=True),
+}
+
+
+def _aws_finish(role, mode, fmt, opts, ctx):
+    key, secret = opts.pop("__aws_key", None), opts.pop("__aws_secret", None)
+    if key or secret:
+        if not (key and secret):
+            return [("CD209", "access_key_id and secret_access_key go together")]
+        opts["aws.credentials.provider"] = "BASIC"
+        # the SQL option names (the connector maps them to aws.credentials.provider.basic.*)
+        opts["aws.credentials.basic.accesskeyid"] = key
+        opts["aws.credentials.basic.secretkey"] = secret
     return []
+
+
+def _kinesis_finish(role, mode, fmt, opts, ctx):
+    return _aws_finish(role, mode, fmt, opts, ctx)
 
 
 register(ConnectorSpec(
     type="kinesis", roles={"source", "sink"},
     doc="Amazon Kinesis Data Streams (connector 6.x, enhanced fan-out off by default).",
-    connection={"region": Prop("aws.region", required=True)},
+    connection=_AWS_CONNECTION,
     source={"stream_arn": Prop("stream.arn", required=True),
             "startup": Prop("source.init.position", default="latest",
                             values={"earliest": "TRIM_HORIZON", "latest": "LATEST"})},
@@ -327,14 +365,16 @@ register(ConnectorSpec(
     formats=STREAM_FORMATS - CDC_FORMATS | {"debezium-json"}, default_format="json",
     source_changelog="by_format",
     artifact="org.apache.flink:flink-sql-connector-aws-kinesis-streams",
+    finish=_kinesis_finish,
 ))
 register(ConnectorSpec(
     type="dynamodb", roles={"sink"},
     doc="Amazon DynamoDB. Upsert sinks put by primary key and delete on retraction.",
-    connection={"region": Prop("aws.region", required=True)},
+    connection=_AWS_CONNECTION,
     sink={"table": Prop("table-name", required=True)},
     sink_modes={"append", "upsert"},
     artifact="org.apache.flink:flink-sql-connector-dynamodb",
+    finish=_aws_finish,
 ))
 
 
@@ -369,17 +409,35 @@ def _lake_finish(streaming: dict):
     return f
 
 
+def _paimon_finish(role, mode, fmt, opts, ctx):
+    """`table: db.table` in a filesystem warehouse -> the table's path; the runner creates the table
+    (with the declared columns and key) if it doesn't exist (`-- @@ensure-table`, lower.py)."""
+    warehouse = str(opts.pop("__warehouse", "")).rstrip("/")
+    full = opts.pop("__table", None)
+    opts.pop("__table_options", None)
+    if full is not None:
+        parts = str(full).split(".")
+        if len(parts) != 2:
+            return [("CD212", f"table must be '<database>.<table>' (got '{full}')")]
+        opts["path"] = f"{warehouse}/{parts[0]}.db/{parts[1]}"
+    return []
+
+
 register(ConnectorSpec(
     type="paimon", roles={"source", "sink"},
-    doc="Apache Paimon tables by path. The table must exist (create it with a Paimon catalog); keyed tables "
-        "(primary_key) are upsert tables and read as changelogs.",
-    connection={"base_path": Prop("__base_path")},
-    source={"path": Prop("path", required=True)},
-    sink={"path": Prop("path", required=True)},
+    doc="Apache Paimon tables in a filesystem warehouse, created on first use with the declared columns and "
+        "key. Keyed tables (primary_key) are upsert tables and read as changelogs.",
+    connection={"warehouse": Prop("__warehouse", required=True, doc="file://, s3://, hdfs:// ...")},
+    source={"table": Prop("__table", required=True, doc="database.table")},
+    sink={"table": Prop("__table", required=True, doc="database.table"),
+          "table_options": Prop("__table_options", doc="Paimon table options when it is created, e.g. bucket")},
     sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
     # Paimon publishes one jar per Flink minor; 2.1.0 has none for 2.3 yet, and the 2.2 build runs on 2.3
     artifact="org.apache.paimon:paimon-flink-2.2",
-    finish=_lake_finish({}),
+    # Paimon's file IO goes through Hadoop's Configuration even for local and s3:// warehouses
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime",
+                                   "commons-logging:commons-logging"],
+    finish=_paimon_finish,
 ))
 register(ConnectorSpec(
     type="hudi", roles={"source", "sink"},
@@ -390,15 +448,10 @@ register(ConnectorSpec(
           "table_type": Prop("table.type", default="cow", values={"cow": "COPY_ON_WRITE", "mor": "MERGE_ON_READ"})},
     sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
     artifact="org.apache.hudi:hudi-flink2.0-bundle",
-    # the bundle expects Hadoop on the classpath (Configuration, FileSystem); Flink's image has none
-    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime"],
+    # the bundle expects Hadoop (Configuration, FileSystem) and commons-logging on the classpath
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime",
+                                   "commons-logging:commons-logging"],
     finish=_lake_finish({"read.streaming.enabled": "true"}),
-))
-register(ConnectorSpec(
-    type="delta", roles={"sink"},
-    doc="Delta Lake tables (sink only; the Delta connector has no SQL source).",
-    sink={"table_path": Prop("table_path", required=True)},
-    artifact="io.delta:delta-flink",
 ))
 
 register(ConnectorSpec(
@@ -415,6 +468,8 @@ register(ConnectorSpec(
     sink={"table": Prop("__table", required=True, doc="database.table")},
     sink_modes={"append", "upsert"}, # Iceberg publishes one runtime jar per Flink minor version, e.g. iceberg-flink-runtime-2.0
     artifact="org.apache.iceberg:iceberg-flink-runtime-{flink_minor}",
+    # the runtime jar expects Hadoop on the classpath (catalogs, FileIO); Flink's image has none
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime"],
     finish=_iceberg_finish,
 ))
 

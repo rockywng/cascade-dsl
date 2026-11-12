@@ -94,6 +94,11 @@ public final class Main {
                         Integer.parseInt(args[6]), args.length > 8 && "allow".equals(args[8]));
                 outPath = args[7];
                 break;
+            case "restore-test-statements":
+                out = restoreTestStatements(Paths.get(args[1]), Paths.get(args[2]), args[3],
+                        Integer.parseInt(args[4]), args.length > 6 && "allow".equals(args[6]));
+                outPath = args[5];
+                break;
             case "job-graph":
                 out = jobGraph(Paths.get(args[1]), args[2]);
                 outPath = args[3];
@@ -148,6 +153,8 @@ public final class Main {
             Matcher m = SET.matcher(s);
             if (dev.cascade.runner.Guards.isGuard(s)) {
                 continue; // local runs use stand-in sources
+            } else if (dev.cascade.runner.Tables.isEnsure(s)) {
+                dev.cascade.runner.Tables.ensure(tEnv, s); // planning a Paimon table needs it to exist
             } else if (dev.cascade.runner.Processes.isDirective(s)) {
                 dev.cascade.runner.Processes.apply((StreamTableEnvironment) tEnv, s);
             } else if (m.matches()) {
@@ -478,6 +485,77 @@ public final class Main {
             out.put("vertices", vertices);
         } catch (Throwable t) {
             out.put("error", errorMessage(t));
+        }
+        return out;
+    }
+
+    /** Submits a whole script (setup, process directives, inserts) as one job. */
+    private static JobClient submitScript(Configuration conf, Path script) throws Exception {
+        TableEnvironment tEnv = newEnv(conf);
+        List<String> inserts = setup(tEnv, statements(script));
+        org.apache.flink.table.api.bridge.java.StreamStatementSet set =
+                ((StreamTableEnvironment) tEnv).createStatementSet();
+        for (String s : inserts) {
+            set.addInsertSql(s);
+        }
+        set.attachAsDataStream(); // SQL and DataStream (process models) parts as one job
+        StreamExecutionEnvironment env =
+                ((org.apache.flink.table.api.bridge.java.internal.StreamTableEnvironmentImpl) tEnv).execEnv();
+        return env.executeAsync("cascade-restore-test");
+    }
+
+    /** restore-test for pipelines without a compiled plan (process models): whole scripts, strict restore. */
+    private static Map<String, Object> restoreTestStatements(Path oldScript, Path newScript, String spDir,
+                                                             int seconds, boolean allowStateLoss) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        JobClient oldJob = null;
+        JobClient newJob = null;
+        try {
+            oldJob = submitScript(null, oldScript);
+            waitFor(oldJob, JobStatus.RUNNING, 60);
+            Thread.sleep(seconds * 1000L);
+            String savepoint = oldJob.triggerSavepoint(new File(spDir).toURI().toString(), SavepointFormatType.CANONICAL)
+                    .get(120, TimeUnit.SECONDS);
+            out.put("savepoint", savepoint);
+            try {
+                oldJob.cancel().get(30, TimeUnit.SECONDS);
+            } catch (Throwable ignored) {
+                // already gone
+            }
+            oldJob = null;
+            Configuration restore = new Configuration();
+            restore.setString("execution.state-recovery.path", savepoint);
+            restore.setString("execution.state-recovery.ignore-unclaimed-state", String.valueOf(allowStateLoss));
+            newJob = submitScript(restore, newScript);
+            JobStatus status = waitFor(newJob, JobStatus.RUNNING, 60);
+            Thread.sleep(3000);
+            try {
+                status = newJob.getJobStatus().get(10, TimeUnit.SECONDS);
+            } catch (Throwable t) {
+                status = JobStatus.FAILED;
+            }
+            out.put("restored", status == JobStatus.RUNNING);
+            out.put("status", status.toString());
+            if (status != JobStatus.RUNNING) {
+                try {
+                    newJob.getJobExecutionResult().get(30, TimeUnit.SECONDS);
+                } catch (Throwable t) {
+                    out.put("error", errorMessage(t));
+                }
+            }
+        } catch (Throwable t) {
+            out.put("restored", false);
+            out.put("error", errorMessage(t));
+        } finally {
+            for (JobClient c : new JobClient[] {oldJob, newJob}) {
+                if (c != null) {
+                    try {
+                        c.cancel().get(10, TimeUnit.SECONDS);
+                    } catch (Throwable ignored) {
+                        // best effort
+                    }
+                }
+            }
         }
         return out;
     }

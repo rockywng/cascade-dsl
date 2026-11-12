@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 
 import yaml
 
@@ -312,6 +313,41 @@ def phase_v1():
     expect("upsert-kafka sink (customer_ltv, latest per key)", ltv_topic, {"c1": (15.0, 2), "c2": (21.0, 2)})
     expect("append Kafka sink (revenue, enriched via CDC temporal join)", revenue,
            {("10:00", "smb"): (15.0, 2), ("10:00", "enterprise"): (20.0, 1)})
+    check_alert_metrics()
+
+
+def check_alert_metrics():
+    """Every metric the generated alerts and dashboard use must exist on the running job: an alert on a
+    misspelled metric never fires."""
+    if EXEC["fn"] is not exec_compose:
+        return  # the kind run has no reporter ports published
+    sys.path.insert(0, REPO)
+    import urllib.request
+    from cascade_dsl import monitoring
+    from cascade_dsl.compiler import compile_pipeline
+    r = compile_pipeline(os.path.join(REPO, "integration", "pipeline"))
+    cfg = {"monitoring": True, **(r.checked.pipeline.deploy or {})}
+    wanted = monitoring.metric_names(monitoring.rules(r, cfg))
+    wanted |= {m for panel in monitoring.dashboard(r, cfg)["panels"] for t in panel["targets"]
+               for m in re.findall(r"\b(flink_[A-Za-z0-9_]+)", t["expr"])}
+
+    def scraped():
+        names = set()
+        for port in (9249, 9250):
+            with urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=10) as resp:
+                for line in resp.read().decode().splitlines():
+                    if line and not line.startswith("#"):
+                        names.add(re.split(r"[{ ]", line, 1)[0])
+        return names
+    try:
+        names = wait_for("metrics for every alert", lambda: (lambda n: n if wanted <= n else None)(scraped()),
+                         timeout=120, every=5)
+    except Failed:
+        names = scraped()
+    missing = wanted - names
+    if missing:
+        raise Failed(f"alerts/dashboard use metrics the job doesn't report: {sorted(missing)}")
+    ok(f"all {len(wanted)} metrics the generated alerts and dashboard use are reported by the job")
 
 
 def write_v2() -> str:
@@ -477,6 +513,42 @@ def phase_v3(job_id: str):
     check_after_v3()
 
 
+def phase_flink_run():
+    """deploy.target: flink-run against the compose session cluster: the generated run.sh submits with the
+    local Flink client (remote mode: the client runs the job's main and submits the job graph)."""
+    step("flink-run target: run.sh against a running session cluster")
+    d = os.path.join(WORK, "pipeline-flinkrun")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    with open(os.path.join(d, "pipeline.yaml"), "w") as f:
+        f.write("""
+pipeline: flinkrun_probe
+deploy: {target: flink-run, run: {jobmanager: "localhost:8081"}, monitoring: true}
+sources:
+  gen: {connection: datagen, rows_per_second: 5, columns: {k: INT, v: STRING}}
+models:
+  m: {sql: "SELECT k, UPPER(v) AS v FROM gen"}
+sinks:
+  out: {from: m, connection: blackhole}
+""")
+    out = os.path.join(WORK, "deploy-flinkrun")
+    cascade("deploy", os.path.relpath(d, REPO), "-o", out, flink=False)
+    for f in ("run.sh", "job/setup.sql", "job/statements.sql", "monitoring/alerts.yml", "monitoring/dashboard.json"):
+        if not os.path.exists(os.path.join(out, f)):
+            raise Failed(f"flink-run deploy did not write {f}")
+    run([os.path.join(out, "run.sh")],
+        env={"FLINK_HOME": FLINK_HOME, "CASCADE_RUNTIME_JAR": os.path.join(REPO, "runtime", "target",
+                                                                            "cascade-runtime.jar")})
+
+    def probe():
+        with urllib.request.urlopen("http://localhost:8081/jobs/overview", timeout=10) as resp:
+            jobs = json.loads(resp.read())["jobs"]
+        return next((j for j in jobs if j["name"] == "flinkrun_probe" and j["state"] == "RUNNING"), None)
+    job = wait_for("the run.sh job RUNNING", probe, timeout=120, every=3)
+    ok(f"run.sh submitted flinkrun_probe ({job['jid'][:8]}) to the session cluster: RUNNING")
+    flink_cli("cancel", job["jid"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="leave the stack running")
@@ -489,6 +561,7 @@ def main():
         phase_v1()
         phase_upgrade(running_jobs()[0])
         phase_v3(running_jobs()[0])
+        phase_flink_run()
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0
     except Failed as e:

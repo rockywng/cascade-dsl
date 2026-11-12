@@ -59,10 +59,16 @@ Durations: `500ms`, `5s`, `10m`, `1h`, `7d`.
 `mode: batch` (top level; the default is `streaming`) runs the pipeline once over bounded inputs and
 finishes. Use it for nightly recomputes and one-off reprocessing.
 
-- **Sources are read as a bounded snapshot.** Kafka reads up to the latest offset at start
-  (`scan.bounded.mode`), CDC sources take a snapshot (`scan.startup.mode: snapshot`), and Iceberg and
-  Hudi do a one-off read. Filesystem, JDBC and Paimon are bounded already. Datagen needs
-  `number_of_rows`. Kinesis can't be bounded (CD120). For `custom` connectors, your options decide.
+- **Sources are read as a bounded snapshot.**
+  - **Kafka** reads up to the latest offset at start (`scan.bounded.mode`).
+  - **Iceberg and Hudi** do a one-off read.
+  - **Filesystem, JDBC and Paimon** are bounded already.
+  - **Datagen** needs `number_of_rows`, even with `sequence` fields.
+  - **Relational CDC sources** (Postgres, MySQL, SQL Server, Oracle, Db2) are read with a JDBC scan of
+    the same table. Every CDC connector declares a changelog even in snapshot mode, and Flink's batch
+    planner rejects that; the connector tests found it.
+  - **MongoDB CDC and Kinesis** have no bounded read (CD120).
+  - **`custom` connectors:** your options decide.
 - **Results are final.** Every model emits each result once, so a `GROUP BY` can write to an append
   sink, and no state TTL is needed.
 - **Streaming-only features are errors.** Temporal joins (CD121) and `backfill` (CD122): a batch
@@ -97,8 +103,8 @@ modes. Zero-config connectors (`datagen`, `print`, `blackhole`) can be used dire
 | `kinesis` | ✓ | append | `stream_arn`; `region` on the connection |
 | `dynamodb` | — | append, upsert | upserts put by key and delete on retraction |
 | `elasticsearch` | — | append, upsert | Elasticsearch 7 API (also OpenSearch 1.x); key = document id |
-| `paimon`, `hudi` | ✓ (changelog when keyed) | append, upsert | `path` under the connection's `base_path`; Paimon tables must exist |
-| `delta` | — | append | `table_path` |
+| `paimon` | ✓ (changelog when keyed) | append, upsert | `table: db.table` in the connection's `warehouse`; created on first use from the declared columns and key (`table_options` on the sink) |
+| `hudi` | ✓ (changelog when keyed) | append, upsert | `path` under the connection's `base_path` |
 | `custom` | ✓ | as declared | any Flink SQL connector, see below |
 | `datagen` / `print` / `blackhole` | dev | dev | |
 
@@ -167,8 +173,21 @@ SQL client skips them.
 
 Every connector's jar version defaults to the one tested with Flink 2.3 (`TESTED_VERSIONS` in
 `cascade_dsl/connectors.py`). `deploy.artifacts` overrides it. `tests/test_connector_smoke.py`
-plans a job against each real jar, which checks option names and binary compatibility. Kafka,
-Postgres CDC and JDBC also run end to end in `integration/`.
+plans a job against each real jar, which checks option names and binary compatibility.
+
+`integration/connectors.py` (workflow `connectors`) runs the rest end to end, against real systems or
+their official emulators:
+- **CDC sources (Postgres, MySQL, SQL Server, MongoDB):** the snapshot, then live inserts, updates and
+  deletes, mirrored exactly into Postgres, plus the batch read.
+- **Sinks (Elasticsearch, DynamoDB, Kinesis, Hudi, Paimon, Iceberg):** rows land. Kinesis, Hudi,
+  Paimon and Iceberg are also read back through their sources.
+- **Lost change history:**
+  - **A purged MySQL binlog:** the source fails loudly, and the job restarts until it's fixed.
+  - **A cleaned-up SQL Server change table:** the change still arrived.
+  - **Postgres:** see the next section.
+
+Kafka, Postgres CDC and JDBC also run in `integration/run.py`. Oracle and Db2 CDC are only planned
+against their jars; their images need licences and minutes of setup.
 
 `cascade fetch-jars <project>` downloads a pipeline's connector jars into `~/.cache/cascade/jars`.
 It prints a `CASCADE_EXTRA_JARS=...` line; with that set, `cascade plan`, `test` and `verify` work
@@ -197,7 +216,9 @@ through as a raw `WITH` option. Keys that look like credentials must be `${secre
 **Not in the catalog, because no Flink 2.x release exists** (checked on Maven Central in November
 2026): Pulsar, Google Pub/Sub, HBase, MongoDB (non-CDC), OpenSearch 2. **ClickHouse** publishes a
 2.x jar with no SQL factory (DataStream only); use a [process model](#process-models) for it.
-**Redis** has no Apache connector at all. Any of them works as `type: custom` once a 2.x-compatible
+**Redis** has no Apache connector at all. **Delta**'s Flink connector (4.x) ships no self-contained
+jar: it needs Delta Kernel, Parquet, Hadoop and the Unity Catalog client, about 30 jars by transitive
+resolution. The end-to-end test found this, so it's `type: custom` with those artifacts listed. Any of them works as `type: custom` once a 2.x-compatible
 build exists.
 
 ## Sources
@@ -267,6 +288,15 @@ Connection, columns and format can't be set on such a source (CD005). Other erro
 This is also how to **split a pipeline into several jobs**: one project per job, joined through
 sinks. One pipeline always compiles to one job; splitting it inside a project would compute
 shared models twice, or need a hidden topic between the jobs.
+
+Across projects:
+- **`cascade lineage <root>`** prints which pipeline reads which sink, for every project under
+  `<root>`, as a Mermaid graph.
+- **`cascade impact <project> --root <root>`** recompiles every project that reads this project's
+  sinks, transitively, and fails if any no longer compiles. Run it in the upstream project's CI to
+  catch a breaking sink change before it ships. With `--verify` (needs `FLINK_HOME`), each reader is
+  also planned by Flink, which catches what static analysis can't, such as a renamed column used only
+  in a `WHERE`.
 
 Kafka sources can also read any compacted topic as a table with `changelog: upsert` (needs a
 `primary_key`).
@@ -415,6 +445,10 @@ Limits:
   may not, so check it with `restore-test`.
 - **The model's own state is yours.** `check-upgrade` sees a process model only as a whole
   (CD140). Use `ctx.uid(...)` on stateful operators, and change state in a compatible way.
+- **`cascade restore-test old/ new/` still works.** For these pipelines it runs the whole scripts:
+  the old version on stand-in connectors, a savepoint, then the new version restored strictly. That
+  checks every operator, including the process model's own state. For example, a changed `config`
+  restores, and a removed process model is refused.
 
 ## Functions
 
@@ -747,6 +781,31 @@ Secret. At startup the runner substitutes the value into the SQL, escaped for a 
 and fails listing every missing secret. Secrets aren't allowed in `deploy:` settings (CD530),
 since only the job's SQL is substituted. `SqlRunner ... --validate` plans the job without
 submitting it.
+
+### Monitoring
+
+```yaml
+deploy:
+  monitoring:
+    alerts: {max_backpressure_ms: 500, max_pending_records: 100000, max_violation_ratio: 0.01}
+    labels: {team: data}            # added to every alert
+```
+
+`monitoring` (or `monitoring: true`) turns on Flink's Prometheus reporter (port 9249, named `metrics`)
+and writes `monitoring/alerts.yml` (a Prometheus rule file) and `monitoring/dashboard.json` (Grafana).
+For the Kubernetes target it also writes a PodMonitor, a PrometheusRule, and a dashboard ConfigMap
+with the `grafana_dashboard` label, all in the kustomization.
+
+The alerts follow the pipeline:
+- **Always:** the job down or restarting; checkpoints failing, or none completed for five intervals;
+  sustained backpressure.
+- **With Kafka sources:** records pending.
+- **With event time:** event time not advancing for 15 minutes, so windows stop closing.
+- **With `drop` or `quarantine` expectations:** the violation ratio per model and expectation (from
+  cascade's expectation counters).
+
+The integration run scrapes the running job and fails if any metric an alert or panel uses isn't
+reported. An alert on a misspelled metric would never fire.
 
 ### Other targets
 

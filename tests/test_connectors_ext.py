@@ -90,11 +90,11 @@ sinks:
         text = """
 pipeline: lake
 connections:
-  lake: {type: paimon, properties: {base_path: "s3://lake"}}
+  lake: {type: paimon, properties: {warehouse: "s3://lake"}}
 sources:
   t:
     connection: lake
-    path: db.db/t
+    table: db.t
     columns: {id: BIGINT NOT NULL, v: BIGINT}
     PK
 models:
@@ -167,5 +167,39 @@ sinks:
         self.assertEqual(compiled(self.PIPE.replace("POLICY", "")).checked.options["t"]["connector"], "postgres-cdc")
         r = compiled("mode: batch\n" + self.PIPE.replace("POLICY", ", on_slot_loss: resnapshot"))
         self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
-        self.assertEqual(r.checked.options["t"]["connector"], "postgres-cdc")
+        self.assertEqual(r.checked.options["t"]["connector"], "jdbc")  # batch reads the table with JDBC
         self.assertNotIn("delegate", r.checked.options["t"])
+
+
+class PatchedJarsTest(unittest.TestCase):
+    def test_dynamodb_jar_is_fixed_locally_and_in_the_image(self):
+        import zipfile
+        from cascade_dsl import deploy, jars
+        from cascade_dsl.connectors import PATCHES
+        d = tempfile.mkdtemp()
+        try:
+            src = os.path.join(d, "x.jar")
+            res = PATCHES["org.apache.flink:flink-sql-connector-dynamodb"][0]
+            with zipfile.ZipFile(src, "w") as z:
+                z.writestr(res, "# Licensed to the ASF\n# more\nsoftware.amazon.Foo\n")
+                z.writestr("other.txt", "# keep\n")
+            out = jars.patch(src, [res])
+            with zipfile.ZipFile(out) as z:
+                self.assertEqual(z.read(res), b"software.amazon.Foo\n")
+                self.assertEqual(z.read("other.txt"), b"# keep\n")
+        finally:
+            shutil.rmtree(d)
+        r = compiled("""
+pipeline: p
+connections:
+  dst: {type: dynamodb, properties: {region: us-east-1}}
+sources:
+  gen: {connection: datagen, columns: {id: BIGINT NOT NULL}}
+sinks:
+  out: {from: gen, connection: dst, mode: upsert, primary_key: [id], table: items}
+""")
+        df = deploy.dockerfile(r, {})
+        self.assertIn("FROM eclipse-temurin:17-jdk AS cascade-patches", df)
+        self.assertIn("COPY --from=cascade-patches /patches/flink-sql-connector-dynamodb-", df)
+        self.assertNotIn("wget -q -P /opt/flink/lib \"https://repo1.maven.org/maven2/org/apache/flink/"
+                         "flink-sql-connector-dynamodb", df)

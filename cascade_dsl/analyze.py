@@ -35,6 +35,7 @@ class Checked:
     implicit_connections: set[str] = field(default_factory=set)
     inferred: dict[str, list | None] = field(default_factory=dict)  # model -> columns before contract
     settings: dict[str, str] = field(default_factory=dict)  # job-wide SETs derived by the compiler
+    extra_artifacts: set = field(default_factory=set)  # jars needed beyond the connections' own
 
 
 def _suggest(name, candidates) -> str | None:
@@ -774,13 +775,36 @@ def _check_pipeline(c: Checked):
 # how each catalog connector reads a bounded snapshot; None = can't be bounded
 BATCH_SOURCE = {
     "kafka": {"scan.bounded.mode": "latest-offset"},   # everything in the topic when the job starts
-    "postgres-cdc": {"scan.startup.mode": "snapshot"}, "mysql-cdc": {"scan.startup.mode": "snapshot"},
-    "oracle-cdc": {"scan.startup.mode": "snapshot"}, "sqlserver-cdc": {"scan.startup.mode": "snapshot"},
-    "db2-cdc": {"scan.startup.mode": "snapshot"}, "mongodb-cdc": {"scan.startup.mode": "snapshot"},
+    # CDC sources declare a changelog even when reading a snapshot, which Flink's batch planner rejects
+    # (integration/connectors.py, every CDC connector). Relational ones are read with a JDBC scan of the
+    # same table instead (_cdc_as_jdbc); MongoDB has no SQL batch read.
+    "mongodb-cdc": None,
     "iceberg": {"streaming": "false"}, "hudi": {"read.streaming.enabled": "false"},
     "paimon": {}, "filesystem": {}, "jdbc": {}, "datagen": {},
     "kinesis": None,
 }
+
+
+def _cdc_as_jdbc(connector: str, opts: dict) -> dict | None:
+    """The bounded read of a relational CDC source: a JDBC scan of the same table."""
+    host, port = opts.get("hostname"), opts.get("port")
+    db, table = opts.get("database-name"), opts.get("table-name")
+    if connector == "postgres-cdc":
+        url, table = f"jdbc:postgresql://{host}:{port or 5432}/{db}", f"{opts.get('schema-name')}.{table}"
+    elif connector == "mysql-cdc":
+        url = f"jdbc:mysql://{host}:{port or 3306}/{db}"
+    elif connector == "sqlserver-cdc":
+        url = f"jdbc:sqlserver://{host}:{port or 1433};databaseName={db};encrypt=false"
+    elif connector == "oracle-cdc":
+        url, table = f"jdbc:oracle:thin:@{host}:{port or 1521}/{db}", f"{opts.get('schema-name')}.{table}"
+    elif connector == "db2-cdc":
+        url = f"jdbc:db2://{host}:{port or 50000}/{db}"
+    else:
+        return None
+    out = {"connector": "jdbc", "url": url, "table-name": table, "username": opts.get("username", "")}
+    if opts.get("password") is not None:
+        out["password"] = opts["password"]
+    return out
 
 
 def _check_batch(c: Checked):
@@ -799,14 +823,21 @@ def _check_batch(c: Checked):
             continue  # the user's options decide boundedness
         if connector == "cascade-healing-cdc":  # a batch run has no slot to lose
             connector = opts["connector"] = opts.pop("delegate")
+        jdbc = _cdc_as_jdbc(connector, opts)
+        if jdbc is not None:
+            opts.clear()
+            opts.update(jdbc)
+            from .connectors import _jdbc_artifacts
+            c.extra_artifacts |= {"org.apache.flink:flink-connector-jdbc-core", *_jdbc_artifacts(jdbc["url"])}
+            continue
         bounded = BATCH_SOURCE.get(connector, {})
         if bounded is None:
-            d.error("CD120", f"source '{s.name}': connector '{connector}' has no bounded read, so it can't be "
-                    "used in a batch pipeline", s.loc, node=s.name)
+            d.error("CD120", f"source '{s.name}': connector '{connector}' has no bounded read Flink's batch mode "
+                    "accepts, so it can't be used in a batch pipeline", s.loc, node=s.name)
             continue
         for k, v in bounded.items():
             opts[k] = v
-        if connector == "datagen" and "number-of-rows" not in opts:
+        if connector == "datagen" and "number-of-rows" not in opts:  # even with sequence fields (Flink 2.3)
             d.error("CD120", f"source '{s.name}': datagen in a batch pipeline needs number_of_rows", s.loc,
                     node=s.name)
         if connector == "upsert-kafka" and "scan.bounded.mode" in opts:

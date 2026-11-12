@@ -43,6 +43,8 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
     out: list[Stmt] = []
     py = _python_executable() if any(f.language == "python" for f in p.functions.values()) else None
     for st in lowered.statements:
+        if mode == "test" and st.kind == "ensure":
+            continue  # fixtures stand in for the table
         if mode == "test" and st.kind == "set" and st.name == "execution.runtime-mode":
             continue  # fixtures are streams; for bounded inputs a streaming run ends with the same results
         if py and st.kind == "set" and st.name == "python.files":

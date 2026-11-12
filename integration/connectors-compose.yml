@@ -1,0 +1,35 @@
+# Systems for integration/connectors.py: one per catalog connector that isn't covered by the main
+# integration stack. Own project name and ports, so it runs beside docker-compose.yml.
+name: cascade-conn
+services:
+  mysql:
+    image: mysql:8.4
+    environment: {MYSQL_ROOT_PASSWORD: pw, MYSQL_DATABASE: app}
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--gtid-mode=ON",
+              "--enforce-gtid-consistency=ON"]
+    ports: ["13306:3306"]
+    healthcheck: {test: ["CMD", "mysqladmin", "ping", "-ppw"], interval: 3s, retries: 60}
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment: {ACCEPT_EULA: "Y", MSSQL_SA_PASSWORD: "Cascade-pw1", MSSQL_AGENT_ENABLED: "true"}
+    ports: ["11433:1433"]
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27018:27017"]
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.29
+    environment: {discovery.type: single-node, xpack.security.enabled: "false", ES_JAVA_OPTS: "-Xms512m -Xmx512m"}
+    ports: ["19200:9200"]
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    ports: ["18000:8000"]
+  kinesis:
+    image: ghcr.io/etspaceman/kinesis-mock:0.4.13
+    environment: {KINESIS_MOCK_PLAIN_PORT: "4568", INITIALIZE_STREAMS: "orders:1,out:1", LOG_LEVEL: WARN}
+    ports: ["14568:4568"]
+  postgres:   # where sources' results land, to be compared; also a CDC source (database app)
+    image: postgres:17
+    environment: {POSTGRES_PASSWORD: pw, POSTGRES_DB: results}
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
+    ports: ["15432:5432"]

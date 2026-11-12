@@ -6,7 +6,9 @@ from __future__ import annotations
 import os
 import urllib.request
 
-from .connectors import TESTED_VERSIONS
+import zipfile
+
+from .connectors import PATCHES, TESTED_VERSIONS
 
 MAVEN = os.environ.get("CASCADE_MAVEN", "https://repo1.maven.org/maven2")
 CACHE = os.environ.get("CASCADE_JAR_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "cascade", "jars"))
@@ -44,5 +46,25 @@ def fetch(coords, flink_minor: str, versions: dict | None = None, cache: str = C
             except OSError as e:
                 raise FetchError(f"downloading {url}: {e}") from e
             os.replace(tmp, path)
+        fixes = PATCHES.get(f"{group}:{artifact}")
+        if fixes:
+            path = patch(path, fixes)
         paths.append(path)
     return paths
+
+
+def patch(path: str, resources: list[str]) -> str:
+    """A copy of the jar with comment lines removed from the given resource files (connectors.PATCHES)."""
+    out = path[:-4] + "-cascade-patched.jar"
+    if os.path.exists(out):
+        return out
+    tmp = out + ".part"
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename in resources:
+                data = b"".join(line for line in data.splitlines(keepends=True)
+                                if not line.lstrip().startswith(b"#"))
+            dst.writestr(info, data)
+    os.replace(tmp, out)
+    return out

@@ -24,7 +24,7 @@ import yaml
 
 from . import __version__
 from .compiler import Result
-from .connectors import TESTED_VERSIONS
+from .connectors import PATCHES, TESTED_VERSIONS
 from .jvm import script
 from .lower import Stmt
 from .udfs import python_files, python_functions
@@ -177,9 +177,21 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
 
     write("configmap.yaml", _dump(configmap))
     write("flinkdeployment.yaml", _dump(deployment))
-    if secrets:
+    store = cfg.get("secrets_from")
+    if secrets and store:
+        # External Secrets Operator: the Secret is synced from Vault / AWS Secrets Manager / GCP ...
+        es = _external_secret(store, secret_name, secrets, meta)
+        write("externalsecret.yaml", _dump(es))
+        kustomization["resources"].append("externalsecret.yaml")
+    elif secrets:
         write("secret.template.yaml", "# Fill in and apply separately (or create it from your secret manager).\n"
               "# Never commit real values.\n" + _dump(secret))
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        for fname, doc in monitoring.kubernetes(r, cfg, name, meta).items():
+            write(fname, _dump(doc))
+            kustomization["resources"].append(fname)
+        _monitoring_files(r, cfg, out)
     write("kustomization.yaml", _dump(kustomization))
     write("Dockerfile", dockerfile(r, cfg))
     return {"name": name, "mode": mode, "secrets": secrets, "secret_name": secret_name, "out": out}
@@ -214,6 +226,41 @@ def _job_args(files: dict, mode: str, inline: bool) -> list[str]:
     return ["--setup", "job/setup.sql", f"--{second}", f"job/{fname}"]
 
 
+def _external_secret(store: dict, secret_name: str, secrets: list, meta) -> dict:
+    """An ExternalSecret (external-secrets.io) that fills the job's Secret from a secret store.
+
+    deploy.secrets_from: {store: vault-backend, kind: ClusterSecretStore, prefix: "pipelines/orders/",
+                          refresh: 1h}
+    Each `${secret:a/b}` is read from remote key `<prefix>a/b` (property: the last path segment when
+    `property_from_key: true`)."""
+    if not isinstance(store, dict) or not store.get("store"):
+        raise DeployError("deploy.secrets_from needs `store` (the name of a SecretStore or ClusterSecretStore)")
+    prefix = str(store.get("prefix", ""))
+    data = []
+    for s in secrets:
+        ref = {"key": prefix + s}
+        if store.get("property_from_key"):
+            path, _, prop = s.rpartition("/")
+            ref = {"key": prefix + path, "property": prop}
+        data.append({"secretKey": secret_key(s), "remoteRef": ref})
+    return {"apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret", "metadata": meta(secret_name),
+            "spec": {"refreshInterval": str(store.get("refresh", "1h")),
+                     "secretStoreRef": {"name": str(store["store"]), "kind": str(store.get("kind", "SecretStore"))},
+                     "target": {"name": secret_name, "creationPolicy": "Owner"},
+                     "data": data}}
+
+
+def _monitoring_files(r: Result, cfg: dict, out: str):
+    """Plain Prometheus rule file and Grafana dashboard JSON, for any target."""
+    from . import monitoring
+    d = os.path.join(out, "monitoring")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "alerts.yml"), "w") as f:
+        f.write(_dump(monitoring.rules(r, cfg)))
+    with open(os.path.join(d, "dashboard.json"), "w") as f:
+        json.dump(monitoring.dashboard(r, cfg), f, indent=1)
+
+
 def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mode: str, secrets: list,
                  cfg: dict) -> dict:
     """A FlinkSessionJob on an existing (operator-managed) session cluster."""
@@ -243,6 +290,9 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
     }
     with open(os.path.join(out, "flinksessionjob.yaml"), "w") as f:
         f.write(_dump(job))
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        _monitoring_files(r, cfg, out)
     notes = ["# Session cluster requirements for this job (it shares the cluster's image and pods):",
              "#   connector jars: " + (", ".join(sorted(r.lowered.manifest["artifacts"])) or "none"),
              "#   secrets as environment variables on the JobManager and TaskManagers: "
@@ -299,9 +349,9 @@ def _flink_run(r: Result, out: str, files: dict, mode: str, secrets: list, cfg: 
         with open(os.path.join(job, fname), "w") as f:
             f.write(text)
     args = " ".join(_job_args(files, mode, inline=False))
-    opts = [f"-D{k}={v}" for k, v in sorted((cfg.get("flink_config") or {}).items())]
+    opts = ["-d"] + [f"-D{k}={v}" for k, v in sorted((cfg.get("flink_config") or {}).items())]  # detached
     if how == "yarn-application":
-        opts = ["-t yarn-application", "-Dyarn.ship-files=job"] + opts
+        opts = ["-t yarn-application", "-Dyarn.ship-files=job"] + opts[1:]  # application mode is detached
     elif run.get("jobmanager"):
         opts = [f"-m {run['jobmanager']}"] + opts
     lines = ["#!/usr/bin/env bash",
@@ -316,6 +366,9 @@ def _flink_run(r: Result, out: str, files: dict, mode: str, secrets: list, cfg: 
              ': "${FLINK_HOME:?set FLINK_HOME}"',
              ': "${CASCADE_RUNTIME_JAR:?set CASCADE_RUNTIME_JAR to cascade-runtime.jar}"',
              f'exec "$FLINK_HOME/bin/flink" run {" ".join(opts)} -c {RUNNER} "$CASCADE_RUNTIME_JAR" {args} "$@"'.replace("  ", " ")]
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        _monitoring_files(r, cfg, out)
     path = os.path.join(out, "run.sh")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -433,6 +486,9 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
     if python_functions(p):
         conf["python.executable"] = PYFLINK_PYTHON
         conf["python.client.executable"] = PYFLINK_PYTHON
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        conf.update(monitoring.REPORTER)
     conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
 
     jm = cfg.get("jobmanager") or {}
@@ -440,6 +496,8 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
            for s in sorted(p.secrets)]
     container = {"name": "flink-main-container",
                  "volumeMounts": [{"name": "cascade-job", "mountPath": JOB_DIR, "readOnly": True}]}
+    if monitoring.enabled(cfg):
+        container["ports"] = [{"name": "metrics", "containerPort": monitoring.METRICS_PORT}]
     volumes = [{"name": "cascade-job", "configMap": {"name": job_cm}}]
     if python_functions(p):
         container["volumeMounts"].append({"name": "cascade-python", "mountPath": PYTHON_DIR, "readOnly": True})
@@ -495,9 +553,29 @@ def dockerfile(r: Result, cfg: dict) -> str:
              "#   docker build -f <this file> --build-arg ... -t <image> .",
              "# On the platform, BASE is the Cascade Flink distribution (cascade-dataplane images/flink),",
              "# which adds the S3 filesystems that checkpoints and savepoints on s3:// need.",
-             f"ARG BASE=flink:{flink}-scala_2.12-java17",
-             "FROM ${BASE}", ""]
+             f"ARG BASE=flink:{flink}-scala_2.12-java17"]
     flink_minor = ".".join(flink.split(".")[:2])
+    patched = {}  # coord -> (arg, default, jar file name)
+    for coord in r.lowered.manifest["artifacts"]:
+        coord = coord.format(flink_minor=flink_minor)
+        group, artifact = coord.split(":")[:2]
+        if f"{group}:{artifact}" in PATCHES:
+            arg = re.sub(r"[^A-Z0-9]", "_", artifact.upper()) + "_VERSION"
+            default = versions.get(f"{group}:{artifact}") or TESTED_VERSIONS.get(f"{group}:{artifact}")
+            patched[f"{group}:{artifact}"] = (arg, default)
+    if patched:
+        # a JDK stage fixes connector jars that are broken as released (connectors.PATCHES)
+        lines += ["", "FROM eclipse-temurin:17-jdk AS cascade-patches", "WORKDIR /patches"]
+        for coord, (arg, default) in patched.items():
+            group, artifact = coord.split(":")
+            lines.append(f"ARG {arg}" + (f"={default}" if default else ""))
+            url = (f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}/${{{arg}}}/"
+                   f"{artifact}-${{{arg}}}.jar")
+            jar = f"{artifact}-${{{arg}}}.jar"
+            lines.append(f'ADD "{url}" /patches/')
+            for res in PATCHES[coord]:
+                lines.append(f"RUN jar xf {jar} {res} && sed -i '/^#/d' {res} && jar uf {jar} {res}")
+    lines += ["", "FROM ${BASE}", ""]
     for coord in r.lowered.manifest["artifacts"]:
         coord = coord.format(flink_minor=flink_minor)
         group, artifact = coord.split(":")[:2]
@@ -507,6 +585,9 @@ def dockerfile(r: Result, cfg: dict) -> str:
         default = pinned or versions.get(coord) or TESTED_VERSIONS.get(coord)
         lines.append(f"# {coord}" + ("" if default else f" (pass --build-arg {arg}=<version>)"))
         lines.append(f"ARG {arg}" + (f"={default}" if default else ""))
+        if coord in patched:
+            lines.append(f"COPY --from=cascade-patches /patches/{artifact}-${{{arg}}}.jar /opt/flink/lib/")
+            continue
         url = (f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}/${{{arg}}}/"
                f"{artifact}-${{{arg}}}.jar")
         lines.append(f'RUN test -n "${{{arg}}}" && wget -q -P /opt/flink/lib "{url}"')

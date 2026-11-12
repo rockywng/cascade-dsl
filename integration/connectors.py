@@ -128,12 +128,16 @@ class Job:
     def check_alive(self):
         if self.proc is not None and self.proc.poll() is not None:
             with open(self.log) as f:
-                raise Failed(f"streaming job in {self.dir} exited:\n{_error(f.read())}")
+                raise JobDied(f"streaming job in {self.dir} exited:\n{_error(f.read())}")
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait(30)
+
+
+class JobDied(Exception):
+    """Not a Failed: wait_for must not keep waiting for a job that is gone."""
 
 
 def _error(text: str) -> str:
@@ -358,7 +362,8 @@ sources:
     startup: earliest
     columns: {{id: BIGINT NOT NULL, name: STRING, qty: INT}}
 sinks:
-  out: {{from: orders, connection: results, table: kinesis_items, mode: upsert, primary_key: [id]}}
+  out: {{from: orders, connection: results, table: kinesis_items, mode: upsert, primary_key: [id],
+         on_conflict: deduplicate}}
 """)
     job.start()
     try:
@@ -588,7 +593,7 @@ def main():
             step(n)
             try:
                 CASES[n]()
-            except Failed as e:
+            except (Failed, JobDied) as e:
                 print(f"   FAIL {n}: {e}", flush=True)
                 failed.append(n)
     finally:

@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 
 import yaml
 
@@ -512,6 +513,42 @@ def phase_v3(job_id: str):
     check_after_v3()
 
 
+def phase_flink_run():
+    """deploy.target: flink-run against the compose session cluster: the generated run.sh submits with the
+    local Flink client (remote mode: the client runs the job's main and submits the job graph)."""
+    step("flink-run target: run.sh against a running session cluster")
+    d = os.path.join(WORK, "pipeline-flinkrun")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    with open(os.path.join(d, "pipeline.yaml"), "w") as f:
+        f.write("""
+pipeline: flinkrun_probe
+deploy: {target: flink-run, run: {jobmanager: "localhost:8081"}, monitoring: true}
+sources:
+  gen: {connection: datagen, rows_per_second: 5, columns: {k: INT, v: STRING}}
+models:
+  m: {sql: "SELECT k, UPPER(v) AS v FROM gen"}
+sinks:
+  out: {from: m, connection: blackhole}
+""")
+    out = os.path.join(WORK, "deploy-flinkrun")
+    cascade("deploy", os.path.relpath(d, REPO), "-o", out, flink=False)
+    for f in ("run.sh", "job/setup.sql", "job/statements.sql", "monitoring/alerts.yml", "monitoring/dashboard.json"):
+        if not os.path.exists(os.path.join(out, f)):
+            raise Failed(f"flink-run deploy did not write {f}")
+    run([os.path.join(out, "run.sh")],
+        env={"FLINK_HOME": FLINK_HOME, "CASCADE_RUNTIME_JAR": os.path.join(REPO, "runtime", "target",
+                                                                            "cascade-runtime.jar")})
+
+    def probe():
+        with urllib.request.urlopen("http://localhost:8081/jobs/overview", timeout=10) as resp:
+            jobs = json.loads(resp.read())["jobs"]
+        return next((j for j in jobs if j["name"] == "flinkrun_probe" and j["state"] == "RUNNING"), None)
+    job = wait_for("the run.sh job RUNNING", probe, timeout=120, every=3)
+    ok(f"run.sh submitted flinkrun_probe ({job['jid'][:8]}) to the session cluster: RUNNING")
+    flink_cli("cancel", job["jid"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="leave the stack running")
@@ -524,6 +561,7 @@ def main():
         phase_v1()
         phase_upgrade(running_jobs()[0])
         phase_v3(running_jobs()[0])
+        phase_flink_run()
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0
     except Failed as e:

@@ -161,6 +161,18 @@ def _fs_finish(role, mode, fmt, opts, ctx: LowerCtx):
 
 CATALOG: dict[str, ConnectorSpec] = {}
 
+# Published connector jars that don't work as released, and the fix applied to them (by `cascade
+# fetch-jars` locally, and in the Dockerfile `cascade deploy` writes): resource files whose comment
+# lines must go. flink-sql-connector-dynamodb 6.0.x-2.0 shades the AWS SDK with an Apache licence header
+# added to its execution.interceptors file, which the SDK reads line by line as class names: every
+# DynamoDB client creation fails with ClassNotFoundException "# Licensed to the Apache Software
+# Foundation..." (found by integration/connectors.py).
+PATCHES = {
+    "org.apache.flink:flink-sql-connector-dynamodb": [
+        "org/apache/flink/connector/dynamodb/shaded/software/amazon/awssdk/services/dynamodb/execution.interceptors",
+    ],
+}
+
 # Connector versions tested with the Flink version the project targets (2.3). `cascade deploy` uses them
 # when the deploy block's `artifacts:` doesn't pin one. Ones marked "smoke" are checked by planning a job
 # against the real jar (tests/test_connector_smoke.py); the rest also run end to end in integration/.

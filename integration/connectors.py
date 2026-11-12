@@ -93,7 +93,10 @@ class Job:
 
     def _cmd(self, wait: bool, restore: str | None = None) -> list[str]:
         cp = os.pathsep.join([RUNTIME, os.path.join(it.FLINK_BASE, "lib", "*"), *self.jars])
-        return ["java", "--add-opens=java.base/java.util=ALL-UNNAMED", "--add-opens=java.base/java.lang=ALL-UNNAMED",
+        opens = [f"--add-opens=java.base/{p}=ALL-UNNAMED" for p in
+                 ("java.util", "java.lang", "java.nio", "java.lang.reflect", "java.net", "java.io", "sun.nio.ch",
+                  "java.util.concurrent", "java.time", "java.text", "java.math")]  # as Flink's own scripts
+        return ["java", *opens,
                 "-cp", cp, "dev.cascade.runner.SqlRunner", "--setup", os.path.join(self.dir, "setup.sql"),
                 "--statements", os.path.join(self.dir, "statements.sql")] + (["--await"] if wait else []) \
             + (["--restore", restore] if restore else [])
@@ -547,7 +550,7 @@ def case_sqlserver_cleanup():
 
 CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,
          "elasticsearch": case_elasticsearch, "dynamodb": case_dynamodb, "kinesis": case_kinesis,
-         "hudi": case_hudi, "delta": case_delta, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
+         "hudi": case_hudi, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
          "sqlserver-cleaned-up": case_sqlserver_cleanup}
 
 

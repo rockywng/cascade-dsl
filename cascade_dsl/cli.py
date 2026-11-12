@@ -313,6 +313,35 @@ def cmd_fetch_jars(args) -> int:
     return 0
 
 
+def cmd_lineage(args) -> int:
+    from .lineage import mermaid
+    print(mermaid(args.root, args.env), end="")
+    return 0
+
+
+def cmd_impact(args) -> int:
+    from .lineage import impact
+    home = None
+    if args.verify:
+        from .verify import find_flink_home
+        home = find_flink_home(None)
+        if home is None:
+            print("error: --verify needs FLINK_HOME", file=sys.stderr)
+            return 2
+    results = impact(args.path, args.root, args.env, home)
+    if not results:
+        print(f"no project under {args.root} reads {args.path}", file=sys.stderr)
+        return 0
+    broken = 0
+    for d, name, errors in results:
+        status = "ok" if not errors else f"BROKEN ({len(errors)} error(s))"
+        print(f"{name:30s} {os.path.relpath(d)}  {status}", file=sys.stderr)
+        for e in errors[:5]:
+            print(f"    {e}", file=sys.stderr)
+        broken += bool(errors)
+    return 1 if broken else 0
+
+
 def cmd_connectors(args) -> int:
     for spec in sorted(CATALOG.values(), key=lambda s: s.type):
         print(f"{spec.type}  [{', '.join(sorted(spec.roles))}]  {spec.doc}")
@@ -421,6 +450,18 @@ def main(argv=None) -> int:
     sp.add_argument("path")
     sp.add_argument("--env")
     sp.set_defaults(fn=cmd_fetch_jars)
+
+    sp = sub.add_parser("lineage", help="Mermaid graph of the pipelines under a directory and who reads whom")
+    sp.add_argument("root")
+    sp.add_argument("--env")
+    sp.set_defaults(fn=cmd_lineage)
+
+    sp = sub.add_parser("impact", help="recompile every pipeline that reads this one's sinks (for its CI)")
+    sp.add_argument("path")
+    sp.add_argument("--root", default=".", help="where the other projects live")
+    sp.add_argument("--env")
+    sp.add_argument("--verify", action="store_true", help="also plan each reader with Flink (FLINK_HOME)")
+    sp.set_defaults(fn=cmd_impact)
 
     sp = sub.add_parser("connectors", help="list available connectors and their properties")
     sp.set_defaults(fn=cmd_connectors)

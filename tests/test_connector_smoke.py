@@ -88,7 +88,6 @@ CASES = {
                                "database: app\ncollection: orders", "{_id: STRING NOT NULL, v: STRING}", "_id"),
     "paimon": sink_case("c: {type: paimon, properties: {warehouse: 'file://{tmp}'}}", "table: shop.out"),
     "hudi": sink_case("c: {type: hudi, properties: {base_path: 'file://{tmp}'}}", "path: out"),
-    "delta": sink_case("c: {type: delta}", "table_path: 'file://{tmp}/out'", mode="append"),
 }
 
 

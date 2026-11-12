@@ -192,7 +192,7 @@ TESTED_VERSIONS = {
     "org.apache.flink:flink-sql-connector-elasticsearch7": "4.0.0-2.0",       # smoke
     "org.apache.paimon:paimon-flink-2.2": "2.1.0",                            # smoke
     "org.apache.hudi:hudi-flink2.0-bundle": "1.2.1",                          # smoke
-    "io.delta:delta-flink": "4.3.1",                                          # smoke
+    "commons-logging:commons-logging": "1.4.0",
     "org.apache.iceberg:iceberg-flink-runtime-2.3": "1.12.0",  # needs Hadoop and a catalog: not smoked
 }
 
@@ -331,8 +331,9 @@ def _aws_finish(role, mode, fmt, opts, ctx):
         if not (key and secret):
             return [("CD209", "access_key_id and secret_access_key go together")]
         opts["aws.credentials.provider"] = "BASIC"
-        opts["aws.credentials.provider.basic.accesskeyid"] = key
-        opts["aws.credentials.provider.basic.secretkey"] = secret
+        # the SQL option names (the connector maps them to aws.credentials.provider.basic.*)
+        opts["aws.credentials.basic.accesskeyid"] = key
+        opts["aws.credentials.basic.secretkey"] = secret
     return []
 
 
@@ -421,6 +422,9 @@ register(ConnectorSpec(
     sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
     # Paimon publishes one jar per Flink minor; 2.1.0 has none for 2.3 yet, and the 2.2 build runs on 2.3
     artifact="org.apache.paimon:paimon-flink-2.2",
+    # Paimon's file IO goes through Hadoop's Configuration even for local and s3:// warehouses
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime",
+                                   "commons-logging:commons-logging"],
     finish=_paimon_finish,
 ))
 register(ConnectorSpec(
@@ -432,15 +436,10 @@ register(ConnectorSpec(
           "table_type": Prop("table.type", default="cow", values={"cow": "COPY_ON_WRITE", "mor": "MERGE_ON_READ"})},
     sink_modes={"append", "upsert"}, source_changelog="by_primary_key",
     artifact="org.apache.hudi:hudi-flink2.0-bundle",
-    # the bundle expects Hadoop on the classpath (Configuration, FileSystem); Flink's image has none
-    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime"],
+    # the bundle expects Hadoop (Configuration, FileSystem) and commons-logging on the classpath
+    extra_artifacts=lambda props: ["org.apache.hadoop:hadoop-client-api", "org.apache.hadoop:hadoop-client-runtime",
+                                   "commons-logging:commons-logging"],
     finish=_lake_finish({"read.streaming.enabled": "true"}),
-))
-register(ConnectorSpec(
-    type="delta", roles={"sink"},
-    doc="Delta Lake tables (sink only; the Delta connector has no SQL source).",
-    sink={"table_path": Prop("table_path", required=True)},
-    artifact="io.delta:delta-flink",
 ))
 
 register(ConnectorSpec(

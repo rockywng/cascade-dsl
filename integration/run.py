@@ -312,6 +312,41 @@ def phase_v1():
     expect("upsert-kafka sink (customer_ltv, latest per key)", ltv_topic, {"c1": (15.0, 2), "c2": (21.0, 2)})
     expect("append Kafka sink (revenue, enriched via CDC temporal join)", revenue,
            {("10:00", "smb"): (15.0, 2), ("10:00", "enterprise"): (20.0, 1)})
+    check_alert_metrics()
+
+
+def check_alert_metrics():
+    """Every metric the generated alerts and dashboard use must exist on the running job: an alert on a
+    misspelled metric never fires."""
+    if EXEC["fn"] is not exec_compose:
+        return  # the kind run has no reporter ports published
+    sys.path.insert(0, REPO)
+    import urllib.request
+    from cascade_dsl import monitoring
+    from cascade_dsl.compiler import compile_pipeline
+    r = compile_pipeline(os.path.join(REPO, "integration", "pipeline"))
+    cfg = {"monitoring": True, **(r.checked.pipeline.deploy or {})}
+    wanted = monitoring.metric_names(monitoring.rules(r, cfg))
+    wanted |= {m for panel in monitoring.dashboard(r, cfg)["panels"] for t in panel["targets"]
+               for m in re.findall(r"\b(flink_[A-Za-z0-9_]+)", t["expr"])}
+
+    def scraped():
+        names = set()
+        for port in (9249, 9250):
+            with urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=10) as resp:
+                for line in resp.read().decode().splitlines():
+                    if line and not line.startswith("#"):
+                        names.add(re.split(r"[{ ]", line, 1)[0])
+        return names
+    try:
+        names = wait_for("metrics for every alert", lambda: (lambda n: n if wanted <= n else None)(scraped()),
+                         timeout=120, every=5)
+    except Failed:
+        names = scraped()
+    missing = wanted - names
+    if missing:
+        raise Failed(f"alerts/dashboard use metrics the job doesn't report: {sorted(missing)}")
+    ok(f"all {len(wanted)} metrics the generated alerts and dashboard use are reported by the job")
 
 
 def write_v2() -> str:

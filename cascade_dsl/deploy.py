@@ -180,6 +180,12 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     if secrets:
         write("secret.template.yaml", "# Fill in and apply separately (or create it from your secret manager).\n"
               "# Never commit real values.\n" + _dump(secret))
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        for fname, doc in monitoring.kubernetes(r, cfg, name, meta).items():
+            write(fname, _dump(doc))
+            kustomization["resources"].append(fname)
+        _monitoring_files(r, cfg, out)
     write("kustomization.yaml", _dump(kustomization))
     write("Dockerfile", dockerfile(r, cfg))
     return {"name": name, "mode": mode, "secrets": secrets, "secret_name": secret_name, "out": out}
@@ -214,6 +220,17 @@ def _job_args(files: dict, mode: str, inline: bool) -> list[str]:
     return ["--setup", "job/setup.sql", f"--{second}", f"job/{fname}"]
 
 
+def _monitoring_files(r: Result, cfg: dict, out: str):
+    """Plain Prometheus rule file and Grafana dashboard JSON, for any target."""
+    from . import monitoring
+    d = os.path.join(out, "monitoring")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "alerts.yml"), "w") as f:
+        f.write(_dump(monitoring.rules(r, cfg)))
+    with open(os.path.join(d, "dashboard.json"), "w") as f:
+        json.dump(monitoring.dashboard(r, cfg), f, indent=1)
+
+
 def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mode: str, secrets: list,
                  cfg: dict) -> dict:
     """A FlinkSessionJob on an existing (operator-managed) session cluster."""
@@ -243,6 +260,9 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
     }
     with open(os.path.join(out, "flinksessionjob.yaml"), "w") as f:
         f.write(_dump(job))
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        _monitoring_files(r, cfg, out)
     notes = ["# Session cluster requirements for this job (it shares the cluster's image and pods):",
              "#   connector jars: " + (", ".join(sorted(r.lowered.manifest["artifacts"])) or "none"),
              "#   secrets as environment variables on the JobManager and TaskManagers: "
@@ -316,6 +336,9 @@ def _flink_run(r: Result, out: str, files: dict, mode: str, secrets: list, cfg: 
              ': "${FLINK_HOME:?set FLINK_HOME}"',
              ': "${CASCADE_RUNTIME_JAR:?set CASCADE_RUNTIME_JAR to cascade-runtime.jar}"',
              f'exec "$FLINK_HOME/bin/flink" run {" ".join(opts)} -c {RUNNER} "$CASCADE_RUNTIME_JAR" {args} "$@"'.replace("  ", " ")]
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        _monitoring_files(r, cfg, out)
     path = os.path.join(out, "run.sh")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -433,6 +456,9 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
     if python_functions(p):
         conf["python.executable"] = PYFLINK_PYTHON
         conf["python.client.executable"] = PYFLINK_PYTHON
+    from . import monitoring
+    if monitoring.enabled(cfg):
+        conf.update(monitoring.REPORTER)
     conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
 
     jm = cfg.get("jobmanager") or {}
@@ -440,6 +466,8 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
            for s in sorted(p.secrets)]
     container = {"name": "flink-main-container",
                  "volumeMounts": [{"name": "cascade-job", "mountPath": JOB_DIR, "readOnly": True}]}
+    if monitoring.enabled(cfg):
+        container["ports"] = [{"name": "metrics", "containerPort": monitoring.METRICS_PORT}]
     volumes = [{"name": "cascade-job", "configMap": {"name": job_cm}}]
     if python_functions(p):
         container["volumeMounts"].append({"name": "cascade-python", "mountPath": PYTHON_DIR, "readOnly": True})

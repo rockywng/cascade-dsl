@@ -43,6 +43,7 @@ GEN = """
   gen:
     connection: datagen
     columns: {id: BIGINT NOT NULL, name: STRING, qty: INT}
+    number_of_rows: 100
     options: {fields.id.kind: sequence, fields.id.start: "1", fields.id.end: "100", fields.name.length: "8",
               fields.qty.min: "1", fields.qty.max: "50"}"""
 
@@ -263,7 +264,7 @@ def case_sqlserver():
                 "{id: INT NOT NULL, name: STRING, qty: INT}", "id", truth,
                 lambda: sql("INSERT INTO dbo.items VALUES (4,'d',1); UPDATE dbo.items SET qty = 70 WHERE id = 2; "
                             "DELETE FROM dbo.items WHERE id = 3"),
-                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"), batch=False)
+                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"))
 
 
 def case_mongodb():
@@ -482,10 +483,13 @@ sinks:
     deadline = time.time() + 120
     try:
         while time.time() < deadline:
-            if job.proc.poll() is not None:
-                with open(job.log) as f:
-                    ok(f"{name}: restored without the lost history, the source failed loudly: "
-                       + (_error(f.read()).splitlines() or ["?"])[-1][:240])
+            with open(job.log) as f:
+                log = f.read()
+            loud = next((x for x in log.splitlines() if "no longer available" in x or "Caused by" in x
+                         and "IllegalStateException" in x), None)
+            if job.proc.poll() is not None or loud:
+                ok(f"{name}: restored without the lost history, the source fails loudly (the job restarts "
+                   f"until fixed): {(loud or _error(log).splitlines()[-1]).strip()[:240]}")
                 return
             if mirror() == truth():
                 ok(f"{name}: the change made while its history was lost still arrived")

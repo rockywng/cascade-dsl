@@ -167,5 +167,5 @@ sinks:
         self.assertEqual(compiled(self.PIPE.replace("POLICY", "")).checked.options["t"]["connector"], "postgres-cdc")
         r = compiled("mode: batch\n" + self.PIPE.replace("POLICY", ", on_slot_loss: resnapshot"))
         self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
-        self.assertEqual(r.checked.options["t"]["connector"], "postgres-cdc")
+        self.assertEqual(r.checked.options["t"]["connector"], "jdbc")  # batch reads the table with JDBC
         self.assertNotIn("delegate", r.checked.options["t"])

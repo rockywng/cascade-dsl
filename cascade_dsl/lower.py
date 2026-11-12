@@ -432,6 +432,7 @@ def _manifest(c: Checked, sql: str) -> dict:
             artifacts.add(spec.artifact)
         if spec and spec.extra_artifacts:
             artifacts.update(spec.extra_artifacts(conn.properties))
+    artifacts |= c.extra_artifacts
     scaling = None
     if p.scaling:
         sc = p.scaling

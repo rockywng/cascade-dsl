@@ -55,7 +55,11 @@ class BatchCompileTest(unittest.TestCase):
         self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
         self.assertIn("SET 'execution.runtime-mode' = 'batch';", r.lowered.sql)
         self.assertEqual(r.checked.options["orders"]["scan.bounded.mode"], "latest-offset")
-        self.assertEqual(r.checked.options["customers"]["scan.startup.mode"], "snapshot")
+        # CDC sources declare a changelog even in snapshot mode, which batch rejects: a JDBC scan instead
+        self.assertEqual(r.checked.options["customers"]["connector"], "jdbc")
+        self.assertEqual(r.checked.options["customers"]["url"], "jdbc:postgresql://h:5432/d")
+        self.assertEqual(r.checked.options["customers"]["table-name"], "public.customers")
+        self.assertIn("org.apache.flink:flink-connector-jdbc-postgres", r.lowered.manifest["artifacts"])
         self.assertNotIn("CD350", r.diagnostics.codes())  # a regular join without TTL is fine for one run
 
     def test_unbounded_source(self):

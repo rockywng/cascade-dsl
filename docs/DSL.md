@@ -445,6 +445,10 @@ Limits:
   may not, so check it with `restore-test`.
 - **The model's own state is yours.** `check-upgrade` sees a process model only as a whole
   (CD140). Use `ctx.uid(...)` on stateful operators, and change state in a compatible way.
+- **`cascade restore-test old/ new/` still works.** For these pipelines it runs the whole scripts:
+  the old version on stand-in connectors, a savepoint, then the new version restored strictly. That
+  checks every operator, including the process model's own state. For example, a changed `config`
+  restores, and a removed process model is refused.
 
 ## Functions
 

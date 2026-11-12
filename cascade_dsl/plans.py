@@ -315,8 +315,22 @@ def restore_test(old_path: str, new_path: str, flink_home: str, env: str | None 
                  pin: bool = True, seconds: int = 8, allow_state_loss: bool = False) -> dict:
     """Run the old version locally, take a savepoint, and restore the new version from it.
 
-    Uses local stand-in connectors (datagen / blackhole), strict mode (no unclaimed state allowed)."""
+    Uses local stand-in connectors (datagen / blackhole), strict mode (no unclaimed state allowed).
+    Pipelines with process models have no compiled plan: their whole scripts run instead (no pinning)."""
     tools = Tools(flink_home)
+    old_r, new_r = compile_pipeline(old_path, env), compile_pipeline(new_path, env)
+    for label, r in (("old", old_r), ("new", new_r)):
+        if r.lowered is None:
+            raise PlanError(f"{label} version does not compile:\n" + "\n".join(d.format() for d in r.diagnostics.errors))
+    if any(m.process for r in (old_r, new_r) for m in r.checked.pipeline.models.values()):
+        with tempfile.TemporaryDirectory(prefix="cascade-restore-") as d:
+            old = localize(old_r.lowered, old_r.checked, "restore", os.path.join(d, "old"))
+            new = localize(new_r.lowered, new_r.checked, "restore", os.path.join(d, "new"))
+            result = tools.restore_test_statements(old, new, seconds, allow_state_loss=allow_state_loss)
+        result["pinned"] = False
+        result["report"] = None
+        result["mode"] = "statements"
+        return result
     with tempfile.TemporaryDirectory(prefix="cascade-restore-") as d:
         old_plan = os.path.join(d, "old.json")
         new_plan = os.path.join(d, "new.json")

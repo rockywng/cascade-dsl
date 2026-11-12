@@ -174,6 +174,23 @@ class Tools:
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def restore_test_statements(self, old: list[Stmt], new: list[Stmt], seconds: int = 8, timeout: int = 400,
+                                allow_state_loss: bool = False) -> dict:
+        d = tempfile.mkdtemp(prefix="cascade-restore-")
+        try:
+            out = os.path.join(d, "out.json")
+            paths = []
+            for label, stmts in (("old", old), ("new", new)):
+                path = os.path.join(d, f"{label}.sql")
+                with open(path, "w") as f:
+                    f.write(script(stmts))
+                paths.append(path)
+            self._run(["restore-test-statements", paths[0], paths[1], os.path.join(d, "savepoints"), str(seconds),
+                       out, "allow" if allow_state_loss else "strict"], timeout)
+            return self._read(out)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def job_graph(self, setup: list[Stmt], plan: str, timeout: int = 180) -> dict:
         with tempfile.TemporaryDirectory(prefix="cascade-jobgraph-") as d:
             path = os.path.join(d, "setup.sql")

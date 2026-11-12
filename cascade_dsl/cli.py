@@ -236,6 +236,8 @@ def cmd_restore_test(args) -> int:
         return 1
     if res.get("report") is not None:
         _print_pin_report(res["report"])
+    if res.get("mode") == "statements":
+        print("(process models: whole scripts restored, no compiled plan or UID pinning)", file=sys.stderr)
     if res.get("restored"):
         print("restore: OK (all savepoint state was mapped to the new job)")
         return 0

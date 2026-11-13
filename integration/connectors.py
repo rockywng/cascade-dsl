@@ -554,6 +554,67 @@ sinks:
         os.environ.pop("CASCADE_FILES_DIR", None)
 
 
+def case_replicate_mysql():
+    """A whole MySQL database replicated into Kafka (debezium-json, one topic per table): the snapshot,
+    live changes, an added column, and a restore from a checkpoint with changes made while down."""
+    sql = lambda q: sh("mysql", "mysql", "-uroot", "-ppw", "-N", "-B", "-e", q)  # noqa: E731
+    it.wait_for("MySQL", mysql_ready, timeout=240, every=3)
+    dc("up", "-d", "kafka")
+    sql("DROP DATABASE IF EXISTS shop2; CREATE DATABASE shop2; "
+        "CREATE TABLE shop2.items (id INT PRIMARY KEY, name VARCHAR(20), qty INT); "
+        "INSERT INTO shop2.items VALUES (1,'a',5),(2,'b',7),(3,'c',9)")
+    rep = Replication("replicate-mysql", """
+pipeline: shop2_replica
+connections:
+  db: {type: mysql-cdc, properties: {hostname: localhost, port: 13306, username: root, password: "${secret:pw}"}}
+  bus: {type: kafka, properties: {bootstrap_servers: "localhost:19092"}}
+replicate:
+  from: db
+  tables: ["shop2.*"]
+  to: bus
+""")
+
+    def topic() -> dict:
+        """The table as the topic's change events leave it: id -> row (after-images, deletes remove)."""
+        out = sh("kafka", "/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", "localhost:19092",
+                 "--topic", "shop2.items", "--from-beginning", "--timeout-ms", "5000", check=False)
+        rows = {}
+        for line in out.splitlines():
+            if not line.startswith("{"):
+                continue
+            ev = json.loads(line)
+            if ev.get("op") == "d" or ev.get("after") is None:
+                rows.pop((ev.get("before") or {}).get("id"), None)
+            else:
+                after = ev["after"]
+                rows[after["id"]] = {k: v for k, v in sorted(after.items()) if k != "id"}
+        return rows
+
+    rep.start()
+    try:
+        converge("replicate mysql: snapshot into Kafka",
+                 topic, {1: {"name": "a", "qty": 5}, 2: {"name": "b", "qty": 7}, 3: {"name": "c", "qty": 9}},
+                 job=rep, timeout=300)
+        sql("INSERT INTO shop2.items VALUES (4,'d',1); UPDATE shop2.items SET qty = 70 WHERE id = 2; "
+            "DELETE FROM shop2.items WHERE id = 3")
+        converge("replicate mysql: inserts, updates and deletes", topic,
+                 {1: {"name": "a", "qty": 5}, 2: {"name": "b", "qty": 70}, 4: {"name": "d", "qty": 1}}, job=rep)
+        sql("ALTER TABLE shop2.items ADD COLUMN note VARCHAR(20); INSERT INTO shop2.items VALUES (5,'e',2,'new')")
+        converge("replicate mysql: rows after an added column carry it",
+                 lambda: topic().get(5), {"name": "e", "note": "new", "qty": 2}, job=rep)
+        time.sleep(6)
+        checkpoint = rep.latest_checkpoint()
+    finally:
+        rep.stop()
+    sql("INSERT INTO shop2.items VALUES (6,'f',3,'while down')")
+    rep.start(restore=checkpoint)
+    try:
+        converge("replicate mysql: restored from a checkpoint, the change made while down arrives",
+                 lambda: topic().get(6), {"name": "f", "note": "while down", "qty": 3}, job=rep)
+    finally:
+        rep.stop()
+
+
 def sink_job(name: str, connection: str, sink: str, mode: str = "upsert") -> Job:
     pk = ", primary_key: [id]" if mode == "upsert" else ""
     return Job(name, f"""
@@ -1015,7 +1076,7 @@ CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc"
          "sqlserver-cleaned-up": case_sqlserver_cleanup, "slot-metrics": case_slot_metrics,
          "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle,
          "oracle-restore": case_oracle_restore, "replicate-postgres": case_replicate_postgres,
-         "kafka-tls": case_kafka_tls}
+         "kafka-tls": case_kafka_tls, "replicate-mysql": case_replicate_mysql}
 
 
 def prepare():
@@ -1045,7 +1106,8 @@ def main():
         step("systems: " + ", ".join(sorted({"postgres"} | {n.split("-")[0] for n in names})))
         services = {"mysql-cdc": "mysql", "sqlserver-cdc": "sqlserver", "mongodb-cdc": "mongo",
                     "mysql-binlog-purged": "mysql", "sqlserver-cleaned-up": "sqlserver",
-                    "elasticsearch": "elasticsearch", "dynamodb": "dynamodb", "kinesis": "kinesis"}
+                    "elasticsearch": "elasticsearch", "dynamodb": "dynamodb", "kinesis": "kinesis",
+                    "replicate-mysql": "mysql"}
         dc("up", "-d", "postgres", *sorted({services[n] for n in names if n in services}), timeout=1200)
         it.wait_for("Postgres", lambda: results("SELECT 1"), timeout=60)
         for n in names:

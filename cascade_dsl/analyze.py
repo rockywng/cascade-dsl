@@ -20,7 +20,7 @@ from .sqlscan import (Analysis, Ref, SqlSyntaxError, analyze_sql, infer_relation
 from .types import TypeParseError, parse_type
 from .util import h, normalize_sql
 
-UNBOUNDED_KINDS = {"group_agg", "regular_join", "dedup", "distinct", "over_agg"}
+UNBOUNDED_KINDS = {"group_agg", "regular_join", "dedup", "distinct", "over_agg", "process_table"}
 
 
 @dataclass
@@ -342,6 +342,17 @@ def _check_models(c: Checked):
             d.error("CD300", f"SQL syntax error in model '{m.name}': {e}", _sql_loc(m, e.pos), node=m.name)
             continue
         c.analyses[m.name] = a
+        fns = {f.name.upper(): f for f in p.functions.values()}
+        for call in a.calls:
+            f = fns.get(call.name.upper())
+            if f is not None and f.kind == "process_table":
+                # its @StateHint state expires with table.exec.state.ttl unless the hint sets its own ttl
+                a.ops.append(StatefulOp("process_table", False, f"process table function {f.name} keeps state "
+                                        "per partition key"))
+            elif f is not None and f.kind not in ("table", "process_table"):
+                d.error("CD165", f"model '{m.name}': {f.name} is a {f.kind} function, not a table function",
+                        _sql_loc(m, call.pos), node=m.name,
+                        hint="declare `kind: table` (LATERAL TABLE) or `kind: process_table` on the function")
         for code, msg, pos, hint in a.problems:
             d.error(code, f"model '{m.name}': {msg}", _sql_loc(m, pos), hint=hint, node=m.name)
         inputs = []
@@ -409,7 +420,9 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
                         _sql_loc(m, pos), node=name,
                         hint=f"time attributes of '{table}': {', '.join(sorted(base.rowtime))}")
     columns, rowtime = infer_relation(m.sql, rels, {f.name.upper(): f.returns for f in p.functions.values()
-                                                    if f.returns is not None})
+                                                    if f.returns is not None and f.kind in ("scalar", "aggregate")},
+                                      {f.name.upper(): (f.kind, f.returns) for f in p.functions.values()
+                                       if f.kind in ("table", "process_table")})
     columns, rowtime = _apply_lock(c, name, inputs, columns, rowtime, kinds)
     c.inferred[name] = columns
 
@@ -571,7 +584,7 @@ def model_fingerprint(p: Pipeline, name: str, inputs: list[str],
     if m.process is not None:
         return h("process", process_identity(m), contract, ins)
     sql_up = m.sql.upper()
-    fns = sorted((f.name, f.language, f.class_name, f.file, f.function, f.returns.text if f.returns else None)
+    fns = sorted((f.name, f.language, f.class_name, f.file, f.function or f.class_attr, f.returns.text if f.returns else None)
                  for f in p.functions.values() if f.name.upper() in sql_up)
     if fns:
         return h(normalize_sql(m.sql), contract, ins, fns)
@@ -658,7 +671,8 @@ def _check_functions(c: Checked):
             d.error("CD160", f"function '{f.name}': Python module '{f.file}' not found in the project", f.loc,
                     hint="`file` is a .py module relative to the project directory")
             continue
-        problem = check_python_module(path, f.function)
+        problem = check_python_module(path, f.function or f.class_attr or "",
+                                      kind="class" if f.kind == "aggregate" else "function")
         if problem:
             d.error("CD161", f"function '{f.name}': {f.file} {problem}", f.loc)
         if f.module == SHIM_MODULE:

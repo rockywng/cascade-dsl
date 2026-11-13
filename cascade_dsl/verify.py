@@ -29,7 +29,7 @@ PLANNER_OPS = {
     "Join": "regular_join", "IntervalJoin": "interval_join", "TemporalJoin": "temporal_join",
     "Deduplicate": "dedup", "Rank": "dedup", "OverAggregate": "over_agg", "WindowJoin": "window_join",
     "LookupJoin": "lookup_join", "Match": "match_recognize", "SinkMaterializer": "sink_materializer",
-    "ChangelogNormalize": "changelog_normalize",
+    "ChangelogNormalize": "changelog_normalize", "ProcessTableFunction": "process_table",
 }
 
 

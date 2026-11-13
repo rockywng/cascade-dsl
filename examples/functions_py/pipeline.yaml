@@ -1,0 +1,62 @@
+# Python aggregate and table functions: a plain class and a plain generator, wrapped by cascade.
+pipeline: shop_functions_py
+defaults: {state_ttl: 1d}
+scaling: {max_parallelism: 360}
+
+functions:
+  weighted_avg:
+    language: python
+    kind: aggregate
+    file: udfs/reviews.py
+    class: WeightedAvg
+    accumulator: ROW<total DOUBLE, weight DOUBLE>
+    returns: DOUBLE
+  split_tags:
+    language: python
+    kind: table
+    file: udfs/reviews.py
+    returns: ROW<tag STRING, pos INT>
+
+connections:
+  bus: {type: kafka, properties: {bootstrap_servers: localhost:9092}}
+
+sources:
+  reviews:
+    connection: bus
+    topic: reviews
+    columns:
+      review_id: STRING
+      product_id: STRING NOT NULL
+      rating: DOUBLE
+      helpful_votes: DOUBLE
+      tags: STRING
+      ts: TIMESTAMP(3)
+    event_time: {column: ts, max_out_of_orderness: 5s}
+
+models:
+  product_rating:
+    sql: |
+      SELECT product_id, weighted_avg(rating, helpful_votes) AS rating
+      FROM reviews
+      GROUP BY product_id
+  latest_reviews:
+    description: The latest version of each review (an edited review replaces its earlier rating)
+    sql: |
+      SELECT review_id, product_id, rating, helpful_votes FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY review_id ORDER BY ts DESC) AS rn FROM reviews)
+      WHERE rn = 1
+  rating_of_latest:
+    description: Over updating input, the aggregate retracts a review's old rating
+    sql: |
+      SELECT product_id, weighted_avg(rating, helpful_votes) AS rating
+      FROM latest_reviews
+      GROUP BY product_id
+  review_tags:
+    sql: |
+      SELECT r.product_id, t.tag, t.pos
+      FROM reviews AS r, LATERAL TABLE(split_tags(r.tags)) AS t
+
+sinks:
+  ratings: {from: product_rating, connection: print, mode: upsert, primary_key: [product_id]}
+  tags: {from: review_tags, connection: print}
+  latest_ratings: {from: rating_of_latest, connection: print, mode: upsert, primary_key: [product_id]}

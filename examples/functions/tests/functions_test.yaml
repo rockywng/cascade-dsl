@@ -1,0 +1,40 @@
+tests:
+  - name: weighted_average_by_helpful_votes
+    target: product_rating
+    given:
+      reviews:
+        - {product_id: p1, rating: 5.0, helpful_votes: 3.0, ts: "2026-01-01 10:00:00"}
+        - {product_id: p1, rating: 1.0, helpful_votes: 1.0, ts: "2026-01-01 10:00:01"}
+        - {product_id: p2, rating: 4.0, helpful_votes: 0.0, ts: "2026-01-01 10:00:02"}
+    expect:
+      rows:
+        - {product_id: p1, rating: 4.0}
+        - {product_id: p2, rating: null}
+
+  - name: one_row_per_tag
+    target: review_tags
+    given:
+      reviews:
+        - {product_id: p1, rating: 5.0, helpful_votes: 1.0, tags: "fast, cheap", ts: "2026-01-01 10:00:00"}
+        - {product_id: p2, rating: 3.0, helpful_votes: 1.0, ts: "2026-01-01 10:00:01"}
+    expect:
+      rows:
+        - {product_id: p1, tag: fast, pos: 0}
+        - {product_id: p1, tag: cheap, pos: 1}
+
+  - name: streak_per_courier
+    target: courier_streaks
+    given:
+      deliveries:
+        - {courier: a, ok: true, ts: "2026-01-01 10:00:00"}
+        - {courier: a, ok: true, ts: "2026-01-01 10:00:01"}
+        - {courier: b, ok: true, ts: "2026-01-01 10:00:02"}
+        - {courier: a, ok: false, ts: "2026-01-01 10:00:03"}
+        - {courier: a, ok: true, ts: "2026-01-01 10:00:04"}
+    expect:
+      rows:
+        - {courier: a, streak: 1, ok: true}
+        - {courier: a, streak: 2, ok: true}
+        - {courier: b, streak: 1, ok: true}
+        - {courier: a, streak: 0, ok: false}
+        - {courier: a, streak: 1, ok: true}

@@ -77,7 +77,8 @@ class Expectation:
 
 @dataclass
 class Function:
-    """A user-defined scalar function (Java class in a jar, or a plain Python function)."""
+    """A user-defined function (Java class in a jar, or plain Python): scalar, aggregate, table, or
+    process table function (Java only)."""
 
     name: str
     language: Literal["java", "python"]
@@ -89,6 +90,9 @@ class Function:
     deterministic: bool = True
     description: str | None = None
     loc: Location | None = None
+    kind: str = "scalar"  # scalar | aggregate | table | process_table
+    class_attr: str | None = None  # python aggregate: the class in the module
+    accumulator: SqlType | None = None  # python aggregate: accumulator type
 
     @property
     def module(self) -> str | None:

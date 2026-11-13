@@ -100,6 +100,7 @@ jobs:
         run: |
           FLINK_HOME=~/flink-${FLINK_VERSION} runtime/build.sh
           FLINK_HOME=~/flink-${FLINK_VERSION} examples/udfs/udfs/build.sh
+          FLINK_HOME=~/flink-${FLINK_VERSION} examples/functions/udfs/build.sh
           FLINK_HOME=~/flink-${FLINK_VERSION} examples/sessions/jobs/build.sh
       - name: All tests, including real Flink jobs
         run: |

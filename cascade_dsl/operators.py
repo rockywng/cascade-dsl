@@ -35,6 +35,7 @@ ANCHOR_TYPES = {
     "dedup": ("deduplicate", "rank", "window-deduplicate", "window-rank"),
     "over_agg": ("over-aggregate",),
     "match_recognize": ("match",),
+    "process_table": ("process-table-function",),
 }
 SOURCE_TAIL = {"watermark-assigner", "drop-update-before", "changelog-normalize", "mini-batch-assigner"}
 LOCAL_PREFIX = "local-"

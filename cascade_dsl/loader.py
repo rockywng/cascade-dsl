@@ -31,6 +31,7 @@ SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "descript
                "metadata"}
 MODEL_KEYS = {"process", "sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling",
               "backfill"}
+FUNCTION_KINDS = ("scalar", "aggregate", "table", "process_table")
 DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
                "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
                "jars", "pod_template", "target", "session_cluster", "jar_uri", "run", "monitoring", "secrets_from",
@@ -328,8 +329,17 @@ def _load_function(name, f, ctx: _Ctx) -> Function | None:
         ctx.diags.error("CD014", f"{what}: language must be java or python", ctx.loc(f, "language") if "language" in f
                         else ctx.loc(f))
         return None
-    allowed = {"language", "returns", "deterministic", "description"} | (
-        {"class", "jar"} if lang == "java" else {"file", "function"})
+    kind = f.get("kind", "scalar")
+    if kind not in FUNCTION_KINDS:
+        ctx.diags.error("CD014", f"{what}: kind must be one of {', '.join(FUNCTION_KINDS)}", ctx.loc(f, "kind"))
+        return None
+    if kind == "process_table" and lang != "java":
+        ctx.diags.error("CD014", f"{what}: process table functions are Java only (PyFlink has no "
+                        "ProcessTableFunction); use a Python process model", ctx.loc(f, "kind"))
+        return None
+    allowed = {"language", "returns", "deterministic", "description", "kind"} | (
+        {"class", "jar"} if lang == "java" else
+        {"file", "class", "accumulator"} if kind == "aggregate" else {"file", "function"})
     ctx.check_keys(f, allowed, what)
     returns = None
     if f.get("returns") is not None:
@@ -338,7 +348,10 @@ def _load_function(name, f, ctx: _Ctx) -> Function | None:
         except TypeParseError as e:
             ctx.diags.error("CD010", f"{what}: bad return type: {e}", ctx.loc(f, "returns"))
     fn = Function(name=name, language=lang, returns=returns, deterministic=bool(f.get("deterministic", True)),
-                  description=f.get("description"), loc=ctx.loc(f))
+                  description=f.get("description"), loc=ctx.loc(f), kind=kind)
+    if kind in ("table", "process_table") and returns is not None and returns.name != "ROW":
+        ctx.diags.error("CD010", f"{what}: a {kind.replace('_', ' ')} function returns rows: "
+                        "`returns: ROW<name TYPE, ...>`", ctx.loc(f, "returns"))
     if lang == "java":
         if not f.get("class"):
             ctx.diags.error("CD005", f"{what} is missing 'class' (the fully qualified ScalarFunction class)",
@@ -351,6 +364,16 @@ def _load_function(name, f, ctx: _Ctx) -> Function | None:
             ctx.diags.error("CD005", f"{what}: Python functions need `returns` (the Flink SQL result type)",
                             ctx.loc(f))
         fn.file, fn.function = f.get("file"), f.get("function") or name
+        if kind == "aggregate":
+            fn.function, fn.class_attr = None, f.get("class")
+            if not fn.class_attr:
+                ctx.diags.error("CD005", f"{what}: a Python aggregate function names its `class` (with "
+                                "create_accumulator, accumulate and get_value)", ctx.loc(f))
+            try:
+                fn.accumulator = parse_type(f.get("accumulator", ""))
+            except TypeParseError as e:
+                ctx.diags.error("CD005", f"{what}: Python aggregate functions need `accumulator`, the Flink type "
+                                f"of what create_accumulator returns ({e})", ctx.loc(f))
     return fn
 
 

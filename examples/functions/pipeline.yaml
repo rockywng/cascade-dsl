@@ -1,0 +1,71 @@
+# Aggregate, table and process table functions (Java), next to the scalar ones in examples/udfs.
+# Build the jar with udfs/build.sh first.
+pipeline: shop_functions
+defaults: {state_ttl: 1d}
+scaling: {max_parallelism: 360}
+
+functions:
+  weighted_avg:
+    language: java
+    kind: aggregate
+    class: com.acme.fn.WeightedAvg
+    jar: udfs/acme-functions.jar
+    returns: DOUBLE
+  split_tags:
+    language: java
+    kind: table
+    class: com.acme.fn.SplitTags
+    jar: udfs/acme-functions.jar
+    returns: ROW<tag STRING, pos INT>
+  streak:
+    language: java
+    kind: process_table
+    class: com.acme.fn.Streak
+    jar: udfs/acme-functions.jar
+    returns: ROW<streak INT, ok BOOLEAN>
+
+connections:
+  bus: {type: kafka, properties: {bootstrap_servers: localhost:9092}}
+
+sources:
+  reviews:
+    connection: bus
+    topic: reviews
+    columns:
+      product_id: STRING NOT NULL
+      rating: DOUBLE
+      helpful_votes: DOUBLE
+      tags: STRING
+      ts: TIMESTAMP(3)
+    event_time: {column: ts, max_out_of_orderness: 5s}
+  deliveries:
+    connection: bus
+    topic: deliveries
+    columns:
+      courier: STRING NOT NULL
+      ok: BOOLEAN
+      ts: TIMESTAMP(3)
+    event_time: {column: ts, max_out_of_orderness: 0s}
+
+models:
+  product_rating:
+    description: Rating weighted by helpful votes (aggregate function)
+    sql: |
+      SELECT product_id, weighted_avg(rating, helpful_votes) AS rating
+      FROM reviews
+      GROUP BY product_id
+  review_tags:
+    description: One row per tag (table function)
+    sql: |
+      SELECT r.product_id, t.tag, t.pos
+      FROM reviews AS r, LATERAL TABLE(split_tags(r.tags)) AS t(tag, pos)
+  courier_streaks:
+    description: Current streak of on-time deliveries per courier (process table function)
+    sql: |
+      SELECT courier, streak, ok
+      FROM streak(input => TABLE deliveries PARTITION BY courier)
+
+sinks:
+  ratings: {from: product_rating, connection: print, mode: upsert, primary_key: [product_id]}
+  tags: {from: review_tags, connection: print}
+  streaks: {from: courier_streaks, connection: print}

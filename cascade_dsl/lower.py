@@ -238,7 +238,7 @@ def _lower_functions(p: Pipeline, stmts: list[Stmt]):
                               options=opts))
         else:
             stmts.append(Stmt("function", f.name, f"{head}{lit(SHIM_MODULE + '.' + f.name)} LANGUAGE PYTHON;",
-                              comment=f"function: {f.name} ({f.file}:{f.function})", options={"python": True}))
+                              comment=f"function: {f.name} ({f.file}:{f.function or f.class_attr})", options={"python": True}))
 
 
 def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
@@ -497,8 +497,8 @@ def _manifest(c: Checked, sql: str) -> dict:
         "artifacts": sorted(artifacts),
         "imports": p.imports,  # sources that read other pipelines' sinks
         "runtime_functions": runtime_fns,
-        "functions": {f.name: {"language": f.language, "class": f.class_name, "jar": f.jar, "file": f.file,
-                               "function": f.function, "returns": f.returns.text if f.returns else None,
+        "functions": {f.name: {"language": f.language, "kind": f.kind, "class": f.class_name or f.class_attr,
+                               "jar": f.jar, "file": f.file, "function": f.function, "returns": f.returns.text if f.returns else None,
                                "deterministic": f.deterministic} for f in p.functions.values()},
     }
 

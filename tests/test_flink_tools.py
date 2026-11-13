@@ -23,7 +23,7 @@ EXAMPLES = os.path.join(os.path.dirname(__file__), "..", "examples")
 @unittest.skipUnless(READY, "set FLINK_HOME and run runtime/build.sh")
 class RunnerTest(unittest.TestCase):
     def test_examples_pass(self):
-        for name in ("orders", "orders_py", "clickstream_py"):
+        for name in ("orders", "orders_py", "clickstream_py", "functions", "functions_py"):
             with self.subTest(example=name):
                 r, results = testing.run(os.path.join(EXAMPLES, name), FLINK)
                 self.assertIsNotNone(results, [d.format() for d in r.diagnostics.errors])

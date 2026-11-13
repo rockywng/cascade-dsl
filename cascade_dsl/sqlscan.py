@@ -142,6 +142,17 @@ class Analysis:
     scope_refs: list[Ref] = field(default_factory=list)  # refs incl. CTE names, for column scoping
     group_keys: list[str] | None = None  # plain-column keys of the outermost non-windowed GROUP BY
     problems: list[tuple[str, str, int, str | None]] = field(default_factory=list)  # code,msg,pos,hint
+    # table-valued calls of user functions in FROM: LATERAL TABLE(f(..)) AS t(a, b), f(TABLE x PARTITION BY k)
+    calls: list["Call"] = field(default_factory=list)
+
+
+@dataclass
+class Call:
+    name: str
+    alias: str | None
+    pos: int
+    column_aliases: list[str] | None = None
+    tables: list[tuple[str, list[str]]] = field(default_factory=list)  # (table arg, PARTITION BY columns)
 
 
 def analyze_sql(sql: str) -> tuple[list[Tok], Analysis]:
@@ -164,6 +175,7 @@ def analyze_sql(sql: str) -> tuple[list[Tok], Analysis]:
 
     a.has_ttl_hint = any(t.kind == "hint" and "STATE_TTL" in t.text.upper() for t in toks)
     _find_ctes(toks, a)
+    _find_calls(toks, a)
     _find_refs(toks, a)
     _find_windows(toks, a)
     _find_stateful(toks, a)
@@ -205,6 +217,48 @@ def _read_alias(toks, j) -> tuple[str | None, int]:
     return None, j
 
 
+def _find_calls(toks, a: Analysis):
+    """Table-valued function calls: `[LATERAL] TABLE(f(...)) [AS] t[(a, b)]` and, for process table
+    functions, `FROM f(input => TABLE x PARTITION BY k, ...)`."""
+    n = len(toks)
+    for i, t in enumerate(toks):
+        start = close = None
+        if t.is_kw("TABLE") and i + 3 < n and toks[i + 1].text == "(" and toks[i + 2].kind in ("ident", "qident") \
+                and toks[i + 3].text == "(" and toks[i + 2].up not in WINDOW_TVFS:
+            start, close = i + 2, _match_paren(toks, i + 1)
+        elif t.kind in ("ident", "qident") and i > 0 and i + 1 < n and toks[i + 1].text == "(" \
+                and (toks[i - 1].is_kw("FROM", "JOIN") or toks[i - 1].up in JOIN_WORDS) \
+                and t.up not in KEYWORDS:
+            start, close = i, _match_paren(toks, i + 1)
+        if start is None:
+            continue
+        call = Call(toks[start].name, None, toks[start].pos)
+        inner_end = _match_paren(toks, start + 1)
+        j = start + 2
+        while j < inner_end:
+            if toks[j].is_kw("TABLE") and toks[j + 1].kind in ("ident", "qident"):
+                table, j = _qualified_name(toks, j + 1)
+                keys: list[str] = []
+                if j + 1 < inner_end and toks[j].is_kw("PARTITION") and toks[j + 1].is_kw("BY"):
+                    j += 2
+                    while j < inner_end and toks[j].kind in ("ident", "qident"):
+                        keys.append(toks[j].name)
+                        j += 1
+                        if j < inner_end and toks[j].text == ",":
+                            # `PARTITION BY a, b` vs the next named argument `, other => ...`
+                            if j + 2 < inner_end and toks[j + 2].text == "=>":
+                                break
+                            j += 1
+                call.tables.append((table, keys))
+                continue
+            j += 1
+        call.alias, k = _read_alias(toks, close + 1)
+        if call.alias and k < n and toks[k].text == "(":
+            end = _match_paren(toks, k)
+            call.column_aliases = [x.name for x in toks[k + 1:end] if x.kind in ("ident", "qident")]
+        a.calls.append(call)
+
+
 def _find_refs(toks, a: Analysis):
     n = len(toks)
     i = 0
@@ -228,6 +282,8 @@ def _find_refs(toks, a: Analysis):
             while j < n:
                 if toks[j].is_kw("LATERAL", "UNNEST") or toks[j].text == "(" or toks[j].is_kw("TABLE"):
                     break  # subquery / TVF / lateral: handled elsewhere
+                if j + 1 < n and toks[j + 1].text == "(" and toks[j].kind in ("ident", "qident"):
+                    break  # a table function call (process table functions): _find_calls
                 if toks[j].kind not in ("ident", "qident") or not (toks[j].is_name or toks[j].kind == "qident"):
                     break
                 name, j = _qualified_name(toks, j)
@@ -567,21 +623,43 @@ def referenced_columns(expr_sql: str) -> list[tuple[str, int]]:
     return out
 
 
+def call_relation(call: Call, rels: dict, table_fns: dict) -> RelationInfo:
+    """Output of a table-valued call: a table function's ROW fields (renamed by `AS t(a, b)`); a process
+    table function's partition keys followed by its ROW fields."""
+    kind, rt = table_fns.get(call.name.upper(), (None, None))
+    if rt is None or rt.name != "ROW":
+        return RelationInfo(columns=None)
+    fields = [OutputColumn(n, t) for n, t in rt.params]
+    if kind == "process_table":
+        keys = []
+        for table, part in call.tables[:1]:
+            base = rels.get(table)
+            for k in part:
+                col = base.column(k) if base is not None and base.columns is not None else None
+                keys.append(OutputColumn(k, col.type if col else None))
+        fields = keys + fields
+    elif call.column_aliases and len(call.column_aliases) == len(fields):
+        fields = [OutputColumn(a, f.type) for a, f in zip(call.column_aliases, fields)]
+    return RelationInfo(columns=fields)
+
+
 def _within(pos: int, spans) -> bool:
     return any(s <= pos < e for _, s, e in spans)
 
 
 def infer_relation(sql: str, rels: dict[str, RelationInfo],
-                   functions: dict | None = None) -> tuple[list[OutputColumn] | None, set[str]]:
+                   functions: dict | None = None,
+                   table_fns: dict | None = None) -> tuple[list[OutputColumn] | None, set[str]]:
     """Infer (output columns, time attributes) of a query, recursing into CTEs and FROM subqueries.
-    `functions` maps user function names (upper case) to their return types."""
+    `functions` maps user function names (upper case) to their return types; `table_fns` maps table and
+    process table functions to (kind, ROW return type)."""
     try:
         _toks, a = analyze_sql(sql)
     except SqlSyntaxError:
         return None, set()
     local = dict(rels)
     for name, s, e in a.ctes:
-        cols, rt = infer_relation(sql[s:e], local, functions)
+        cols, rt = infer_relation(sql[s:e], local, functions, table_fns)
         local[name] = RelationInfo(columns=cols, rowtime=rt)
     spans = a.ctes + a.subqueries
     outer_refs = [r for r in a.scope_refs if not _within(r.pos, spans)]
@@ -590,8 +668,12 @@ def infer_relation(sql: str, rels: dict[str, RelationInfo],
         if r.name in local and not r.in_window_tvf:
             by_alias[r.alias or r.name] = local[r.name]
     for alias, s, e in a.subqueries:
-        cols, rt = infer_relation(sql[s:e], local, functions)
+        cols, rt = infer_relation(sql[s:e], local, functions, table_fns)
         by_alias[alias] = RelationInfo(columns=cols, rowtime=rt)
+    for call in a.calls:
+        if _within(call.pos, spans):
+            continue
+        by_alias[call.alias or call.name] = call_relation(call, local, table_fns or {})
     kinds = {op.kind for op in a.ops}
     if "regular_join" in kinds:
         rt_aliases: set[str] = set()  # regular joins materialize time attributes

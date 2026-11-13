@@ -1,0 +1,60 @@
+# A Python process model: PyFlink DataStream code (jobs/sessionize.py) between SQL models. It sessionizes
+# clicks per user with keyed state and event-time timers, sends late clicks to a side output, and a
+# SQL window aggregates its sessions. Needs PyFlink (pip install apache-flink, or CASCADE_PYTHON).
+pipeline: click_sessions_py
+owner: growth
+defaults: {state_ttl: 1d}
+# PyFlink hands Python functions records in bundles and the watermark per bundle; this example's late-data
+# branch needs the watermark per record (exact lateness), at the cost of throughput
+flink: {config: {python.fn-execution.bundle.size: "1"}}
+scaling: {max_parallelism: 120, parallelism: 1}
+
+connections:
+  events:
+    type: kafka
+    properties:
+      bootstrap_servers: localhost:9092
+
+sources:
+  clicks:
+    connection: events
+    topic: clicks
+    columns:
+      user_id: STRING
+      url: STRING
+      ts: TIMESTAMP(3)
+    event_time: {column: ts, max_out_of_orderness: 10s}
+
+models:
+  sessions:
+    description: One row per session, emitted when the user has been inactive for `gap`
+    process:
+      language: python
+      file: jobs/sessionize.py
+      function: sessionize
+      inputs: [clicks]
+      key_by: [user_id]
+      config: {gap: PT30M}
+      event_time: session_closed
+      side_outputs:
+        late:
+          columns: {user_id: STRING, url: STRING, ts: TIMESTAMP(3)}
+    columns:
+      user_id: STRING
+      session_start: TIMESTAMP(3)
+      session_end: TIMESTAMP(3)
+      clicks: BIGINT
+      session_closed: TIMESTAMP(3)
+    expectations:
+      - {name: has_clicks, check: clicks > 0, on_violation: drop}
+
+  sessions_per_hour:
+    sql: |
+      SELECT window_start, COUNT(*) AS sessions, SUM(clicks) AS clicks
+      FROM TABLE(TUMBLE(TABLE sessions, DESCRIPTOR(session_closed), INTERVAL '1' HOUR))
+      GROUP BY window_start, window_end
+
+sinks:
+  sessions_out: {from: sessions, connection: events, topic: sessions}
+  late_clicks_out: {from: sessions_late, connection: events, topic: late_clicks}
+  hourly_out: {from: sessions_per_hour, connection: events, topic: sessions_per_hour}

@@ -196,6 +196,14 @@ def phase_session():
     ]
     kubectl("apply", "-f", "-", input=yaml.safe_dump_all(server))
     kubectl("rollout", "status", "deploy/jar-server", "--timeout=180s")
+    # the operator fetches session-job jars over https only by default; the test serves plain http
+    cm = json.loads(kubectl("get", "configmap", "flink-operator-config", "-o", "json"))
+    key = next(k for k in cm["data"] if k in ("config.yaml", "flink-conf.yaml"))
+    if "allowed-schemes" not in cm["data"][key]:
+        cm["data"][key] += "\nkubernetes.operator.user.artifacts.allowed-schemes: https,http\n"
+        kubectl("apply", "-f", "-", input=json.dumps(cm))
+        kubectl("rollout", "restart", "deploy/flink-kubernetes-operator")
+        kubectl("rollout", "status", "deploy/flink-kubernetes-operator", "--timeout=180s")
 
     def session_ready():
         out = kubectl("get", "flinkdeployment", "shared-flink", "-o", "json", check=False)

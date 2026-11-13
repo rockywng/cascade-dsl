@@ -26,12 +26,25 @@ SHIM_MODULE = "cascade_udfs"
 PYTHON_DIR = os.path.join(".cascade", "python")
 
 
+PYRUNNER = "cascade_pyrunner.py"
+
+
 def python_dir(p: Pipeline) -> str:
     return os.path.join(p.root_dir, PYTHON_DIR)
 
 
 def python_functions(p: Pipeline) -> list:
     return [f for f in p.functions.values() if f.language == "python"]
+
+
+def python_processes(p: Pipeline) -> list:
+    return [m for m in p.models.values() if m.process and m.process.get("language") == "python"
+            and m.copy_of is None]
+
+
+def needs_python(p: Pipeline) -> bool:
+    """PyFlink at runtime: Python UDFs, or Python process models (the job is driven by pyrunner.py)."""
+    return bool(python_functions(p) or python_processes(p))
 
 
 def shim(p: Pipeline) -> str:
@@ -63,10 +76,16 @@ def write_python_dir(p: Pipeline) -> str | None:
 
 def python_files(p: Pipeline) -> dict[str, str]:
     """File name -> content of everything the Python workers import (for the deploy ConfigMap)."""
-    out = {f"{SHIM_MODULE}.py": shim(p)}
+    out = {f"{SHIM_MODULE}.py": shim(p)} if python_functions(p) else {}
     for f in python_functions(p):
         with open(os.path.join(p.root_dir, f.file)) as fh:
             out[os.path.basename(f.file)] = fh.read()
+    if python_processes(p):
+        with open(os.path.join(os.path.dirname(__file__), "pyrunner.py")) as fh:
+            out[PYRUNNER] = fh.read()
+        for m in python_processes(p):
+            with open(os.path.join(p.root_dir, m.process["file"])) as fh:
+                out[os.path.basename(m.process["file"])] = fh.read()
     return out
 
 

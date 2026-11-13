@@ -124,20 +124,7 @@ public final class SqlRunner {
         // replication slots first: a lost one is refused or moved to a new generation (slot.name)
         Map<String, String> slots = validate ? new java.util.HashMap<>() : Guards.resolve(setupStmts, restoring, env);
         for (String raw : setupStmts) {
-            String stmt = Guards.rename(raw, slots);
-            Matcher m = SET.matcher(stmt);
-            if (Guards.isGuard(stmt)) {
-                continue;
-            } else if (Tables.isEnsure(stmt)) {
-                Tables.ensure(tEnv, stmt);
-            } else if (Processes.isDirective(stmt)) {
-                Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
-                processes = true;
-            } else if (m.matches()) {
-                tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));
-            } else {
-                tEnv.executeSql(stripSemicolon(stmt));
-            }
+            processes |= applySetup(tEnv, Guards.rename(raw, slots));
         }
         if (plan != null) {
             CompiledPlan compiled = tEnv.loadPlan(PlanReference.fromFile(plan));
@@ -176,6 +163,33 @@ public final class SqlRunner {
                 result.await();
             }
         }
+    }
+
+    /**
+     * One setup statement (guards were resolved before). Returns true for a process model (DataStream
+     * code). Public for the Python runner (cascade_dsl/pyrunner.py), which handles Python process models
+     * itself and everything else through here.
+     */
+    public static boolean applySetup(StreamTableEnvironment tEnv, String stmt) throws Exception {
+        Matcher m = SET.matcher(stmt);
+        if (Guards.isGuard(stmt)) {
+            return false;
+        } else if (Tables.isEnsure(stmt)) {
+            Tables.ensure(tEnv, stmt);
+        } else if (Processes.isDirective(stmt)) {
+            Processes.apply(tEnv, stmt); // a process model: DataStream code between SQL views
+            return true;
+        } else if (m.matches()) {
+            tEnv.getConfig().getConfiguration().setString(m.group(1), m.group(2).replace("''", "'"));
+        } else {
+            tEnv.executeSql(stripSemicolon(stmt));
+        }
+        return false;
+    }
+
+    /** A script read, secrets substituted from the environment, split into statements. */
+    public static List<String> readScript(String path, Map<String, String> env) throws Exception {
+        return split(substitute(read(path), env));
     }
 
     static String tempFile(String name, String base64) throws Exception {

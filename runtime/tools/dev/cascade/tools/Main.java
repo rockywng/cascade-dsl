@@ -192,6 +192,74 @@ public final class Main {
         return out;
     }
 
+    /**
+     * One test against an environment whose setup is done (the Python runner prepares it, with its
+     * Python process models): the query or capture of runTests, as a JSON object.
+     */
+    public static String runPreparedTest(TableEnvironment tEnv, String dir, int timeoutSec) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        ExecutorService pool = Executors.newCachedThreadPool();
+        TableResult[] holder = new TableResult[1];
+        long start = System.currentTimeMillis();
+        try {
+            Path test = Paths.get(dir);
+            String query = new String(Files.readAllBytes(test.resolve("query.sql")), StandardCharsets.UTF_8).trim();
+            if (query.endsWith(";")) {
+                query = query.substring(0, query.length() - 1);
+            }
+            Path capture = test.resolve("capture.txt");
+            Future<List<Object>> rows;
+            if (Files.exists(capture)) {
+                List<String> spec = Files.readAllLines(capture, StandardCharsets.UTF_8);
+                Path file = Paths.get(spec.get(1).trim());
+                r.put("columns", columns(tEnv.from("`" + spec.get(0).trim() + "`").getResolvedSchema()));
+                TableResult result = tEnv.executeSql(query);
+                holder[0] = result;
+                rows = pool.submit(() -> {
+                    result.await();
+                    return readCapture(file);
+                });
+            } else {
+                TableResult result = tEnv.executeSql(query);
+                holder[0] = result;
+                r.put("columns", columns(result.getResolvedSchema()));
+                rows = pool.submit(() -> {
+                    List<Object> collected = new ArrayList<>();
+                    try (CloseableIterator<Row> it = result.collect()) {
+                        while (it.hasNext()) {
+                            Row row = it.next();
+                            Map<String, Object> enc = new LinkedHashMap<>();
+                            enc.put("kind", row.getKind().shortString());
+                            List<Object> values = new ArrayList<>();
+                            for (int i = 0; i < row.getArity(); i++) {
+                                values.add(encode(row.getField(i)));
+                            }
+                            enc.put("values", values);
+                            collected.add(enc);
+                        }
+                    }
+                    return collected;
+                });
+            }
+            r.put("rows", rows.get(timeoutSec, TimeUnit.SECONDS));
+        } catch (java.util.concurrent.TimeoutException e) {
+            r.put("error", "timed out after " + timeoutSec + "s (is a source unbounded?)");
+            cancel(holder[0]);
+        } catch (Throwable t) {
+            r.put("error", errorMessage(t));
+            r.put("expectation_violation", hasCause(t, "ExpectationViolation"));
+            cancel(holder[0]);
+        }
+        r.put("millis", System.currentTimeMillis() - start);
+        pool.shutdownNow();
+        try {
+            return new org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper()
+                    .writeValueAsString(r);
+        } catch (Exception e) {
+            return "{\"error\": \"cannot encode the result\"}";
+        }
+    }
+
     private static List<Object> columns(ResolvedSchema schema) {
         List<Object> cols = new ArrayList<>();
         for (Column c : schema.getColumns()) {

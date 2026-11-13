@@ -139,11 +139,27 @@ class Tools:
                     with open(os.path.join(td, "capture.txt"), "w") as f:
                         f.write(f"{rest[0][0]}\n{rest[0][1]}\n")
             out = os.path.join(d, "out.json")
-            self._run(["run", os.path.join(d, "tests"), out, str(per_test_timeout)], timeout)
+            if any('"language": "python"' in script(c[1]) for c in cases):
+                self._run_python_tests(os.path.join(d, "tests"), out, per_test_timeout, timeout)
+            else:
+                self._run(["run", os.path.join(d, "tests"), out, str(per_test_timeout)], timeout)
             results = self._read(out)["results"]
             for r in results:
                 r["name"] = index[r["name"]]
             return results
+
+    def _run_python_tests(self, tests: str, out: str, per_test_timeout: int, timeout: int):
+        """Tests of pipelines with Python process models run on cascade_dsl/pyrunner.py (PyFlink)."""
+        py = python_executable()
+        if py is None:
+            raise ToolsError("Python process models need PyFlink: pip install apache-flink, or set CASCADE_PYTHON")
+        runner = os.path.join(os.path.dirname(__file__), "pyrunner.py")
+        env = {**os.environ, "CASCADE_JARS": os.pathsep.join([self.tools_jar, runtime_jar()])}
+        # -P: not cascade_dsl/ on sys.path (its types.py would shadow the standard library's)
+        p = subprocess.run([py, "-P", runner, "tests", tests, out, str(per_test_timeout)], capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        if p.returncode != 0 or not os.path.exists(out):
+            raise ToolsError("Python test runner failed:\n" + (p.stderr or p.stdout)[-4000:])
 
     def compile_plan(self, stmts: list[Stmt], out_path: str, timeout: int = 180) -> dict:
         with tempfile.TemporaryDirectory(prefix="cascade-plan-") as d:

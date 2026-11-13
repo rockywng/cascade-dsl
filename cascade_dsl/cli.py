@@ -261,6 +261,11 @@ def cmd_deploy(args) -> int:
     if info["mode"] == "statements":
         print("  note: without --plan-dir the job is planned at startup and operator UIDs are not pinned; "
               "use `cascade plan` for upgrades that must keep state", file=sys.stderr)
+    if info.get("target") == "session":
+        with open(os.path.join(info["out"], "REQUIREMENTS")) as f:
+            for line in f:
+                if "allowed-schemes" in line:
+                    print("  warning:" + line.lstrip("#").rstrip(), file=sys.stderr)
     if info["secrets"] and not info.get("secret_name"):
         from .deploy import env_name
         print("  needs these environment variables where the job runs: "

@@ -465,7 +465,8 @@ def _analyze_process(c: Checked, name: str, inputs: list[str]):
     _check_expectations(c, m, columns, changelog)
     p.relations[name] = RelationInfo(
         columns=columns, rowtime={et} if et else set(), changelog=changelog, inputs=inputs,
-        stateful_ops=[] if side else [StatefulOp("process", True, f"process {pr['class']}")],
+        stateful_ops=[] if side else [StatefulOp("process", True, "process " + (
+            pr["class"] if pr.get("language", "java") == "java" else f"{pr.get('file')}:{pr.get('function')}"))],
         upsert_key=pk or None)
 
 
@@ -502,7 +503,8 @@ def process_identity(m, inputs: list[str] | None = None) -> list:
     if "side_of" in pr:
         return ["side", pr["side"], pr.get("event_time")]
     ins = [f"_input{i}" for i in range(len(inputs))] if inputs is not None else pr["inputs"]
-    return [pr["class"], ins, pr.get("key_by"), sorted(pr.get("config", {}).items()), pr.get("changelog"),
+    code = pr["class"] if pr.get("language", "java") == "java" else f"{pr.get('file')}:{pr.get('function')}"
+    return [code, ins, pr.get("key_by"), sorted(pr.get("config", {}).items()), pr.get("changelog"),
             pr.get("primary_key"), pr.get("event_time"),
             sorted((k, [(c.name, c.type.text) for c in v["columns"]], v.get("event_time"))
                    for k, v in pr.get("side_outputs", {}).items())]

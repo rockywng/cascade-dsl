@@ -50,6 +50,10 @@ public final class Processes {
     public static void apply(StreamTableEnvironment tEnv, String stmt) throws Exception {
         Map<String, Object> spec = JSON.readValue(stmt.substring(DIRECTIVE.length()).trim(), Map.class);
         String name = (String) spec.get("name");
+        if ("python".equals(spec.get("language"))) {
+            throw new IllegalStateException("process model " + name + " is Python: run this job with the Python "
+                    + "runner (cascade_dsl/pyrunner.py; cascade deploy does this for pipelines with Python process models)");
+        }
         String view = (String) spec.get("view");
         List<String> inputs = (List<String>) spec.get("inputs");
         List<String> keyBy = (List<String>) spec.getOrDefault("key_by", new ArrayList<>());

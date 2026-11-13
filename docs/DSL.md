@@ -212,8 +212,9 @@ the test. A table in a pluggable database needs the connection's `pdb`. The test
   twice.
 
 **Db2 CDC** is only planned against its jar. It reads changes through IBM's ASN capture, which has to
-be installed and administered inside a privileged, licensed Db2 instance. That's beyond what the
-test harness should set up.
+be installed and administered inside a privileged, licensed Db2 instance. Debezium publishes no image
+with it, so there's no trustworthy Db2 to test against in CI. The jar check did find that the connector
+doesn't bundle IBM's driver, like MySQL's and Oracle's, so the catalog adds `com.ibm.db2:jcc`.
 
 `cascade fetch-jars <project>` downloads a pipeline's connector jars into `~/.cache/cascade/jars`.
 It prints a `CASCADE_EXTRA_JARS=...` line; with that set, `cascade plan`, `test` and `verify` work

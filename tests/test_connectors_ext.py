@@ -203,3 +203,13 @@ sinks:
         self.assertIn("COPY --from=cascade-patches /patches/flink-sql-connector-dynamodb-", df)
         self.assertNotIn("wget -q -P /opt/flink/lib \"https://repo1.maven.org/maven2/org/apache/flink/"
                          "flink-sql-connector-dynamodb", df)
+
+
+class BundledDriversTest(unittest.TestCase):
+    def test_cdc_connectors_that_ship_without_their_driver_get_it(self):
+        from cascade_dsl.connectors import CATALOG, LowerCtx
+        from cascade_dsl.ir import Connection
+        for kind, driver in (("mysql-cdc", "com.mysql:mysql-connector-j"), ("oracle-cdc", "com.oracle.database.jdbc:ojdbc8"),
+                             ("db2-cdc", "com.ibm.db2:jcc")):
+            with self.subTest(connector=kind):
+                self.assertIn(driver, CATALOG[kind].extra_artifacts({}))

@@ -330,6 +330,8 @@ for _db, _port, _doc in (("sqlserver", 1433, "SQL Server"), ("db2", 50000, "Db2"
         source={"table": Prop("__table", required=True, doc="schema.table"), "startup": _CDC_STARTUP},
         source_changelog="updating", source_requires_pk=True,
         artifact=f"org.apache.flink:flink-sql-connector-{_db}-cdc",
+        # the Db2 jar doesn't bundle IBM's driver (licensing; like MySQL's and Oracle's)
+        extra_artifacts=(lambda props: ["com.ibm.db2:jcc"]) if _db == "db2" else None,
         finish=_incremental(_passthrough_table),
     ))
 register(ConnectorSpec(

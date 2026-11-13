@@ -65,7 +65,7 @@ class AlertRulesTest(unittest.TestCase):
             sel = f"{{{JOB}}}"
             # alert -> (input series, eval time, expected labels added by the expression)
             cases = {
-                "CascadeJobDown": ([], "6m", {}),
+                "CascadeJobDown": ([], "6m", {"job_name": "test_pipe"}),  # absent() keeps the selector's labels
                 "CascadeJobRestarting": ([up, {"series": f"flink_jobmanager_job_numRestarts{sel}",
                                                "values": "0 0 0 1 1 1"}], "4m", {"job_name": "test_pipe"}),
                 "CascadeCheckpointsFailing": ([up, {"series": f"flink_jobmanager_job_numberOfFailedCheckpoints{sel}",

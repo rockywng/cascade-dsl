@@ -191,6 +191,9 @@ def phase_session():
         {"apiVersion": "flink.apache.org/v1beta1", "kind": "FlinkDeployment", "metadata": {"name": "shared-flink"},
          "spec": {"image": "cascade-it:it", "flinkVersion": _operator_version("2.3.0"), "serviceAccount": "flink",
                   "flinkConfiguration": {"taskmanager.numberOfTaskSlots": "2"},
+                  "podTemplate": {"spec": {"containers": [{"name": "flink-main-container", "volumeMounts": [
+                      {"name": "flink-data", "mountPath": "/flink-data"}]}],
+                      "volumes": [{"name": "flink-data", "hostPath": {"path": "/flink-data", "type": "Directory"}}]}},
                   "jobManager": {"resource": {"memory": "1024m", "cpu": 0.25}},
                   "taskManager": {"resource": {"memory": "1536m", "cpu": 0.5}}}},
     ]
@@ -221,7 +224,8 @@ def phase_session():
     with open(os.path.join(d, "pipeline.yaml"), "w") as f:
         f.write("""
 pipeline: session_probe
-deploy: {target: session, session_cluster: shared-flink, jar_uri: "http://jar-server/cascade-runtime.jar"}
+deploy: {target: session, session_cluster: shared-flink, jar_uri: "http://jar-server/cascade-runtime.jar",
+         checkpoints: {interval: 10s, dir: "file:///flink-data/checkpoints"}, savepoints: "file:///flink-data/savepoints"}
 sources:
   gen: {connection: datagen, rows_per_second: 5, columns: {k: INT, v: STRING}}
 models:

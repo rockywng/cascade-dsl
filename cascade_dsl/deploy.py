@@ -262,6 +262,21 @@ def _monitoring_files(r: Result, cfg: dict, out: str):
         json.dump(monitoring.dashboard(r, cfg), f, indent=1)
 
 
+def _session_conf(cfg: dict) -> dict:
+    """Job-level configuration of a session job: the operator needs a checkpoint directory for savepoint
+    and last-state upgrades, and the job's own checkpointing settings."""
+    conf = {}
+    cp = cfg.get("checkpoints") or {}
+    if cp.get("interval"):
+        conf["execution.checkpointing.interval"] = str(cp["interval"])
+    if cp.get("dir"):
+        conf["execution.checkpointing.dir"] = str(cp["dir"])
+    if cfg.get("savepoints"):
+        conf["execution.checkpointing.savepoint-dir"] = str(cfg["savepoints"])
+    conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
+    return conf
+
+
 def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mode: str, secrets: list,
                  cfg: dict) -> dict:
     """A FlinkSessionJob on an existing (operator-managed) session cluster."""
@@ -277,6 +292,10 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
         raise DeployError("Python UDFs need their files on the cluster; a session job can't ship them. "
                           "Use target: kubernetes")
     sc = p.scaling
+    mode_ = cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint")
+    if mode_ in ("savepoint", "last-state") and not (cfg.get("checkpoints") or {}).get("dir"):
+        raise DeployError(f"upgrade_mode {mode_} needs deploy.checkpoints.dir (the operator refuses the session job "
+                          "without a checkpoint directory)")
     job = {
         "apiVersion": "flink.apache.org/v1beta1", "kind": "FlinkSessionJob", "metadata": metadata,
         "spec": {
@@ -285,8 +304,7 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
                     "parallelism": (sc.parallelism if sc and sc.parallelism else 1),
                     "upgradeMode": cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint"),
                     "state": "running"},
-            **({"flinkConfiguration": {str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()}}
-               if cfg.get("flink_config") else {}),
+            "flinkConfiguration": _session_conf(cfg),
         },
     }
     with open(os.path.join(out, "flinksessionjob.yaml"), "w") as f:

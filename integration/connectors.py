@@ -684,7 +684,8 @@ def case_oracle():
                            for line in sql("SELECT id, name, qty FROM items ORDER BY id;").splitlines() if line.strip())
     mirror_case("oracle-cdc", '{type: oracle-cdc, properties: {hostname: localhost, port: 11521, username: c##flinkuser, '
                 'password: "${secret:oracle}", database: XE, pdb: XEPDB1}}',
-                "    table: APP.ITEMS\n    options: {debezium.log.mining.strategy: online_catalog}",
+                "    table: APP.ITEMS\n    options: {debezium.log.mining.strategy: online_catalog, "
+                "scan.incremental.snapshot.enabled: 'false'}",
                 "{ID: INT NOT NULL, NAME: STRING, QTY: INT}", "ID", truth,
                 lambda: sql("INSERT INTO items VALUES (4, 'd', 1);\nUPDATE items SET qty = 70 WHERE id = 2;\n"
                             "DELETE FROM items WHERE id = 3;\nCOMMIT;"),

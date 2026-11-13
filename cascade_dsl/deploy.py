@@ -119,6 +119,10 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     if plan_dir and any(m.process for m in p.models.values()):
         raise DeployError("pipelines with process models deploy as statements (a compiled plan can't contain "
                           "DataStream code); drop --plan-dir")
+    from .plans import uses_variant
+    if plan_dir and uses_variant(p):
+        raise DeployError("this pipeline uses VARIANT, which Flink 2.3 can't write into a compiled plan; drop "
+                          "--plan-dir (the job is planned at startup)")
     if plan_dir and p.mode == "batch":
         raise DeployError("batch pipelines deploy as statements (Flink compiles plans for streaming jobs only); "
                           "drop --plan-dir")

@@ -17,6 +17,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -264,7 +265,16 @@ def pin_uids(old: dict, new: dict, allow_drift: bool = True, tag: str | None = N
 def plan_setup(stmts) -> list:
     """Statements a compiled plan needs registered before EXECUTE PLAN (plans reference
     temporary tables and functions by name only, which also keeps connector secrets out of plans)."""
-    return [s for s in stmts if s.kind in ("set", "function", "source", "sink", "quarantine")]
+    return [s for s in stmts if s.kind in ("set", "function", "ml_model", "source", "sink", "quarantine")]
+
+
+def uses_variant(p) -> bool:
+    """Flink 2.3 can't serialize VARIANT into a compiled plan ("Unable to serialize logical type
+    'VARIANT'"), whether a column or an intermediate expression has it."""
+    cols = [c for rel in p.relations.values() for c in (rel.columns or [])]
+    if any(c.type is not None and "VARIANT" in c.type.text for c in cols):
+        return True
+    return any(re.search(r"\b(TRY_)?PARSE_JSON\s*\(", m.sql or "", re.I) for m in p.models.values())
 
 
 def compile_plan(path: str, flink_home: str, out: str, env: str | None = None, local: bool = False,
@@ -277,6 +287,10 @@ def compile_plan(path: str, flink_home: str, out: str, env: str | None = None, l
     if any(m.process for m in r.checked.pipeline.models.values()):
         raise PlanError("this pipeline has process models: Flink can't compile a plan for DataStream code. "
                         "Deploy without --plan-dir; give stateful process operators .uid(ctx.uid(...))")
+    if uses_variant(r.checked.pipeline):
+        raise PlanError("this pipeline uses VARIANT, which Flink 2.3 can't write into a compiled plan. Deploy "
+                        "without --plan-dir: the job is planned at startup, and operator UIDs follow the query "
+                        "(check upgrades with cascade restore-test)")
     if r.checked.pipeline.mode == "batch":
         raise PlanError("batch pipelines have no compiled plan: Flink compiles plans for streaming jobs only, "
                         "and a batch run has no state to keep across upgrades. Deploy without --plan-dir.")
@@ -322,11 +336,14 @@ def restore_test(old_path: str, new_path: str, flink_home: str, env: str | None 
     for label, r in (("old", old_r), ("new", new_r)):
         if r.lowered is None:
             raise PlanError(f"{label} version does not compile:\n" + "\n".join(d.format() for d in r.diagnostics.errors))
-    if any(m.process for r in (old_r, new_r) for m in r.checked.pipeline.models.values()):
+    if any(m.process for r in (old_r, new_r) for m in r.checked.pipeline.models.values()) \
+            or any(uses_variant(r.checked.pipeline) for r in (old_r, new_r)):
         with tempfile.TemporaryDirectory(prefix="cascade-restore-") as d:
             old = localize(old_r.lowered, old_r.checked, "restore", os.path.join(d, "old"))
             new = localize(new_r.lowered, new_r.checked, "restore", os.path.join(d, "new"))
-            result = tools.restore_test_statements(old, new, seconds, allow_state_loss=allow_state_loss)
+            jars = sorted({os.path.normpath(os.path.join(r.checked.pipeline.root_dir, f.jar)) for r in (old_r, new_r)
+                           for f in r.checked.pipeline.functions.values() if f.language == "java" and f.jar})
+            result = tools.restore_test_statements(old, new, seconds, allow_state_loss=allow_state_loss, jars=jars)
         result["pinned"] = False
         result["report"] = None
         result["mode"] = "statements"

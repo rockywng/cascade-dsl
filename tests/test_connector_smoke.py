@@ -109,6 +109,25 @@ c:
 """, f"table: {table}", _meta_columns(kind, physical or {"id": "BIGINT NOT NULL"}), pk)
 
 
+GEN_ML = """
+pipeline: smoke
+ml_models:
+  mdl:
+    provider: {provider}
+    input: {{body: STRING}}
+    output: {{label: STRING}}
+    properties: {props}
+sources:
+  gen:
+    connection: datagen
+    columns: {{id: STRING NOT NULL, body: STRING}}
+models:
+  m:
+    sql: SELECT id, label FROM ML_PREDICT(TABLE gen, MODEL mdl, DESCRIPTOR(body))
+sinks:
+  out: {{from: m, connection: print}}
+"""
+
 METADATA_CASES = {
     "kafka-source": source_case("c: {type: kafka, properties: {bootstrap_servers: 'k:9092'}}",
                                 "topic: [a, b]\nformat: json", _meta_columns("kafka", {"id": "STRING"}), None),
@@ -140,6 +159,8 @@ sinks:
                                       "{id: STRING, v: BIGINT}", None),
     "kafka-keyed-sink": sink_case("c: {type: kafka, properties: {bootstrap_servers: 'k:9092'}}",
                                   "topic: out\nkey_fields: [id]\nkey_format: raw", mode="append"),
+    "ml-openai": GEN_ML.format(provider="openai", props="{endpoint: 'https://api.example.com/v1/chat/completions', "
+                               "model: m, api_key: '${secret:k}'}"),
     "filesystem-source": source_case("c: {type: filesystem}", "path: 'file://{tmp}'\nformat: json",
                                      _meta_columns("filesystem", {"id": "STRING"}), None),
     "postgres-cdc": _cdc_meta("postgres-cdc", ", database: app"),

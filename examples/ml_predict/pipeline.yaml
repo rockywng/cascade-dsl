@@ -1,0 +1,37 @@
+# Model inference with ML_PREDICT: support tickets classified by an OpenAI-compatible chat model.
+# Tests pin the model's answers (tests/), so they run without calling the endpoint.
+pipeline: ticket_triage
+defaults: {state_ttl: 1d}
+
+ml_models:
+  triage:
+    description: Classifies a support ticket into a queue
+    provider: openai
+    input: {body: STRING}
+    output: {queue: STRING}
+    properties:
+      endpoint: https://api.openai.com/v1/chat/completions
+      model: gpt-4.1-mini
+      api_key: ${secret:openai/api_key}
+      system_prompt: "Answer with one word: billing, outage or other."
+
+connections:
+  bus: {type: kafka, properties: {bootstrap_servers: localhost:9092}}
+
+sources:
+  tickets:
+    connection: bus
+    topic: tickets
+    columns:
+      ticket_id: STRING NOT NULL
+      body: STRING
+      ts: TIMESTAMP(3)
+
+models:
+  routed:
+    sql: |
+      SELECT ticket_id, queue, ts
+      FROM ML_PREDICT(TABLE tickets, MODEL triage, DESCRIPTOR(body))
+
+sinks:
+  to_queues: {from: routed, connection: bus, topic: tickets.routed}

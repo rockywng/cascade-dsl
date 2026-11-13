@@ -32,7 +32,7 @@ AGG_FUNCS = {"COUNT", "SUM", "MIN", "MAX", "AVG", "LISTAGG", "COLLECT", "STDDEV_
              "JSON_ARRAYAGG", "JSON_OBJECTAGG"}
 STRING_FUNCS = {"UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "CONCAT", "CONCAT_WS", "SUBSTRING",
                 "SUBSTR", "REPLACE", "REGEXP_REPLACE", "REGEXP_EXTRACT", "INITCAP", "LPAD",
-                "RPAD", "MD5", "SHA256", "JSON_VALUE", "DATE_FORMAT", "UUID"}
+                "RPAD", "MD5", "SHA256", "JSON_VALUE", "DATE_FORMAT", "UUID", "JSON_STRING"}
 WINDOW_TVFS = {"TUMBLE", "HOP", "CUMULATE", "SESSION"}
 WINDOW_COLS = {"window_start", "window_end", "window_time"}
 CLAUSE_END = {"WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT",
@@ -153,6 +153,7 @@ class Call:
     pos: int
     column_aliases: list[str] | None = None
     tables: list[tuple[str, list[str]]] = field(default_factory=list)  # (table arg, PARTITION BY columns)
+    model: str | None = None  # ML_PREDICT(TABLE t, MODEL m, ...)
 
 
 def analyze_sql(sql: str) -> tuple[list[Tok], Analysis]:
@@ -251,6 +252,8 @@ def _find_calls(toks, a: Analysis):
                             j += 1
                 call.tables.append((table, keys))
                 continue
+            if toks[j].is_kw("MODEL") and j + 1 < inner_end and toks[j + 1].kind in ("ident", "qident"):
+                call.model = toks[j + 1].name
             j += 1
         call.alias, k = _read_alias(toks, close + 1)
         if call.alias and k < n and toks[k].text == "(":
@@ -578,6 +581,8 @@ def _infer_expr(expr: list[Tok], scope: Scope) -> tuple[SqlType | None, bool, st
             return parse_type("TIMESTAMP_LTZ(3)"), False, None
         if fn in ("TO_TIMESTAMP",):
             return TIMESTAMP3, False, None
+        if fn in ("PARSE_JSON", "TRY_PARSE_JSON"):
+            return parse_type("VARIANT"), False, None
     if len(expr) == 1 and expr[0].is_kw("CURRENT_TIMESTAMP"):
         return parse_type("TIMESTAMP_LTZ(3)"), False, None
     return None, False, None
@@ -626,6 +631,13 @@ def referenced_columns(expr_sql: str) -> list[tuple[str, int]]:
 def call_relation(call: Call, rels: dict, table_fns: dict) -> RelationInfo:
     """Output of a table-valued call: a table function's ROW fields (renamed by `AS t(a, b)`); a process
     table function's partition keys followed by its ROW fields."""
+    if call.name.upper() == "ML_PREDICT":
+        # the input table's columns, then the model's output columns
+        _kind, out = table_fns.get(f"MODEL:{(call.model or '').upper()}", (None, None))
+        base = rels.get(call.tables[0][0]) if call.tables else None
+        if out is None or base is None or base.columns is None:
+            return RelationInfo(columns=None)
+        return RelationInfo(columns=list(base.columns) + [OutputColumn(n, t) for n, t in out.params])
     kind, rt = table_fns.get(call.name.upper(), (None, None))
     if rt is None or rt.name != "ROW":
         return RelationInfo(columns=None)

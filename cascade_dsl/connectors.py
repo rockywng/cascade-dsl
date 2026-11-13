@@ -244,6 +244,7 @@ TESTED_VERSIONS = {
     "org.apache.hudi:hudi-flink2.0-bundle": "1.2.1",                          # smoke
     "commons-logging:commons-logging": "1.4.0",
     "org.apache.iceberg:iceberg-flink-runtime-2.3": "1.12.0",  # needs Hadoop and a catalog: not smoked
+    "org.apache.flink:flink-model-openai": "2.3.0",                           # ML_PREDICT provider, smoke
 }
 
 

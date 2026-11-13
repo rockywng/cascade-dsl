@@ -1,0 +1,14 @@
+tests:
+  - name: tickets_go_to_the_predicted_queue
+    target: routed
+    given:
+      triage:                     # the model's answers: input columns and output columns
+        - {body: "I was charged twice", queue: billing}
+        - {body: "the site is down", queue: outage}
+      tickets:
+        - {ticket_id: t1, body: "I was charged twice", ts: "2026-01-01 10:00:00"}
+        - {ticket_id: t2, body: "the site is down", ts: "2026-01-01 10:00:01"}
+    expect:
+      rows:
+        - {ticket_id: t1, queue: billing}
+        - {ticket_id: t2, queue: outage}

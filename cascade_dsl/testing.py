@@ -30,6 +30,7 @@ what the external system would hold.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import tempfile
 from collections import Counter
@@ -150,8 +151,8 @@ def _validate_case(case: TestCase, p) -> str | None:
     elif target not in p.models and target not in p.sources and target not in p.sinks:
         return f"unknown target '{target}' (expected a model, <model>.quarantined or a sink)"
     for src in case.given:
-        if src not in p.sources:
-            return f"`given` names '{src}', which is not a source"
+        if src not in p.sources and src not in p.ml_models:
+            return f"`given` names '{src}', which is not a source or an ml model"
         if not isinstance(case.given[src], list):
             return f"`given.{src}` must be a list of rows"
     return None
@@ -221,6 +222,12 @@ def normalize(value, flink_type: str):
         return ("<unparseable>", str(value))
     if base in ("CHAR", "VARCHAR", "STRING"):
         return str(value).rstrip() if base == "CHAR" else str(value)
+    if base == "VARIANT" and isinstance(value, str):
+        # produced as JSON text; expected as YAML (or JSON text): compare the JSON values
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
     return _freeze(value)
 
 

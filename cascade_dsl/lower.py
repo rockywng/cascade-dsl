@@ -52,7 +52,7 @@ class Stmt:
     """One generated statement. Tools (verify, test runner, restore test) rewrite these by kind
     instead of pattern-matching SQL text."""
 
-    kind: str  # set | function | source | view | quarantine | sink | insert
+    kind: str  # set | function | ml_model | source | view | quarantine | sink | insert
     name: str
     sql: str = ""
     comment: str | None = None
@@ -85,6 +85,10 @@ class Stmt:
             body = [f"  {self.column_ddl(n, t)}" for n, t in self.columns] + [f"  {x}" for x in self.extra]
             return f"CREATE TEMPORARY TABLE {q(self.name)} (\n" + ",\n".join(body) + "\n) " \
                 + with_clause(self.options) + ";"
+        if self.kind == "ml_model":  # columns: input; extra: output column DDL
+            cols = lambda xs: ", ".join(xs)  # noqa: E731
+            return (f"CREATE TEMPORARY MODEL {q(self.name)}\nINPUT ({cols(self.column_ddl(n, t) for n, t in self.columns)})"
+                    f"\nOUTPUT ({cols(self.extra)})\n" + with_clause(self.options) + ";")
         if self.kind == "insert":
             conflict = f"\nON CONFLICT DO {self.on_conflict.upper()}" if self.on_conflict else ""
             return f"INSERT INTO {q(self.name)}\n{self.query}{conflict};"
@@ -158,6 +162,12 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
                                                  f"AS {lit(EXPECT_CLASS)} LANGUAGE JAVA;"))
 
     _lower_functions(p, stmts)
+    for mm in p.ml_models.values():
+        stmts.append(Stmt("ml_model", mm.name, comment=f"ml model: {mm.name} ({mm.provider})"
+                          + (f" -- {mm.description}" if mm.description else ""),
+                          columns=[(col.name, col.type.text) for col in mm.input],
+                          extra=[f"{q(col.name)} {col.type.text}" for col in mm.output],
+                          options={"provider": mm.provider, **{k: optstr(v) for k, v in mm.properties.items()}}))
 
     for s in p.sources.values():
         extra = []

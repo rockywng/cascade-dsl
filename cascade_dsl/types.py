@@ -16,7 +16,7 @@ ALIASES = {
 
 SIMPLE = {
     "STRING", "BOOLEAN", "TINYINT", "SMALLINT", "INT", "BIGINT", "FLOAT", "DOUBLE",
-    "DATE", "BYTES",
+    "DATE", "BYTES", "VARIANT",  # VARIANT: semi-structured data (Flink 2.1+; PARSE_JSON)
 }
 PARAMETERIZED = {
     # name: (min params, max params)

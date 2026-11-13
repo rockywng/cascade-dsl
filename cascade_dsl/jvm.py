@@ -86,13 +86,14 @@ class Tools:
         major = self._java_major()
         return [o for o in str(opts).split() if all(not o.startswith(f) or major >= v for f, v in newer.items())]
 
-    def _run(self, args: list[str], timeout: int) -> None:
+    def _run(self, args: list[str], timeout: int, extra_cp: list[str] | None = None) -> None:
         java = self._java()
         cp = [self.tools_jar, runtime_jar(), os.path.join(self.flink_home, "lib", "*")]
         # Python UDF support lives in opt/ in the Flink distribution
         cp += sorted(glob.glob(os.path.join(self.flink_home, "opt", "flink-python*.jar")))[:1]
         # connector jars that aren't in FLINK_HOME/lib, e.g. from `cascade fetch-jars`
         cp += [j for j in os.environ.get("CASCADE_EXTRA_JARS", "").split(os.pathsep) if j]
+        cp += list(extra_cp or [])
         cp = os.pathsep.join(cp)
         cmd = [java, *self._java_opts(),
                f"-Dlog4j.configurationFile={os.path.join(REPO, 'runtime', 'tools', 'log4j2.properties')}",
@@ -191,7 +192,9 @@ class Tools:
             shutil.rmtree(d, ignore_errors=True)
 
     def restore_test_statements(self, old: list[Stmt], new: list[Stmt], seconds: int = 8, timeout: int = 400,
-                                allow_state_loss: bool = False) -> dict:
+                                allow_state_loss: bool = False, jars: list[str] | None = None) -> dict:
+        """`jars`: UDF jars. A whole-script job is built in this JVM, so `USING JAR` classes must be on its
+        classpath (the planner loads them, but deserializing the job graph doesn't)."""
         d = tempfile.mkdtemp(prefix="cascade-restore-")
         try:
             out = os.path.join(d, "out.json")
@@ -215,7 +218,7 @@ class Tools:
                     raise ToolsError("Python restore test failed:\n" + (p.stderr or p.stdout)[-4000:])
                 return self._read(out)
             self._run(["restore-test-statements", paths[0], paths[1], os.path.join(d, "savepoints"), str(seconds),
-                       out, "allow" if allow_state_loss else "strict"], timeout)
+                       out, "allow" if allow_state_loss else "strict"], timeout, extra_cp=jars)
             return self._read(out)
         finally:
             shutil.rmtree(d, ignore_errors=True)

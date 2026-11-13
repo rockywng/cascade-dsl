@@ -45,6 +45,9 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
     for st in lowered.statements:
         if st.kind in ("source", "sink", "quarantine"):
             st = st.without_metadata()  # stand-ins have no connector metadata: those columns become data
+        if st.kind == "ml_model":
+            out.append(_model_stand_in(st, mode, workdir, (fixtures or {}).get(st.name)))
+            continue
         if mode == "test" and st.kind == "ensure":
             continue  # fixtures stand in for the table
         if mode == "test" and st.kind == "set" and st.name == "execution.runtime-mode":
@@ -61,6 +64,7 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
                     rows = (fixtures or {}).get(p.sources[st.name].copy_of)
                 out.append(_fixture_source(st, updating, workdir, rows, c, watermarks))
                 continue
+            st = _variant_from_text(st)
             out.append(st.with_options(_source_options(st, updating, mode, workdir, rows_per_second, c)))
         elif st.kind in ("sink", "quarantine"):
             if mode != "test":
@@ -77,9 +81,44 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
     return out
 
 
+def _model_stand_in(st: Stmt, mode: str, workdir: str, rows) -> Stmt:
+    """ML models answer from fixtures (the tools jar's 'cascade-fixture' provider): in tests, the rows
+    given under the model's name (input and output columns); elsewhere NULL outputs, never a real call."""
+    d = os.path.join(workdir, "models")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{st.name}.jsonl")
+    inputs = [n for n, _ in st.columns]
+    outputs = [x.split("`")[1] for x in st.extra]
+    with open(path, "w") as f:
+        for i, row in enumerate(rows or []):
+            if not isinstance(row, dict):
+                raise FixtureError(f"fixture row {i + 1} for model '{st.name}' must be a mapping")
+            unknown = set(row) - set(inputs) - set(outputs)
+            if unknown:
+                raise FixtureError(f"fixture row {i + 1} for model '{st.name}' has unknown column(s) "
+                                   f"{sorted(unknown)}; inputs: {inputs}, outputs: {outputs}")
+            f.write(json.dumps({"input": [_jsonable(row.get(n)) for n in inputs],
+                                "output": [_jsonable(row.get(n)) for n in outputs]}) + "\n")
+    return st.with_options({"provider": "cascade-fixture", "path": path,
+                            "missing": "error" if mode == "test" else "null"})
+
+
 def _python_executable() -> str | None:
     from .jvm import python_executable
     return python_executable()
+
+
+def _variant_from_text(st: Stmt) -> Stmt:
+    """Neither datagen nor the JSON format produces VARIANT: stand-ins compute the column as NULL. (Random
+    JSON would fail queries that index into it: `v['k']` on a non-object variant is a runtime error.)"""
+    variants = [n for n, t in st.columns if t.split(" ")[0] == "VARIANT" and n not in st.meta]
+    if not variants:
+        return st
+    meta = dict(st.meta)
+    for n in variants:
+        meta[n] = ("computed", "TRY_PARSE_JSON(CAST(NULL AS STRING))")
+    return Stmt(st.kind, st.name, st.sql, st.comment, st.columns, st.extra, st.options, st.query,
+                st.on_conflict, meta)
 
 
 def _source_options(st: Stmt, updating: bool, mode: str, workdir: str, rps: int, c: Checked) -> dict:

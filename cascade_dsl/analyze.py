@@ -50,6 +50,7 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     backfill.apply(p, d)
     _check_namespace(c)
     _check_functions(c)
+    _check_ml_models(c)
     _check_connections(c)
     _check_sources(c)
     _check_idle_timeouts(c)
@@ -61,6 +62,42 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     _check_scaling(c)
     _check_batch(c)
     return c
+
+
+# --- ML models (ML_PREDICT) --------------------------------------------------------------
+
+# provider -> (artifact, required options). Not triton: flink-model-triton 2.3.0 rejects every input
+# column when the model is created ("input column x should be null, but is a STRING"; connector smoke test)
+ML_PROVIDERS = {
+    "openai": ("org.apache.flink:flink-model-openai", ("endpoint", "api-key", "model")),
+}
+ML_SECRET_KEYS = re.compile(r"(api-key|auth-token|password|secret|token)", re.I)
+
+
+def _check_ml_models(c: Checked):
+    from .connectors import SECRET_RE
+    p, d = c.pipeline, c.diagnostics
+    for m in p.ml_models.values():
+        if m.name in p.relation_names() or m.name.upper() in {f.upper() for f in p.functions}:
+            d.error("CD101", f"ml model '{m.name}' has the name of a table or function", m.loc, node=m.name)
+        known = ML_PROVIDERS.get(m.provider)
+        if known:
+            c.extra_artifacts.add(known[0])
+            for req in known[1]:
+                if req not in m.properties:
+                    d.error("CD209", f"ml model '{m.name}': provider {m.provider} needs property '{req}'", m.loc,
+                            node=m.name)
+        elif not m.artifacts:
+            d.error("CD200", f"ml model '{m.name}': provider '{m.provider}' isn't built in (openai); "
+                    "list the jar(s) that provide it under `artifacts`", m.loc, node=m.name)
+        else:
+            c.extra_artifacts |= set(m.artifacts)
+        for k, v in m.properties.items():
+            if ML_SECRET_KEYS.search(k) and not SECRET_RE.match(str(v)):
+                d.error("CD201", f"ml model '{m.name}': '{k}' is a secret and must be a ${{secret:...}} reference",
+                        m.loc, node=m.name)
+        if not m.input or not m.output:
+            d.error("CD005", f"ml model '{m.name}' needs input and output columns", m.loc, node=m.name)
 
 
 # --- names / connections ---------------------------------------------------------------
@@ -349,6 +386,11 @@ def _check_models(c: Checked):
                 # its @StateHint state expires with table.exec.state.ttl unless the hint sets its own ttl
                 a.ops.append(StatefulOp("process_table", False, f"process table function {f.name} keeps state "
                                         "per partition key"))
+            elif call.name.upper() == "ML_PREDICT":
+                if call.model is None or call.model not in p.ml_models:
+                    d.error("CD302", f"model '{m.name}': ML_PREDICT names unknown ml model '{call.model}'",
+                            _sql_loc(m, call.pos), node=m.name,
+                            hint=f"declare it under ml_models ({', '.join(p.ml_models) or 'none declared'})")
             elif f is not None and f.kind not in ("table", "process_table"):
                 d.error("CD165", f"model '{m.name}': {f.name} is a {f.kind} function, not a table function",
                         _sql_loc(m, call.pos), node=m.name,
@@ -421,8 +463,11 @@ def _analyze_model(c: Checked, name: str, inputs: list[str]):
                         hint=f"time attributes of '{table}': {', '.join(sorted(base.rowtime))}")
     columns, rowtime = infer_relation(m.sql, rels, {f.name.upper(): f.returns for f in p.functions.values()
                                                     if f.returns is not None and f.kind in ("scalar", "aggregate")},
-                                      {f.name.upper(): (f.kind, f.returns) for f in p.functions.values()
-                                       if f.kind in ("table", "process_table")})
+                                      {**{f.name.upper(): (f.kind, f.returns) for f in p.functions.values()
+                                          if f.kind in ("table", "process_table")},
+                                       **{f"MODEL:{mm.name.upper()}": ("model", parse_type(
+                                           "ROW<" + ", ".join(f"`{col.name}` {col.type.text}" for col in mm.output)
+                                           + ">")) for mm in p.ml_models.values() if mm.output}})
     columns, rowtime = _apply_lock(c, name, inputs, columns, rowtime, kinds)
     c.inferred[name] = columns
 

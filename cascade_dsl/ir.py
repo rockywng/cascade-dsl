@@ -149,6 +149,21 @@ class Sink:
 
 
 @dataclass
+class MLModel:
+    """A model for ML_PREDICT (CREATE MODEL): a provider (openai, or another provider's jar),
+    its input and output columns, and the provider's options."""
+
+    name: str
+    provider: str
+    input: list[Column]
+    output: list[Column]
+    properties: dict  # Flink option -> value
+    artifacts: list[str] = field(default_factory=list)  # other providers: Maven coordinates
+    description: str | None = None
+    loc: Location | None = None
+
+
+@dataclass
 class Quarantine:
     connection: str
     endpoint: dict
@@ -207,6 +222,7 @@ class Pipeline:
     secrets: set[str] = field(default_factory=set)
     scaling: Scaling | None = None
     functions: dict[str, Function] = field(default_factory=dict)
+    ml_models: dict[str, "MLModel"] = field(default_factory=dict)
     deploy: dict | None = None  # deployment settings (image, resources, checkpoints, ...), vars resolved
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     mode: str = "streaming"  # streaming | batch

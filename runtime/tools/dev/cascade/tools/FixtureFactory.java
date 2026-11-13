@@ -480,6 +480,13 @@ public final class FixtureFactory implements DynamicTableSourceFactory, DynamicT
                 }
                 return r;
             }
+            case VARIANT:
+                // any JSON value: an object, array, string or number in the fixture row
+                try {
+                    return org.apache.flink.types.variant.BinaryVariantInternalBuilder.parseJson(v.toString(), false);
+                } catch (java.io.IOException e) {
+                    throw new IllegalArgumentException("fixture value " + v + " is not valid JSON for VARIANT", e);
+                }
             default:
                 throw new IllegalArgumentException("fixture values of type " + t + " are not supported");
         }

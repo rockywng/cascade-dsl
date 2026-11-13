@@ -13,7 +13,7 @@ import re
 import yaml
 
 from .diagnostics import CompileError, Diagnostics, Location
-from .ir import (Column, Connection, EventTime, Expectation, Function, Model, Pipeline, Quarantine,
+from .ir import (Column, Connection, EventTime, Expectation, Function, MLModel, Model, Pipeline, Quarantine,
                  Scaling, Sink, Source)
 from .connectors import optstr
 from .types import TypeParseError, parse_type
@@ -24,7 +24,8 @@ DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h|d)\s*$")
 UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "environments",
-            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions", "mode"}
+            "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions", "mode",
+            "ml_models"}
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict",
@@ -287,6 +288,13 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         if fn is not None:
             functions[fname] = fn
 
+    ml_models = {}
+    for mname, mdef in ctx.require_mapping(doc.get("ml_models"), "ml_models", doc, "ml_models").items():
+        ctx.check_name(mname, "ml model", doc["ml_models"])
+        mdef = subst(ctx.require_mapping(mdef, f"ml model '{mname}'", doc["ml_models"], mname), doc["ml_models"],
+                     mname)
+        ml_models[mname] = _load_ml_model(mname, mdef, ctx)
+
     deploy = None
     if doc.get("deploy") is not None:
         deploy = _load_deploy(subst(ctx.require_mapping(doc["deploy"], "deploy", doc, "deploy"), doc, "deploy"), ctx)
@@ -303,7 +311,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         state_ttl_ms=state_ttl_ms, flink_config=flink_config,
         connections=connections, sources=sources, models=models, sinks=sinks,
         quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, functions=functions, loc=ctx.loc(doc),
-        mode=mode,
+        mode=mode, ml_models=ml_models,
     )
     return p, diags
 
@@ -375,6 +383,22 @@ def _load_function(name, f, ctx: _Ctx) -> Function | None:
                 ctx.diags.error("CD005", f"{what}: Python aggregate functions need `accumulator`, the Flink type "
                                 f"of what create_accumulator returns ({e})", ctx.loc(f))
     return fn
+
+
+def _load_ml_model(name, m, ctx: _Ctx) -> MLModel:
+    what = f"ml model '{name}'"
+    ctx.check_keys(m, {"provider", "input", "output", "properties", "artifacts", "description"}, what)
+    for req in ("provider", "input", "output"):
+        if req not in m:
+            ctx.diags.error("CD005", f"{what} is missing '{req}'", ctx.loc(m))
+    # Flink's model options are hyphenated (api-key, system-prompt); YAML keys may use underscores
+    props = {str(k).replace("_", "-"): v
+             for k, v in ctx.require_mapping(m.get("properties"), f"{what}.properties", m, "properties").items()}
+    return MLModel(name=name, provider=str(m.get("provider", "")),
+                   input=_load_columns(m.get("input"), ctx, m, "input", what),
+                   output=_load_columns(m.get("output"), ctx, m, "output", what),
+                   properties=props, artifacts=[str(a) for a in (m.get("artifacts") or [])],
+                   description=m.get("description"), loc=ctx.loc(m))
 
 
 def _load_deploy(d, ctx: _Ctx) -> dict:

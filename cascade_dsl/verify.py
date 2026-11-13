@@ -63,12 +63,16 @@ def localized_script(lowered, c: Checked, tmpdir: str) -> str:
 def run_verify(c: Checked, lowered, flink_home: str, timeout: int = 180) -> VerifyResult:
     with tempfile.TemporaryDirectory(prefix="cascade-verify-") as tmp:
         script = os.path.join(tmp, "verify.sql")
+        text = localized_script(lowered, c, tmp)
         with open(script, "w") as f:
-            f.write(localized_script(lowered, c, tmp))
+            f.write(text)
         cmd = [os.path.join(flink_home, "bin", "sql-client.sh"), "embedded", "-f", script]
         jar = jvm.runtime_jar()
         if jar:
             cmd[2:2] = ["-j", jar]
+        tools = os.path.join(jvm.TARGET, "cascade-tools.jar")
+        if "'cascade-fixture'" in text and os.path.exists(tools):
+            cmd[2:2] = ["-j", tools]  # stand-in for sources datagen can't generate (VARIANT columns)
         if any(f.language == "python" for f in c.pipeline.functions.values()):
             import glob
             for py_jar in sorted(glob.glob(os.path.join(flink_home, "opt", "flink-python*.jar")))[:1]:

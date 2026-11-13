@@ -298,6 +298,8 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
              *([f"#   the operator fetches {jar}: it allows only https by default; for another scheme add it to "
                 "kubernetes.operator.user.artifacts.allowed-schemes (operator configuration; a list separated by ;, e.g. https;http)"]
                if not str(jar).startswith("https://") else []),
+             "#   the jar host must resolve to a public address: the operator refuses private, loopback and link-"
+             "local hosts (kubernetes.operator.user.artifacts.disallow-restricted-hosts, SSRF protection)",
              "#   connector jars: " + (", ".join(sorted(r.lowered.manifest["artifacts"])) or "none"),
              "#   secrets as environment variables on the JobManager and TaskManagers: "
              + (", ".join(env_name(s) for s in secrets) or "none")]

@@ -200,7 +200,10 @@ def phase_session():
     cm = json.loads(kubectl("get", "configmap", "flink-operator-config", "-o", "json"))
     key = next(k for k in cm["data"] if k in ("config.yaml", "flink-conf.yaml"))
     if "allowed-schemes" not in cm["data"][key]:
-        cm["data"][key] += "\nkubernetes.operator.user.artifacts.allowed-schemes: https;http\n"
+        # and refuses hosts that resolve to private addresses (SSRF protection, FLINK-40400): the test's jar
+        # server is in-cluster on purpose, so the test relaxes both
+        cm["data"][key] += ("\nkubernetes.operator.user.artifacts.allowed-schemes: https;http\n"
+                            "kubernetes.operator.user.artifacts.disallow-restricted-hosts: false\n")
         kubectl("apply", "-f", "-", input=json.dumps(cm))
         kubectl("rollout", "restart", "deploy/flink-kubernetes-operator")
         kubectl("rollout", "status", "deploy/flink-kubernetes-operator", "--timeout=180s")

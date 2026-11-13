@@ -200,8 +200,16 @@ their official emulators:
   - **A cleaned-up SQL Server change table:** the change still arrived.
   - **Postgres:** see the next section.
 
-Kafka, Postgres CDC and JDBC also run in `integration/run.py`. Oracle and Db2 CDC are only planned
-against their jars; their images need licences and minutes of setup.
+Kafka, Postgres CDC and JDBC also run in `integration/run.py`.
+
+**Oracle CDC** runs against Oracle XE 21c (multitenant), set up by `integration/oracle/setup.sh`:
+ARCHIVELOG mode, supplemental logging, and a common user with LogMiner grants. The setup is part of
+the test. A table in a pluggable database needs the connection's `pdb`. The test found that the
+connector doesn't bundle the Oracle driver, so the catalog adds `ojdbc8`.
+
+**Db2 CDC** is only planned against its jar. It reads changes through IBM's ASN capture, which has to
+be installed and administered inside a privileged, licensed Db2 instance. That's beyond what the
+test harness should set up.
 
 `cascade fetch-jars <project>` downloads a pipeline's connector jars into `~/.cache/cascade/jars`.
 It prints a `CASCADE_EXTRA_JARS=...` line; with that set, `cascade plan`, `test` and `verify` work

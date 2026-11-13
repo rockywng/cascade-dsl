@@ -194,6 +194,7 @@ TESTED_VERSIONS = {
     "org.apache.flink:flink-connector-jdbc-db2": "4.1.0-2.2",
     "com.microsoft.sqlserver:mssql-jdbc": "13.6.2.jre11",
     "com.oracle.database.jdbc:ojdbc11": "23.26.4.0.0",
+    "com.oracle.database.jdbc:ojdbc8": "19.33.0.0",  # the oracle-cdc driver (Debezium 1.9: the 19c line)
     "com.ibm.db2:jcc": "12.1.5.0",
     "org.apache.hadoop:hadoop-client-api": "3.4.2",
     "org.apache.hadoop:hadoop-client-runtime": "3.4.2",
@@ -303,6 +304,8 @@ register(ConnectorSpec(
     source={"table": Prop("__table", required=True, doc="schema.table"), "startup": _CDC_STARTUP},
     source_changelog="updating", source_requires_pk=True,
     artifact="org.apache.flink:flink-sql-connector-oracle-cdc",
+    # like MySQL's, the jar doesn't bundle the driver (found by integration/connectors.py: "No suitable driver")
+    extra_artifacts=lambda props: ["com.oracle.database.jdbc:ojdbc8"],
     finish=_incremental(_db_table_finish("schema-name", "table-name")),
 ))
 for _db, _port, _doc in (("sqlserver", 1433, "SQL Server"), ("db2", 50000, "Db2")):

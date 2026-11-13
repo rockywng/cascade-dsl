@@ -200,7 +200,7 @@ def phase_session():
     cm = json.loads(kubectl("get", "configmap", "flink-operator-config", "-o", "json"))
     key = next(k for k in cm["data"] if k in ("config.yaml", "flink-conf.yaml"))
     if "allowed-schemes" not in cm["data"][key]:
-        cm["data"][key] += "\nkubernetes.operator.user.artifacts.allowed-schemes: https,http\n"
+        cm["data"][key] += "\nkubernetes.operator.user.artifacts.allowed-schemes: https;http\n"
         kubectl("apply", "-f", "-", input=json.dumps(cm))
         kubectl("rollout", "restart", "deploy/flink-kubernetes-operator")
         kubectl("rollout", "status", "deploy/flink-kubernetes-operator", "--timeout=180s")

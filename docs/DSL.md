@@ -41,7 +41,10 @@ models: {...}
 sinks: {...}
 quarantine: {...}
 functions: {...}                  # user-defined functions; see "Functions" below
+ml_models: {...}                  # models for ML_PREDICT; see "Model inference" below
 deploy: {...}                     # Kubernetes deployment; see "Deployment" below
+# or, instead of sources/models/sinks:
+replicate: {...}                  # whole-database replication; see "Replication" below
 ```
 
 Durations: `500ms`, `5s`, `10m`, `1h`, `7d`.
@@ -49,6 +52,10 @@ Durations: `500ms`, `5s`, `10m`, `1h`, `7d`.
 ### Variables and secrets
 
 - `${var:name}` is resolved at compile time from `vars`, then overridden by `environments.<env>.vars`.
+- `${file:name}` names a file the job reads, such as a TLS trust store. Like a secret it stays a
+  placeholder. At startup the runner replaces it with `$CASCADE_FILES_DIR/<name>` (default
+  `/opt/cascade/files`; `/` and other characters become `_`), where `cascade deploy` mounts the Secret
+  `<deployment>-files`.
 - `${secret:path}` is **never resolved by the compiler**. It is passed through to the generated SQL as
   a placeholder and listed in `manifest.json → secrets`; the platform agent injects it at deploy
   time. Properties marked as secrets (`password`, `sasl_jaas_config`) must use a `${secret:...}`
@@ -281,6 +288,61 @@ sources:
 > In YAML flow style (`{a: DECIMAL(10, 2)}`) the comma splits the mapping; quote such types or
 > use block style.
 
+`VARIANT` (semi-structured data, Flink 2.1+) is a column type too. `PARSE_JSON` and `TRY_PARSE_JSON`
+produce it, `v['key']` reads a field and `JSON_STRING(v)` turns it back into text. Two limits come from
+Flink 2.3:
+- **No compiled plan.** Flink 2.3 can't write VARIANT into a compiled plan, so a pipeline that uses it
+  deploys as statements. `cascade plan` and `deploy --plan-dir` refuse it, and `restore-test` runs whole
+  scripts.
+- **No casts out of VARIANT.** `CAST(v['n'] AS DOUBLE)` is rejected; use `JSON_STRING`. Indexing a
+  non-object variant (`v['k']` on a number) fails the job, so prefer `TRY_PARSE_JSON` on untrusted input.
+
+Local stand-ins compute a VARIANT source column as NULL. Fixtures take any JSON value for it, and
+expectations compare VARIANT values as JSON.
+
+### Metadata and computed columns
+
+A column can come from the connector's metadata instead of the payload, or be computed from other
+columns:
+
+```yaml
+columns:
+  order_id: STRING
+  epoch_ms: BIGINT
+  kafka_ts: TIMESTAMP_LTZ(3) METADATA FROM 'timestamp'   # Flink's own syntax works
+  partition: {type: INT, metadata: partition, virtual: true}
+  offset: {type: BIGINT, metadata: true}                  # key = the column name
+  ts: {type: TIMESTAMP_LTZ(3), expression: "TO_TIMESTAMP_LTZ(epoch_ms, 3)"}
+event_time: {column: kafka_ts, max_out_of_orderness: 5s}  # event time may be either kind
+```
+
+- **Catalogued keys.** Kafka (`topic`, `partition`, `headers`, `leader-epoch`, `offset`, `timestamp`,
+  `timestamp-type`, and format keys under `value.`/`key.`), Postgres, MySQL, Oracle, SQL Server, Db2 and
+  MongoDB CDC (`op_ts`, `table_name`, `database_name`, `schema_name`, `row_kind`, `collection_name` as
+  each supports), and filesystem (`file.path`, `file.name`, `file.size`, `file.modification-time`) are
+  checked. An unknown key is CD220, a different type CD221. Every key is planned against the real jar
+  in the connector smoke test.
+- **Other connectors.** Their metadata isn't catalogued; `cascade verify` and the planner check it.
+- **Primary keys** must be physical columns (CD106).
+- **`on_slot_loss: resnapshot`** can't read metadata (CD222). The re-read describes the snapshot, not
+  the change.
+- **In tests,** fixtures give metadata columns like any other column, and computed columns are derived
+  from the fixture's values.
+
+### Kafka topics and message keys
+
+- `topic: [orders.eu, orders.us]` reads several topics; `topic_pattern: "orders\\..*"` reads every topic
+  matching a Java regex. A source names exactly one of the two.
+- **Message keys of append topics.** `key_fields: [customer_id]` puts those columns in the message key.
+  A sink then partitions by them, which keeps each key's records in order; a source reads them from the
+  key. `key_format` defaults to the value's format. `value_includes_key: false` leaves the key columns
+  out of the value (Flink's `EXCEPT_KEY`). Upsert topics key by `primary_key` instead (CD224), and every
+  key column must be a physical column (CD225).
+- **TLS.** `security_protocol: SSL` (or `SASL_SSL`) with `ssl_truststore` and, for mutual TLS,
+  `ssl_keystore`, both `${file:...}` references, plus `ssl_*_password` secrets and `ssl_*_type`
+  (`JKS`, `PKCS12`, `PEM`). `integration/connectors.py` (case `kafka-tls`) writes and reads over
+  mutual TLS against a broker that requires client certificates.
+
 ### Reading another pipeline: `from_pipeline`
 
 ```yaml
@@ -400,6 +462,11 @@ sinks:
     primary_key: [customer_id]   # required for upsert
     on_conflict: error           # upsert only: error | nothing | deduplicate
 ```
+
+**Metadata.** `metadata: {column: key}` writes a column to the connector's metadata instead of the
+payload. Kafka takes `timestamp`, `headers` and `topic`. With a `topic` column, each row goes to the
+topic it names, and the sink's `topic` is the list of topics allowed (CD209). Kafka sinks also take
+`key_fields` (see "Kafka topics and message keys").
 
 `on_conflict` lowers to Flink's `INSERT ... ON CONFLICT DO ...` (Flink ≥ 2.3). Flink requires it
 when it can't prove that the query's upsert key equals the sink's primary key. The compiler proves
@@ -554,6 +621,86 @@ In Python: `mask = p.java_function("mask_email", "com.acme.udf.MaskEmail", jar=.
 and `churn = p.python_function(scoring.churn_risk, returns="DOUBLE")`. The handles render calls,
 for example `churn("days_inactive", "orders_90d")`, for f-strings and builder expressions. See
 [`examples/udfs`](../examples/udfs) and [`examples/udfs_py`](../examples/udfs_py).
+
+### Aggregate, table and process table functions
+
+`kind:` declares what a function is; the default is `scalar`.
+
+```yaml
+functions:
+  weighted_avg: {language: java, kind: aggregate, class: com.acme.fn.WeightedAvg, jar: udfs/fn.jar, returns: DOUBLE}
+  split_tags:   {language: java, kind: table, class: com.acme.fn.SplitTags, jar: udfs/fn.jar,
+                 returns: "ROW<tag STRING, pos INT>"}
+  streak:       {language: java, kind: process_table, class: com.acme.fn.Streak, jar: udfs/fn.jar,
+                 returns: "ROW<streak INT, ok BOOLEAN>"}
+  py_avg:
+    language: python
+    kind: aggregate
+    file: udfs/reviews.py
+    class: WeightedAvg                         # create_accumulator, accumulate, get_value (+ retract, merge)
+    accumulator: ROW<total DOUBLE, weight DOUBLE>
+    returns: DOUBLE
+  py_split: {language: python, kind: table, file: udfs/reviews.py, function: split_tags,
+             returns: "ROW<tag STRING, pos INT>"}   # a generator yielding tuples
+```
+
+- **Aggregate functions** are called like `SUM`. Over updating input they need `retract`.
+- **Table functions** are used as `LATERAL TABLE(f(x)) AS t(a, b)`. Their columns are typed from
+  `returns`, which must be a `ROW` (CD010).
+- **Process table functions** (Flink 2.1+, Java only) are called as
+  `FROM f(input => TABLE t PARTITION BY k)`. Their output is the partition keys followed by the `ROW`
+  fields. Their `@StateHint` state is keyed state: it needs a state TTL (CD350) and counts toward max
+  parallelism. `verify` and `plan` map the planner's operator to the model, so UIDs are pinned as for SQL
+  state.
+
+  Build PTF jars with `javac -parameters`, so Flink can name the state.
+- **Python** aggregate functions are plain classes and table functions plain generators; the generated
+  shim wraps them with PyFlink's `udaf` and `udtf`. A list accumulator becomes a Row when
+  `accumulator` is a `ROW`.
+- Using a non-table function as a table is CD165.
+
+See [`examples/functions`](../examples/functions) (Java, including a PTF restored from a savepoint) and
+[`examples/functions_py`](../examples/functions_py).
+
+## Model inference: `ml_models`
+
+```yaml
+ml_models:
+  triage:
+    provider: openai                 # built in: openai; others: provider id + artifacts
+    input: {body: STRING}
+    output: {queue: STRING}
+    properties:                      # the provider's options; _ becomes -
+      endpoint: https://api.openai.com/v1/chat/completions
+      model: gpt-4.1-mini
+      api_key: ${secret:openai/api_key}
+      system_prompt: "Answer with one word: billing, outage or other."
+models:
+  routed:
+    sql: SELECT ticket_id, queue FROM ML_PREDICT(TABLE tickets, MODEL triage, DESCRIPTOR(body))
+```
+
+- **Lowering.** Each model becomes `CREATE TEMPORARY MODEL`. `ML_PREDICT`'s output is the input
+  table's columns followed by the model's output columns.
+- **Checks.** The provider's required options (CD209) and secret options (`api-key`, `auth-token`;
+  CD201) are checked.
+- **Compiled plans** reference the model by name, so the API key stays out of `plan.json`.
+- **Tests never call the model.** Its answers are given like a source's rows, under the model's name,
+  with input and output columns:
+
+  ```yaml
+  given:
+    triage: [{body: "I was charged twice", queue: billing}]
+    tickets: [{ticket_id: t1, body: "I was charged twice"}]
+  ```
+
+  An input with no pinned answer fails the test. `verify`, `plan` and `restore-test` stand-ins
+  answer NULL.
+- **Triton isn't built in:** `flink-model-triton` 2.3.0 rejects every input column when the model is
+  created ("input column ... should be null"). Use `provider: triton` with `artifacts` once a fixed
+  release exists.
+
+See [`examples/ml_predict`](../examples/ml_predict).
 
 ## Scaling
 
@@ -800,6 +947,47 @@ compiler warns (CD361). Compilation itself never needs a JVM.
   `ignore-unclaimed-state=false`. It reports whether every piece of state mapped, and which
   operators start empty.
 
+## Replication: `replicate`
+
+A replication copies every table matching a pattern from a database into a lake or Kafka, and keeps
+copying. It creates each sink table from the source schema and applies schema changes as they happen:
+added columns, new tables. Flink SQL can't do this, because a SQL job has a fixed set of tables with
+fixed columns. Flink CDC's pipeline runtime can, so a replication compiles to a Flink CDC pipeline
+definition instead of SQL.
+
+```yaml
+pipeline: crm_replica
+connections:
+  crm: {type: postgres-cdc, properties: {hostname: db, database: app, username: cdc, password: "${secret:crm/pw}"}}
+  lake: {type: paimon, properties: {warehouse: s3://lake/wh}}
+replicate:
+  from: crm                         # postgres-cdc | mysql-cdc
+  tables: ["public.*"]              # schema.table (database.table for MySQL), * as a glob
+  exclude: [public.audit_log]
+  to: lake                          # paimon | kafka (debezium-json, one topic per table)
+  schema_changes: evolve            # evolve (default) | try_evolve | lenient | ignore | exception
+  route: [{from: "public.orders_*", to: shop.orders}]   # merge or rename tables
+  table_options: {bucket: "4"}      # Paimon options of the tables it creates
+  source_options: {}                # raw Flink CDC options, applied last
+  sink_options: {}
+```
+
+- **Its own project.** A replication has no sources, models or sinks (CD601). Read the replicated
+  tables from another pipeline.
+- **`cascade compile`** writes `cdc-pipeline.yaml`.
+- **`cascade deploy`** writes a FlinkDeployment running `dev.cascade.runner.CdcRunner`, and a Dockerfile
+  that adds the Flink CDC 3.7 distribution (pinned by sha512) and its pipeline connectors.
+- **At startup** the runner fills in secrets and runs the Postgres slot guard: a restore whose
+  replication slot is gone is refused, because Flink CDC would silently start a new slot. It then builds
+  the job with Flink CDC's composer. Monitoring adds the slot alerts.
+- **Tested end to end** (`integration/connectors.py`, case `replicate-postgres`):
+  - a whole Postgres schema into Paimon: the snapshot, then inserts, updates and deletes
+  - an `ALTER TABLE ... ADD COLUMN`, and a table created while running
+  - a restore from a checkpoint with a change made while down
+  - a refused restore after the slot was dropped
+- **No local tools:** `test`, `verify`, `plan` and `restore-test` don't apply; Flink CDC builds the job
+  at startup.
+
 ## Deployment
 
 ```yaml
@@ -837,6 +1025,18 @@ the Flink Kubernetes Operator:
 | `Dockerfile` | Runtime image: `flink:<version>`, the connector jars the manifest lists (one `ARG` per version), `cascade-runtime.jar`, UDF jars, and PyFlink when needed |
 | `operators.json` | Copied from `--plan-dir`: vertex → model mapping |
 
+**High availability.** A stateful job (any `upgrade_mode` but `stateless`, with a checkpoint directory)
+gets Kubernetes HA: `high-availability.type: kubernetes`, with its metadata under
+`<checkpoints.dir>/ha` (or `deploy.high_availability.storage_dir`). Without HA, a JobManager crash
+(OOM, node loss, eviction) brings the application back as a new job with empty state. With it, the
+new JobManager resumes the same job from its latest checkpoint.
+
+The kind integration run checks this: it kills the JobManager pod, then checks the job keeps its ID,
+restores a checkpoint, and that the upgrade after it continues the totals. Other settings:
+- `high_availability: false` turns HA off. It's refused with `upgrade_mode: last-state` or
+  `jobmanager.replicas > 1`.
+- `jobmanager: {replicas: 2}` adds a standby JobManager.
+
 **Upgrades through the operator.** The job ConfigMap is named after its content and referenced
 from the pod template. So `kubectl apply -k` of a new version changes the FlinkDeployment spec,
 and the operator does a savepoint upgrade (`upgrade_mode: savepoint`). A running job never sees
@@ -870,6 +1070,9 @@ The alerts follow the pipeline:
 - **With event time:** event time not advancing for 15 minutes, so windows stop closing.
 - **With `drop` or `quarantine` expectations:** the violation ratio per model and expectation (from
   cascade's expectation counters).
+- **With window aggregations:** rows dropped because they arrived after their window closed
+  (`numLateRecordsDropped`, over `alerts.max_late_records`, default 0). Interval joins and OVER
+  aggregations drop late rows too, but Flink reports no metric for them.
 
 The integration run scrapes the running job and fails if any metric an alert or panel uses isn't
 reported. An alert on a misspelled metric would never fire.
@@ -973,6 +1176,16 @@ the data itself, not something missing from the compiler.
 - **Splitting one project into several jobs.** One pipeline is one job. Splitting inside a
   project would compute shared models twice, or need hidden topics between jobs. Split across
   projects and connect them with `from_pipeline`.
+- **Compiled plans with VARIANT.** Flink 2.3 can't serialize the type into a plan, so such pipelines
+  deploy as statements (see Sources).
+- **Python process table functions.** PyFlink has no ProcessTableFunction; use a Python process model.
+- **Materialized tables** (`CREATE MATERIALIZED TABLE`). Flink runs them through the SQL Gateway with a
+  persistent catalog and a workflow scheduler for refreshes, outside any one job. A continuously
+  refreshed materialized table is a model with an upsert sink, which is what cascade compiles.
+- **Triton models** (see "Model inference"), until flink-model-triton fixes its input check.
+- **Replication sources and sinks beyond Postgres/MySQL and Paimon/Kafka.** Flink CDC has pipeline
+  connectors for Oracle, SQL Server, Iceberg, Doris, StarRocks and others. `source_options` and
+  `sink_options` pass raw options, but only the four pairs are tested.
 - **Planned UID pinning for pipelines with process models or `mode: batch`.** Flink compiles plans
   only for pure streaming SQL. Such pipelines deploy as statements. Process-model state is pinned
   by `ctx.uid`.
@@ -1005,8 +1218,8 @@ and checks that the diagnostics arrive and that go-to-definition works. Any othe
 | Range | Area |
 |---|---|
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
-| CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts, CD110 alignment/emit without push-down, CD111 SOURCE_WATERMARK unsupported); batch (CD120 unbounded source, CD121 temporal join, CD122 backfill); `from_pipeline` (CD130 cycle, CD131 upstream doesn't compile, CD132 unknown sink, CD133 sink not readable, CD134 not streamable); process models (CD140 state not checked by upgrades, CD141 key_by column, CD142 event_time / primary_key column); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
-| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage) |
+| CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts, CD110 alignment/emit without push-down, CD111 SOURCE_WATERMARK unsupported); batch (CD120 unbounded source, CD121 temporal join, CD122 backfill); `from_pipeline` (CD130 cycle, CD131 upstream doesn't compile, CD132 unknown sink, CD133 sink not readable, CD134 not streamable); process models (CD140 state not checked by upgrades, CD141 key_by column, CD142 event_time / primary_key column); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built, CD165 not a table function) |
+| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage); metadata columns (CD220 unknown or read-only key, CD221 type differs, CD222 metadata with `on_slot_loss: resnapshot`, CD223 sink metadata column missing); Kafka keys (CD224 key_fields on an upsert topic, CD225 key column not physical) |
 | CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |
 | CD35x | state / TTL |
@@ -1015,5 +1228,6 @@ and checks that the diagnostics arrive and that go-to-definition works. Any othe
 | CD50x | pipeline-level (unused nodes, no sinks) |
 | CD52x | scaling (CD520 no max parallelism with keyed state, CD521 invalid bounds, CD522 uneven key groups) |
 | CD53x | deployment (CD530 secret in deploy settings) |
+| CD60x | replication (CD601 sources/models/sinks or batch mode in a replication, CD602 unsupported from/to) |
 
 `cascade validate --json` emits machine-readable diagnostics for editors and CI.

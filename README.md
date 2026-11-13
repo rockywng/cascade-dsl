@@ -154,7 +154,8 @@ through a small runner in the runtime jar, which fills in `${secret:...}` values
 Kubernetes Secret at startup, so no secret is written to disk. The `scaling:` block sets
 `pipeline.max-parallelism` and the operator autoscaler's bounds. `operators.json` maps every
 Flink vertex ID to the models it runs, so metrics and per-model autoscaling can speak in models
-instead of `Calc[7]`.
+instead of `Calc[7]`. Stateful jobs get Kubernetes HA, so a JobManager crash resumes the same job
+from its latest checkpoint; the kind run kills the JobManager to check it.
 
 ## User-defined functions
 
@@ -167,6 +168,19 @@ functions:
 Python UDFs are plain functions with no PyFlink imports. The compiler generates the PyFlink
 wrapper, and the declared return types feed schema inference. See [examples/udfs](examples/udfs)
 and [examples/udfs_py](examples/udfs_py).
+
+`kind: aggregate | table | process_table` adds aggregate functions, table functions (`LATERAL
+TABLE`) and Flink 2.1's process table functions, which keep keyed state of their own. In Python,
+an aggregate function is a plain class and a table function a plain generator. See
+[examples/functions](examples/functions) and [examples/functions_py](examples/functions_py).
+
+## Model inference and replication
+
+- **`ml_models:`** declares models for `ML_PREDICT` (OpenAI-compatible endpoints built in). Tests
+  pin the model's answers, so they never call it. See [examples/ml_predict](examples/ml_predict).
+- **`replicate:`** copies whole databases (Postgres or MySQL, by table pattern) into Paimon or Kafka.
+  It creates the sink tables and applies schema changes as they happen, by compiling to a Flink CDC
+  pipeline.
 
 ## Data quality you can see
 
@@ -246,9 +260,13 @@ CI runs everything against Flink 2.3.0.
 - **UID pinning matches the operators Flink generates.** If a Flink upgrade changes how a query is
   planned, operators won't match, and the restore test reports that before deploy.
 - **Schema import handles Avro only** (no JSON Schema or Protobuf).
-- **Integration runs cover Kafka, Postgres CDC and JDBC only.** [integration/](integration/)
-  runs a pipeline against real Kafka, Postgres CDC and JDBC on Flink 2.3, under docker compose and
-  under the Flink Kubernetes Operator on kind. It includes a savepoint upgrade. Iceberg, MySQL CDC
-  and schema-registry formats aren't in it yet.
+- **Not every connector runs end to end.** [integration/](integration/) runs a pipeline against real
+  Kafka, Postgres CDC and JDBC on Flink 2.3, under docker compose and under the Flink Kubernetes
+  Operator on kind (savepoint upgrades, a JobManager kill). `integration/connectors.py` covers:
+  - the other CDC sources, the lakes, Elasticsearch, DynamoDB and Kinesis
+  - Kafka over mutual TLS
+  - replication
+
+  Db2 CDC and schema-registry formats are only planned against their jars.
 - **Operator attribution is structural.** It's exact for sources, sinks and stateful operators.
   Stateless operators fused across models are attributed by their position in the graph.

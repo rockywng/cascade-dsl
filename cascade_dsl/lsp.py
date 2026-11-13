@@ -72,7 +72,7 @@ def diagnose(path: str, text: str | None = None) -> list[dict]:
 # --- completion -------------------------------------------------------------------------------------
 
 TOP = ["pipeline", "description", "owner", "mode", "defaults", "flink", "vars", "environments", "connections",
-       "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions"]
+       "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions", "ml_models", "replicate"]
 SOURCE = ["connection", "columns", "primary_key", "event_time", "processing_time", "options", "description",
           "format", "from_pipeline", "sink"]
 MODEL = ["sql", "sql_file", "process", "columns", "expectations", "description", "allow_unbounded_state",
@@ -167,7 +167,7 @@ def _ranges(cell: str) -> list[tuple[int, int]]:
 
 # --- definitions and references ------------------------------------------------------------------------
 
-SECTIONS = ("connections", "sources", "models", "sinks", "functions")
+SECTIONS = ("connections", "sources", "models", "sinks", "functions", "ml_models")
 
 
 def definitions(text: str) -> dict[str, tuple[int, int]]:

@@ -101,6 +101,8 @@ def definition(p) -> dict:
     if kind == "postgres":
         source["slot.name"] = r.get("slot_name") or slot_name(p)
         source["decoding.plugin.name"] = "pgoutput"
+    # tables that start matching later (created after the job started) are snapshotted on the next start
+    source["scan.newly-added-table.enabled"] = True
     source.update(r.get("source_options") or {})
     if dst.type == "paimon":
         sink = {"type": "paimon", "catalog.properties.metastore": "filesystem",

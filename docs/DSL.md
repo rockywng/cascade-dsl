@@ -985,12 +985,15 @@ replicate:
   updates and deletes. The runner checks every matching table at start and refuses, listing the
   `ALTER TABLE ... REPLICA IDENTITY FULL` statements to run. Tables created later need it too, or the
   job fails at their first update.
+- **New tables** that match a pattern are captured at the next start: a restart or an upgrade from a
+  savepoint (`scan.newly-added-table.enabled`). Flink CDC's Postgres source doesn't add tables while
+  running.
 - **At startup** the runner fills in secrets and runs the Postgres slot guard: a restore whose
   replication slot is gone is refused, because Flink CDC would silently start a new slot. It then builds
   the job with Flink CDC's composer. Monitoring adds the slot alerts.
 - **Tested end to end** (`integration/connectors.py`, case `replicate-postgres`):
   - a whole Postgres schema into Paimon: the snapshot, then inserts, updates and deletes
-  - an `ALTER TABLE ... ADD COLUMN`, and a table created while running
+  - an `ALTER TABLE ... ADD COLUMN`, and a table created while running (picked up at the restore)
   - a restore from a checkpoint with a change made while down
   - a refused restore after the slot was dropped
 - **No local tools:** `test`, `verify`, `plan` and `restore-test` don't apply; Flink CDC builds the job

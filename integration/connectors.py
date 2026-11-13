@@ -426,10 +426,10 @@ sinks:
         converge("replicate: an added column reaches the Paimon table (schema evolution)",
                  lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
                  [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"]], job=rep)
+        # Flink CDC's Postgres source captures the tables matching at start; one created while running is
+        # picked up at the next restart (scan.newly-added-table.enabled), checked after the restore below
         sql("CREATE TABLE shop.refunds (id INT PRIMARY KEY, amount INT); "
             "ALTER TABLE shop.refunds REPLICA IDENTITY FULL; INSERT INTO shop.refunds VALUES (1, 5)")
-        converge("replicate: a table created while running is replicated",
-                 lambda: lake("refunds", "{id: INT NOT NULL, amount: INT}", "id, amount"), [["1", "5"]], job=rep)
         time.sleep(6)  # a checkpoint after the last change
         checkpoint = rep.latest_checkpoint()
     finally:
@@ -440,6 +440,8 @@ sinks:
         converge("replicate: restored from a checkpoint, the change made while down arrives",
                  lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
                  [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"], ["6", "while down"]], job=rep)
+        converge("replicate: a table created while running is replicated after the restart",
+                 lambda: lake("refunds", "{id: INT NOT NULL, amount: INT}", "id, amount"), [["1", "5"]], job=rep)
         time.sleep(6)
         checkpoint = rep.latest_checkpoint()
     finally:
@@ -533,7 +535,8 @@ sources:
     startup: earliest
     columns: {{id: BIGINT NOT NULL, name: STRING, qty: INT}}
 sinks:
-  out: {{from: items, connection: results, table: {table}, mode: upsert, primary_key: [id]}}
+  out: {{from: items, connection: results, table: {table}, mode: upsert, primary_key: [id],
+         on_conflict: deduplicate}}
 """)
         job.start()
         try:

@@ -213,3 +213,41 @@ class BundledDriversTest(unittest.TestCase):
                              ("db2-cdc", "com.ibm.db2:jcc")):
             with self.subTest(connector=kind):
                 self.assertIn(driver, CATALOG[kind].extra_artifacts({}))
+
+
+EVENTHUBS = """
+pipeline: eh
+defaults: {state_ttl: 1d}
+connections:
+  hubs:
+    type: eventhubs
+    properties: {namespace: acme, connection_string: "${secret:eh/cs}"}
+sources:
+  clicks: {connection: hubs, event_hub: clicks, columns: {id: STRING NOT NULL, v: BIGINT}}
+models:
+  m:
+    sql: SELECT id, v FROM clicks
+sinks:
+  out: {from: m, connection: hubs, event_hub: clicks-out}
+"""
+
+
+class EventHubsTest(unittest.TestCase):
+    def test_lowers_to_the_kafka_connector_with_sasl(self):
+        r = compiled(EVENTHUBS)
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        o = r.checked.options["clicks"]
+        self.assertEqual(o["connector"], "kafka")
+        self.assertEqual(o["properties.bootstrap.servers"], "acme.servicebus.windows.net:9093")
+        self.assertEqual(o["properties.security.protocol"], "SASL_SSL")
+        self.assertIn('username="$ConnectionString" password="${secret:eh/cs}"', o["properties.sasl.jaas.config"])
+        self.assertEqual(r.checked.options["out"]["topic"], "clicks-out")
+        self.assertIn("org.apache.flink:flink-sql-connector-kafka", r.lowered.manifest["artifacts"])
+
+    def test_literal_connection_string_is_rejected(self):
+        r = compiled(EVENTHUBS.replace('"${secret:eh/cs}"', "Endpoint=sb://x"))
+        self.assertIn("CD201", r.diagnostics.codes())
+
+    def test_exactly_once_is_not_offered(self):
+        r = compiled(EVENTHUBS.replace("event_hub: clicks-out", "event_hub: clicks-out, delivery: exactly-once"))
+        self.assertIn("CD211", r.diagnostics.codes())

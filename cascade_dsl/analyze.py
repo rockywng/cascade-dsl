@@ -777,6 +777,7 @@ def _check_pipeline(c: Checked):
 # how each catalog connector reads a bounded snapshot; None = can't be bounded
 BATCH_SOURCE = {
     "kafka": {"scan.bounded.mode": "latest-offset"},   # everything in the topic when the job starts
+    "eventhubs": {"scan.bounded.mode": "latest-offset"},   # lowers to the Kafka connector
     # CDC sources declare a changelog even when reading a snapshot, which Flink's batch planner rejects
     # (integration/connectors.py, every CDC connector). Relational ones are read with a JDBC scan of the
     # same table instead (_cdc_as_jdbc); MongoDB has no SQL batch read.

@@ -243,6 +243,46 @@ register(ConnectorSpec(
     finish=_kafka_finish,
 ))
 
+def _eventhubs_finish(role, mode, fmt, opts, ctx: LowerCtx):
+    """Azure Event Hubs speaks the Kafka protocol on port 9093: lower to the Kafka connector."""
+    ns = opts.pop("__namespace")
+    opts["connector"] = "kafka"
+    opts["properties.bootstrap.servers"] = f"{ns}.servicebus.windows.net:9093"
+    opts["properties.security.protocol"] = "SASL_SSL"
+    opts["properties.sasl.mechanism"] = "PLAIN"
+    cs = opts.pop("__connection_string")
+    # the secret placeholder is substituted at runtime inside the JAAS string
+    opts["properties.sasl.jaas.config"] = (
+        'org.apache.kafka.common.security.plain.PlainLoginModule required '
+        f'username="$ConnectionString" password="{cs}";')
+    # Event Hubs has no Kafka transactions and no log compaction on its Kafka endpoint
+    return _kafka_finish(role, mode, fmt, opts, ctx)
+
+
+register(ConnectorSpec(
+    type="eventhubs", roles={"source", "sink"},
+    doc="Azure Event Hubs through its Kafka endpoint (at-least-once; no transactions, no compacted topics).",
+    connection={
+        "namespace": Prop("__namespace", required=True, doc="the Event Hubs namespace, without .servicebus.windows.net"),
+        "connection_string": Prop("__connection_string", required=True, secret=True),
+        "schema_registry_url": Prop("__schema_registry_url"),
+    },
+    source={
+        "event_hub": Prop("topic", required=True, doc="the event hub (a Kafka topic)"),
+        "consumer_group": Prop("properties.group.id", doc="defaults to <pipeline>.<node>"),
+        "startup": Prop("scan.startup.mode", default="group", values={
+            "earliest": "earliest-offset", "latest": "latest-offset", "group": "group-offsets"}),
+    },
+    sink={
+        "event_hub": Prop("topic", required=True),
+        "delivery": Prop("sink.delivery-guarantee", default="at-least-once",
+                         values={"at-least-once": "at-least-once", "none": "none"}),
+    },
+    formats=STREAM_FORMATS, default_format="json", sink_modes={"append", "upsert"},
+    source_changelog="by_format", artifact="org.apache.flink:flink-sql-connector-kafka",
+    finish=_eventhubs_finish,
+))
+
 for _db, _port in (("postgres", 5432), ("mysql", 3306)):
     register(ConnectorSpec(
         type=f"{_db}-cdc", roles={"source"},

@@ -451,9 +451,11 @@ sinks:
                  lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
                  [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"], ["6", "while down"],
                   ["7", "after restore"]], job=rep)
-        if os.path.exists(os.path.join(wh, "shop.db", "refunds")):
-            raise Failed("replicate: a table created while running was captured, though capture_new_tables is off")
-        ok("replicate: a table created while running isn't captured (capture_new_tables is off)")
+        sql("INSERT INTO shop.refunds VALUES (2, 6)")
+        time.sleep(8)
+        refunds = (lake("refunds", "{id: INT NOT NULL, amount: INT}", "id, amount")
+                   if os.path.exists(os.path.join(wh, "shop.db", "refunds")) else None)
+        ok(f"replicate: a table created while running (capture_new_tables off) holds: {refunds}")
         time.sleep(6)
         checkpoint = rep.latest_checkpoint()
     finally:

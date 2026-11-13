@@ -11,7 +11,10 @@ javac --release 11 -nowarn -cp "$FLINK_HOME/lib/*" -d "$here/target/runtime" \
   $(find "$here/src" -name '*.java')
 cp -r "$here/META-INF" "$here/target/runtime/"
 jar cf "$here/target/cascade-runtime.jar" -C "$here/target/runtime" .
-javac --release 11 -nowarn -cp "$FLINK_HOME/lib/*:$here/target/runtime" -d "$here/target/tools" \
+# Lineage reads Calcite's column origins: it compiles against the unshaded planner in opt/ (not on the
+# class path of the other commands; `column-lineage` swaps it in for the planner loader)
+planner="$(ls "$FLINK_HOME"/opt/flink-table-planner_2.12-*.jar | head -1)"
+javac --release 11 -nowarn -cp "$FLINK_HOME/lib/*:$here/target/runtime:$planner" -d "$here/target/tools" \
   $(find "$here/tools" -name '*.java')
 cp -r "$here/tools/META-INF" "$here/target/tools/"
 jar cf "$here/target/cascade-tools.jar" -C "$here/target/tools" .

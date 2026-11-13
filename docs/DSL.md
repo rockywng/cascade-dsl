@@ -378,6 +378,14 @@ This is also how to **split a pipeline into several jobs**: one project per job,
 sinks. One pipeline always compiles to one job; splitting it inside a project would compute
 shared models twice, or need a hidden topic between the jobs.
 
+Inside one project:
+- **`cascade column-lineage <project>`** (needs `FLINK_HOME` with `opt/flink-table-planner_2.12`, and
+  `runtime/build.sh` run against it) prints which source columns each sink column is computed from,
+  traced by the Flink planner through joins, aggregates and views. A column computed behind a window
+  table function is marked `unknown`. `--openlineage` prints an OpenLineage RunEvent instead (job =
+  the pipeline, sources as inputs, sinks as outputs with the schema and column-lineage facets);
+  `--post URL` also POSTs it to `URL/api/v1/lineage` (Marquez and compatible servers).
+
 Across projects:
 - **`cascade lineage <root>`** prints which pipeline reads which sink, for every project under
   `<root>`, as a Mermaid graph.

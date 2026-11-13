@@ -86,9 +86,18 @@ class Tools:
         major = self._java_major()
         return [o for o in str(opts).split() if all(not o.startswith(f) or major >= v for f, v in newer.items())]
 
-    def _run(self, args: list[str], timeout: int, extra_cp: list[str] | None = None) -> None:
+    def _run(self, args: list[str], timeout: int, unshaded_planner: bool = False,
+             extra_cp: list[str] | None = None) -> None:
         java = self._java()
         cp = [self.tools_jar, runtime_jar(), os.path.join(self.flink_home, "lib", "*")]
+        if unshaded_planner:
+            # the planner loader hides Calcite and the planner's operation classes: list lib/ without it
+            # and put opt/'s unshaded planner in its place
+            planner = sorted(glob.glob(os.path.join(self.flink_home, "opt", "flink-table-planner_2.12-*.jar")))
+            if not planner:
+                raise ToolsError("column lineage needs opt/flink-table-planner_2.12-*.jar in the Flink distribution")
+            cp = cp[:2] + [j for j in sorted(glob.glob(os.path.join(self.flink_home, "lib", "*.jar")))
+                           if "flink-table-planner-loader" not in os.path.basename(j)] + planner[:1]
         # Python UDF support lives in opt/ in the Flink distribution
         cp += sorted(glob.glob(os.path.join(self.flink_home, "opt", "flink-python*.jar")))[:1]
         # connector jars that aren't in FLINK_HOME/lib, e.g. from `cascade fetch-jars`
@@ -121,6 +130,17 @@ class Tools:
                 f.write(script([s for s in stmts if s.kind != "insert"]))
             out = os.path.join(d, "out.json")
             self._run(["describe", path, out], timeout)
+            return self._read(out)
+
+    def column_lineage(self, stmts: list[Stmt], timeout: int = 180) -> dict:
+        """{"inserts": [{"sink", "columns": [{"name", "derived", "from": [{"table", "column"}]}]}]}: where
+        every sink column comes from, by the planner."""
+        with tempfile.TemporaryDirectory(prefix="cascade-lineage-") as d:
+            path = os.path.join(d, "script.sql")
+            with open(path, "w") as f:
+                f.write(script(stmts))
+            out = os.path.join(d, "out.json")
+            self._run(["column-lineage", path, out], timeout, unshaded_planner=True)
             return self._read(out)
 
     def run_tests(self, cases: list[tuple], per_test_timeout: int = 60, timeout: int = 900) -> list[dict]:

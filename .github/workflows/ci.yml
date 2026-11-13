@@ -31,6 +31,23 @@ jobs:
         run: |
           for e in examples/*/; do python -m cascade_dsl validate "$e"; done
 
+  alerts:
+    name: generated alerts fire (promtool)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: promtool from the latest Prometheus release
+        run: |
+          tag=$(curl -s https://api.github.com/repos/prometheus/prometheus/releases/latest | python -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
+          curl -sL "https://github.com/prometheus/prometheus/releases/download/$tag/prometheus-${tag#v}.linux-amd64.tar.gz" | tar xz
+          echo "PROMTOOL=$PWD/prometheus-${tag#v}.linux-amd64/promtool" >> "$GITHUB_ENV"
+      - name: promtool test rules on every generated alert
+        run: PYTHONPATH=.:tests python -m unittest test_alert_rules -v
+
   flink:
     name: against Flink
     runs-on: ubuntu-latest

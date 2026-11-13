@@ -658,6 +658,10 @@ functions:
   shim wraps them with PyFlink's `udaf` and `udtf`. A list accumulator becomes a Row when
   `accumulator` is a `ROW`.
 - Using a non-table function as a table is CD165.
+- **Python API:** `p.java_function(..., kind="table")`, `p.python_function(gen, kind="table", ...)`,
+  `p.python_aggregate(Class, returns=..., accumulator=...)` and
+  `p.ml_model(name, provider=..., input=..., output=..., properties=...)`. Metadata columns, `key_fields`
+  and `topic_pattern` pass through `p.source` and `p.sink` as in YAML.
 
 See [`examples/functions`](../examples/functions) (Java, including a PTF restored from a savepoint) and
 [`examples/functions_py`](../examples/functions_py).

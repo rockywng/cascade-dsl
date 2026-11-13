@@ -167,3 +167,43 @@ class ExpectationsInPythonTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+with open(os.path.join(ROOT, "functions_py", "udfs", "reviews.py")) as _f:
+    REVIEWS = _f.read()
+
+
+class NewDeclarationsTest(unittest.TestCase):
+    def test_function_kinds_and_ml_models(self):
+        d = project("", base=False, files={
+            "udfs/reviews.py": REVIEWS,
+            "pipeline.py": '''
+                from cascade_dsl.api import Pipeline, kafka
+                p = Pipeline("shop_py", state_ttl="1d")
+                bus = p.connection("bus", kafka(bootstrap_servers="localhost:9092"))
+                p.source("reviews", bus, topic="reviews", key_fields=["product_id"],
+                         columns={"product_id": "STRING NOT NULL", "rating": "DOUBLE", "votes": "DOUBLE",
+                                  "tags": "STRING", "kts": {"type": "TIMESTAMP_LTZ(3)", "metadata": "timestamp"}})
+                avg = p.python_aggregate("udfs/reviews.py:WeightedAvg", returns="DOUBLE",
+                                         accumulator="ROW<total DOUBLE, weight DOUBLE>", name="wavg")
+                p.java_function("split_tags", "com.acme.fn.SplitTags", kind="table", returns="ROW<tag STRING, pos INT>")
+                p.ml_model("triage", provider="openai", input={"tags": "STRING"}, output={"queue": "STRING"},
+                           properties={"endpoint": "https://e/v1/chat/completions", "model": "m",
+                                       "api_key": "${secret:openai/key}"})
+                p.sql_model("rated", "SELECT product_id, wavg(rating, votes) AS r FROM reviews GROUP BY product_id")
+                p.sql_model("tagged", "SELECT r.product_id, t.tag FROM reviews AS r, LATERAL TABLE(split_tags(r.tags)) AS t")
+                p.sql_model("routed", "SELECT product_id, queue FROM ML_PREDICT(TABLE reviews, MODEL triage, DESCRIPTOR(tags))")
+                p.sink("o1", "rated", "print", mode="upsert", primary_key=["product_id"])
+                p.sink("o2", "tagged", "print")
+                p.sink("o3", "routed", "print")
+                pipeline = p
+            '''})
+        r = compile_pipeline(os.path.join(d, "pipeline.py"))
+        self.assertTrue(r.ok, [x.format() for x in r.diagnostics.items])
+        sql = r.lowered.sql
+        self.assertIn("CREATE TEMPORARY MODEL `triage`", sql)
+        self.assertIn("`kts` TIMESTAMP_LTZ(3) METADATA FROM 'timestamp'", sql)
+        self.assertIn("'key.fields' = 'product_id'", sql)
+        fns = r.checked.pipeline.functions
+        self.assertEqual((fns["wavg"].kind, fns["wavg"].class_attr), ("aggregate", "WeightedAvg"))
+        self.assertEqual(fns["split_tags"].kind, "table")

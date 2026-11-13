@@ -167,6 +167,7 @@ class Pipeline:
         self._sinks: dict[str, tuple[dict, int]] = {}
         self._quarantine: tuple[dict, int] | None = None
         self._functions: dict[str, tuple[dict, int]] = {}
+        self._ml_models: dict[str, tuple[dict, int]] = {}
 
     # -- declarations -------------------------------------------------------------------
     def var(self, name: str) -> str:
@@ -177,18 +178,45 @@ class Pipeline:
         return Connection(name)
 
     def java_function(self, name: str, class_name: str, *, jar: str | None = None, returns: str | None = None,
-                      deterministic: bool = True, description: str | None = None) -> SqlFunction:
-        """A Java ScalarFunction; `jar` is relative to the project (or omit it if the class is on the
-        runtime image's classpath). `returns` lets the compiler type the column statically."""
+                      deterministic: bool = True, description: str | None = None,
+                      kind: str = "scalar") -> SqlFunction:
+        """A Java function class: kind scalar, aggregate, table or process_table. `jar` is relative to the
+        project (or omit it if the class is on the runtime image's classpath). `returns` lets the compiler
+        type the column statically (a ROW for table and process table functions)."""
         self._functions[name] = ({"language": "java", "class": class_name, "jar": jar, "returns": returns,
                                   "deterministic": deterministic if not deterministic else None,
-                                  "description": description}, _caller_line())
+                                  "description": description, "kind": None if kind == "scalar" else kind},
+                                 _caller_line())
         return SqlFunction(name)
 
+    def python_aggregate(self, cls, *, returns: str, accumulator: str, name: str | None = None,
+                         description: str | None = None) -> SqlFunction:
+        """A plain class (create_accumulator, accumulate, get_value; optionally retract and merge) from a
+        module of the project, as an aggregate function. Pass the class, or "module_file.py:Class"."""
+        if isinstance(cls, type):
+            file, attr = inspect.getsourcefile(cls), cls.__name__
+            description = description or (inspect.getdoc(cls) or None)
+        else:
+            file, _, attr = str(cls).partition(":")
+        fname = name or attr
+        self._functions[fname] = ({"language": "python", "kind": "aggregate", "file": file, "class": attr,
+                                   "accumulator": accumulator, "returns": returns, "description": description},
+                                  _caller_line())
+        return SqlFunction(fname)
+
+    def ml_model(self, name: str, *, provider: str, input: dict, output: dict, properties: dict | None = None,
+                 artifacts: list | None = None, description: str | None = None) -> str:
+        """A model for ML_PREDICT(TABLE t, MODEL <name>, DESCRIPTOR(...)); returns its name."""
+        self._ml_models[name] = ({"provider": provider, "input": dict(input), "output": dict(output),
+                                  "properties": properties, "artifacts": artifacts, "description": description},
+                                 _caller_line())
+        return name
+
     def python_function(self, fn, *, returns: str, name: str | None = None, deterministic: bool = True,
-                        description: str | None = None) -> SqlFunction:
+                        description: str | None = None, kind: str = "scalar") -> SqlFunction:
         """A plain Python function from a module of the project (not pipeline.py itself), run by PyFlink
-        workers. Pass the function object, or "module_file.py:function"."""
+        workers; kind scalar, or table for a generator. Pass the function object, or
+        "module_file.py:function"."""
         if callable(fn):
             file = inspect.getsourcefile(fn)
             func = fn.__name__
@@ -198,7 +226,8 @@ class Pipeline:
         fname = name or func
         self._functions[fname] = ({"language": "python", "file": file, "function": func, "returns": returns,
                                    "deterministic": deterministic if not deterministic else None,
-                                   "description": description}, _caller_line())
+                                   "description": description, "kind": None if kind == "scalar" else kind},
+                                  _caller_line())
         return SqlFunction(fname)
 
     def source(self, name: str, connection, *, columns: dict, format: str | None = None,
@@ -282,6 +311,9 @@ class Pipeline:
                     spec["file"] = os.path.relpath(spec["file"], base)
                 fdefs[n] = _ld(spec, line)
             doc["functions"] = _ld(fdefs, self._line)
+        if self._ml_models:
+            doc["ml_models"] = _ld({n: _nested({k: v for k, v in spec.items() if v is not None}, line)
+                                    for n, (spec, line) in self._ml_models.items()}, self._line)
         doc["connections"] = _ld({n: _ld({"type": spec.type, "properties": _ld(spec.properties, line)}, line)
                                   for n, (spec, line) in self._connections.items()}, self._line)
         doc["sources"] = _ld({n: _nested(spec, line) for n, (spec, line) in self._sources.items()}, self._line)

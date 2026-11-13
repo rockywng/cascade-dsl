@@ -52,6 +52,13 @@ class ReplicateTest(unittest.TestCase):
         self.assertIn('"on_slot_loss": "refuse"', r.lowered.cdc_guard)
         self.assertIn("org.apache.flink:flink-cdc-pipeline-connector-postgres", r.lowered.manifest["artifacts"])
 
+    def test_new_tables_are_opt_in_with_a_warning(self):
+        r = compile_text(REPL, base=False)
+        self.assertNotIn("scan.newly-added-table.enabled", yaml.safe_load(r.lowered.cdc_pipeline)["source"])
+        r = compile_text(REPL.replace("  to: lake\n", "  to: lake\n  capture_new_tables: true\n"), base=False)
+        self.assertIs(yaml.safe_load(r.lowered.cdc_pipeline)["source"]["scan.newly-added-table.enabled"], True)
+        self.assertIn("CD603", [d.code for d in r.diagnostics.items])
+
     def test_mysql_to_kafka(self):
         r = compile_text(REPL.replace("from: crm", "from: shopdb").replace("to: lake", "to: bus")
                          .replace("public.", "shop."), base=False)

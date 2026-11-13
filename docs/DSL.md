@@ -996,15 +996,21 @@ replicate:
 - **MySQL** connections allow public key retrieval, as Flink CDC's SQL source does, so MySQL 8's default
   authentication works without TLS. `source_options: {jdbc.properties.useSSL: "true"}` and the like
   pass driver settings.
-- **New tables** that match a pattern are captured at the next start: a restart or an upgrade from a
-  savepoint (`scan.newly-added-table.enabled`). Flink CDC's Postgres source doesn't add tables while
-  running.
+- **New tables** that match a pattern aren't captured by a running replication, and by default not after
+  a restart either. `capture_new_tables: true` snapshots them at the next start. It's off, and warns
+  (CD603), because of a Flink CDC 3.7 bug: while it snapshots a new table on restore, it can drop changes
+  it streams for the other tables at the same time. `integration/connectors.py` lost a change made while
+  the job was down in 1 restore out of 8, with nothing in the logs. To add tables, start the replication
+  fresh (new slot, full snapshot), or replicate them in a second replication.
 - **At startup** the runner fills in secrets and runs the Postgres slot guard: a restore whose
   replication slot is gone is refused, because Flink CDC would silently start a new slot. It then builds
   the job with Flink CDC's composer. Monitoring adds the slot alerts.
-- **Tested end to end** (`integration/connectors.py`, case `replicate-postgres`):
+- **Tested end to end:** `integration/connectors.py`, case `replicate-mysql` (a MySQL database into
+  Kafka: snapshot, changes, an added column, a restore with changes made while down), and case
+  `replicate-postgres`:
   - a whole Postgres schema into Paimon: the snapshot, then inserts, updates and deletes
-  - an `ALTER TABLE ... ADD COLUMN`, and a table created while running (picked up at the restore)
+  - an `ALTER TABLE ... ADD COLUMN`
+  - a table created while running, not captured (see above), without losing other changes
   - a restore from a checkpoint with a change made while down
   - a refused restore after the slot was dropped
 - **No local tools:** `test`, `verify`, `plan` and `restore-test` don't apply; Flink CDC builds the job
@@ -1255,6 +1261,6 @@ and checks that the diagnostics arrive and that go-to-definition works. Any othe
 | CD50x | pipeline-level (unused nodes, no sinks) |
 | CD52x | scaling (CD520 no max parallelism with keyed state, CD521 invalid bounds, CD522 uneven key groups) |
 | CD53x | deployment (CD530 secret in deploy settings) |
-| CD60x | replication (CD601 sources/models/sinks or batch mode in a replication, CD602 unsupported from/to) |
+| CD60x | replication (CD601 sources/models/sinks or batch mode in a replication, CD602 unsupported from/to, CD603 capture_new_tables can drop changes) |
 
 `cascade validate --json` emits machine-readable diagnostics for editors and CI.

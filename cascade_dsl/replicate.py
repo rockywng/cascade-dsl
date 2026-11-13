@@ -32,7 +32,7 @@ SOURCES = {"postgres-cdc": "postgres", "mysql-cdc": "mysql"}
 SINKS = {"paimon": "paimon", "kafka": "kafka"}
 SCHEMA_CHANGES = ("evolve", "try_evolve", "lenient", "ignore", "exception")
 KEYS = {"from", "to", "tables", "exclude", "schema_changes", "route", "table_options", "parallelism",
-        "slot_name", "source_options", "sink_options"}
+        "slot_name", "source_options", "sink_options", "capture_new_tables"}
 
 
 def artifact(kind: str) -> str:
@@ -73,6 +73,12 @@ def check(c) -> None:
             d.error("CD201", f"'{k}' is a secret and must be a ${{secret:...}} reference", loc)
     if p.mode == "batch":
         d.error("CD601", "replication is streaming only", loc)
+    if r.get("capture_new_tables"):
+        d.warning("CD603", "capture_new_tables: Flink CDC 3.7 can drop changes to the other tables that it "
+                  "streams while it snapshots a newly added table on restore (integration/connectors.py "
+                  "replicate-postgres, 1 restore in 8)", loc,
+                  hint="leave it off and start the replication fresh (a new slot, a full snapshot) when tables "
+                       "are added, or replicate new tables in a second replication")
     for kind in ([SOURCES.get(src.type)] if src else []) + ([SINKS.get(dst.type)] if dst else []):
         if kind:
             c.extra_artifacts.add(artifact(kind))
@@ -105,8 +111,9 @@ def definition(p) -> dict:
         # MySQL 8's caching_sha2_password over a non-TLS connection needs the server's public key, which
         # Flink CDC's SQL source allows and its pipeline source doesn't ("Public Key Retrieval is not allowed")
         source["jdbc.properties.allowPublicKeyRetrieval"] = "true"
-    # tables that start matching later (created after the job started) are snapshotted on the next start
-    source["scan.newly-added-table.enabled"] = True
+    if r.get("capture_new_tables"):
+        # tables that start matching later are snapshotted on the next start; off by default (CD603)
+        source["scan.newly-added-table.enabled"] = True
     source.update(r.get("source_options") or {})
     if dst.type == "paimon":
         sink = {"type": "paimon", "catalog.properties.metastore": "filesystem",

@@ -432,8 +432,8 @@ sinks:
         converge("replicate: an added column reaches the Paimon table (schema evolution)",
                  lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
                  [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"]], job=rep)
-        # Flink CDC's Postgres source captures the tables matching at start; one created while running is
-        # picked up at the next restart (scan.newly-added-table.enabled), checked after the restore below
+        # a table created while running isn't captured: capture_new_tables is off (CD603), so the restore
+        # below must neither pick it up nor lose the changes it streams meanwhile
         sql("CREATE TABLE shop.refunds (id INT PRIMARY KEY, amount INT); "
             "ALTER TABLE shop.refunds REPLICA IDENTITY FULL; INSERT INTO shop.refunds VALUES (1, 5)")
         time.sleep(6)  # a checkpoint after the last change
@@ -446,8 +446,14 @@ sinks:
         converge("replicate: restored from a checkpoint, the change made while down arrives",
                  lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
                  [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"], ["6", "while down"]], job=rep)
-        converge("replicate: a table created while running is replicated after the restart",
-                 lambda: lake("refunds", "{id: INT NOT NULL, amount: INT}", "id, amount"), [["1", "5"]], job=rep)
+        sql("INSERT INTO shop.orders VALUES (7, 70, 'after restore')")
+        converge("replicate: and changes after the restore",
+                 lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
+                 [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"], ["6", "while down"],
+                  ["7", "after restore"]], job=rep)
+        if os.path.exists(os.path.join(wh, "shop.db", "refunds")):
+            raise Failed("replicate: a table created while running was captured, though capture_new_tables is off")
+        ok("replicate: a table created while running isn't captured (capture_new_tables is off)")
         time.sleep(6)
         checkpoint = rep.latest_checkpoint()
     finally:

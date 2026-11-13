@@ -412,6 +412,34 @@ def cmd_lineage(args) -> int:
     return 0
 
 
+def cmd_column_lineage(args) -> int:
+    import json
+    from .lineage import LineageError, column_lineage, openlineage_event
+    from .verify import find_flink_home
+    home = find_flink_home(None)
+    if home is None:
+        print("error: column lineage needs FLINK_HOME (the planner computes it)", file=sys.stderr)
+        return 2
+    try:
+        if args.openlineage or args.post:
+            doc = openlineage_event(args.path, home, args.env, namespace=args.namespace)
+        else:
+            doc = column_lineage(args.path, home, args.env)
+    except (LineageError, Exception) as e:
+        if not isinstance(e, LineageError) and type(e).__name__ != "ToolsError":
+            raise
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if args.post:
+        import urllib.request
+        req = urllib.request.Request(args.post.rstrip("/") + "/api/v1/lineage", json.dumps(doc).encode(),
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            print(f"posted to {args.post} ({resp.status})", file=sys.stderr)
+    print(json.dumps(doc, indent=2))
+    return 0
+
+
 def cmd_impact(args) -> int:
     from .lineage import impact
     home = None
@@ -557,6 +585,15 @@ def main(argv=None) -> int:
     sp.add_argument("root")
     sp.add_argument("--env")
     sp.set_defaults(fn=cmd_lineage)
+
+    sp = sub.add_parser("column-lineage",
+                        help="which source columns each sink column is computed from (needs FLINK_HOME)")
+    sp.add_argument("path")
+    sp.add_argument("--env")
+    sp.add_argument("--openlineage", action="store_true", help="print an OpenLineage RunEvent instead")
+    sp.add_argument("--post", metavar="URL", help="POST the OpenLineage event to a Marquez-style server (/api/v1/lineage)")
+    sp.add_argument("--namespace", default="cascade", help="the OpenLineage job namespace (default cascade)")
+    sp.set_defaults(fn=cmd_column_lineage)
 
     sp = sub.add_parser("impact", help="recompile every pipeline that reads this one's sinks (for its CI)")
     sp.add_argument("path")

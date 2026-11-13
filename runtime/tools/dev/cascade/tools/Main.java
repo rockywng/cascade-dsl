@@ -99,6 +99,11 @@ public final class Main {
                         Integer.parseInt(args[4]), args.length > 6 && "allow".equals(args[6]));
                 outPath = args[5];
                 break;
+            case "column-lineage":
+                // needs the unshaded planner (opt/flink-table-planner_2.12) instead of the loader: see Lineage
+                out = Lineage.run(Paths.get(args[1]));
+                outPath = args[2];
+                break;
             case "job-graph":
                 out = jobGraph(Paths.get(args[1]), args[2]);
                 outPath = args[3];
@@ -114,7 +119,7 @@ public final class Main {
 
     // ---------------------------------------------------------------------------------------
 
-    private static TableEnvironment newEnv(Configuration extra) {
+    static TableEnvironment newEnv(Configuration extra) {
         Configuration conf = new Configuration();
         conf.setString("parallelism.default", "1");
         conf.setString("restart-strategy.type", "none");
@@ -134,7 +139,7 @@ public final class Main {
                 EnvironmentSettings.newInstance().inStreamingMode().withConfiguration(conf).build());
     }
 
-    private static List<String> statements(Path script) throws Exception {
+    static List<String> statements(Path script) throws Exception {
         String text = new String(Files.readAllBytes(script), StandardCharsets.UTF_8);
         List<String> out = new ArrayList<>();
         for (String part : text.split("(?m)^" + Pattern.quote(SEPARATOR) + "\\s*$")) {
@@ -147,7 +152,7 @@ public final class Main {
     }
 
     /** Executes DDL/SET statements; returns INSERT statements for a statement set. */
-    private static List<String> setup(TableEnvironment tEnv, List<String> stmts) throws Exception {
+    static List<String> setup(TableEnvironment tEnv, List<String> stmts) throws Exception {
         List<String> inserts = new ArrayList<>();
         for (String s : stmts) {
             Matcher m = SET.matcher(s);
@@ -640,7 +645,7 @@ public final class Main {
 
     // --- errors -----------------------------------------------------------------------------
 
-    private static String errorMessage(Throwable t) {
+    static String errorMessage(Throwable t) {
         List<String> parts = new ArrayList<>();
         for (Throwable c = t; c != null && parts.size() < 12; c = c.getCause()) {
             String m = c.getClass().getSimpleName() + ": " + c.getMessage();

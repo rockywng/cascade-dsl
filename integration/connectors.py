@@ -345,7 +345,13 @@ class Replication:
         opens = [f"--add-opens=java.base/{p}=ALL-UNNAMED" for p in
                  ("java.util", "java.lang", "java.nio", "java.lang.reflect", "java.net", "java.io", "sun.nio.ch",
                   "java.util.concurrent", "java.time", "java.text", "java.math")]
-        cmd = ["java", *opens, "-cp", cp, "dev.cascade.runner.CdcRunner",
+        log4j = os.path.join(self.dir, "log4j2.properties")
+        with open(log4j, "w") as f:  # Flink's warnings and errors in job.log (restarts, connector errors)
+            f.write("rootLogger.level = WARN\nrootLogger.appenderRef.c.ref = C\nappender.c.type = Console\n"
+                    "appender.c.name = C\nappender.c.layout.type = PatternLayout\n"
+                    "appender.c.layout.pattern = %d %p %c{1} %m%n\n"
+                    "logger.cdc.name = org.apache.flink.cdc\nlogger.cdc.level = INFO\n")
+        cmd = ["java", *opens, f"-Dlog4j.configurationFile={log4j}", "-cp", cp, "dev.cascade.runner.CdcRunner",
                "--pipeline", os.path.join(self.dir, "cdc-pipeline.yaml"), "--guard", os.path.join(self.dir, "guard.sql"),
                "--conf", "execution.checkpointing.interval=2s",
                "--conf", f"execution.checkpointing.dir=file://{self.dir}/checkpoints"] \

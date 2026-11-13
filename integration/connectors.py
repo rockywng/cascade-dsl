@@ -467,6 +467,10 @@ def tls_certs() -> str:
            os.path.join(d, f"{who}.csr"), "-outfile", os.path.join(d, f"{who}.pem"), "-rfc", "-validity", "2", *ext)
         kt("-importcert", "-noprompt", "-alias", "ca", "-file", os.path.join(d, "ca.pem"), "-keystore", store, *pw)
         kt("-importcert", "-alias", who, "-file", os.path.join(d, f"{who}.pem"), "-keystore", store, *pw)
+    with open(os.path.join(d, "client.properties"), "w") as f:  # for kafka-topics.sh in the container
+        f.write("security.protocol=SSL\nssl.truststore.location=/certs/truststore.p12\nssl.truststore.type=PKCS12\n"
+                "ssl.truststore.password=storepw\nssl.keystore.location=/certs/client.p12\n"
+                "ssl.keystore.type=PKCS12\nssl.keystore.password=storepw\nssl.key.password=storepw\n")
     for f in os.listdir(d):
         os.chmod(os.path.join(d, f), 0o644)  # the broker runs as another user
     return d
@@ -489,10 +493,18 @@ def case_kafka_tls():
         shutil.copy(os.path.join(certs, f), os.path.join(files, f"kafka_{f}"))
     os.environ["CASCADE_FILES_DIR"] = files
     try:
-        def write():
-            sink_job("kafka-tls-sink", conn, "topic: tls.items, format: json", mode="append").run()
-            return True
-        it.wait_for("a write over mutual TLS (broker starting)", write, timeout=180, every=10)
+        def topic():
+            out = sh("kafka-tls", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:19093",
+                     "--command-config", "/certs/client.properties", "--create", "--if-not-exists",
+                     "--topic", "tls.items", check=False)
+            return "tls.items" in sh("kafka-tls", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server",
+                                     "localhost:19093", "--command-config", "/certs/client.properties", "--list",
+                                     check=False) or (print(out[-400:]) and False)
+        try:
+            it.wait_for("the TLS broker (topic created over mutual TLS)", topic, timeout=180, every=5)
+        except Failed:
+            raise Failed("TLS broker not ready:\n" + dc("logs", "--tail", "40", "kafka-tls", check=False)[-3000:])
+        sink_job("kafka-tls-sink", conn, "topic: tls.items, format: json", mode="append").run()
         ok("kafka-tls: 100 rows written over mutual TLS")
         table = "kafka_tls"
         pg_table("id BIGINT PRIMARY KEY, name TEXT, qty INT")(table)

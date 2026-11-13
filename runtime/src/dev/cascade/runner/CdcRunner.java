@@ -62,6 +62,11 @@ public final class CdcRunner {
         if (restore != null) {
             conf.set(StateRecoveryOptions.SAVEPOINT_PATH, restore);
         }
+        // Flink CDC adds the connector jars to the job (pipeline.jars) although they are on the classpath;
+        // child-first loading would load their classes twice ("cannot assign Options to Options")
+        if (!conf.containsKey("classloader.resolve-order")) {
+            conf.setString("classloader.resolve-order", "parent-first");
+        }
         Map<String, String> env = System.getenv();
         String yaml = SqlRunner.substitute(
                 new String(Files.readAllBytes(Paths.get(pipeline)), StandardCharsets.UTF_8), env);

@@ -565,6 +565,9 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
         conf["python.client.executable"] = PYFLINK_PYTHON
     jm = cfg.get("jobmanager") or {}
     conf.update(_high_availability(p, cfg, int(jm.get("replicas", 1))))
+    if r.lowered.cdc_pipeline is not None:
+        # Flink CDC also ships its connector jars with the job; they're in the image's lib already
+        conf["classloader.resolve-order"] = "parent-first"
     from . import monitoring
     if monitoring.enabled(cfg):
         conf.update(monitoring.REPORTER)

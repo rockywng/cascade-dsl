@@ -101,6 +101,10 @@ def definition(p) -> dict:
     if kind == "postgres":
         source["slot.name"] = r.get("slot_name") or slot_name(p)
         source["decoding.plugin.name"] = "pgoutput"
+    if kind == "mysql":
+        # MySQL 8's caching_sha2_password over a non-TLS connection needs the server's public key, which
+        # Flink CDC's SQL source allows and its pipeline source doesn't ("Public Key Retrieval is not allowed")
+        source["jdbc.properties.allowPublicKeyRetrieval"] = "true"
     # tables that start matching later (created after the job started) are snapshotted on the next start
     source["scan.newly-added-table.enabled"] = True
     source.update(r.get("source_options") or {})

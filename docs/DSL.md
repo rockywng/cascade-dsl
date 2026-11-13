@@ -993,6 +993,9 @@ replicate:
   updates and deletes. The runner checks every matching table at start and refuses, listing the
   `ALTER TABLE ... REPLICA IDENTITY FULL` statements to run. Tables created later need it too, or the
   job fails at their first update.
+- **MySQL** connections allow public key retrieval, as Flink CDC's SQL source does, so MySQL 8's default
+  authentication works without TLS. `source_options: {jdbc.properties.useSSL: "true"}` and the like
+  pass driver settings.
 - **New tables** that match a pattern are captured at the next start: a restart or an upgrade from a
   savepoint (`scan.newly-added-table.enabled`). Flink CDC's Postgres source doesn't add tables while
   running.

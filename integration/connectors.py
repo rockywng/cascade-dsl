@@ -666,8 +666,7 @@ sinks:
         restored.stop()
 
 
-def case_oracle():
-    """Oracle CDC (LogMiner, multitenant): snapshot, live changes, batch read through JDBC."""
+def oracle_ready():
     dc("up", "-d", "oracle")
     it.wait_for("Oracle", lambda: "DATABASE IS READY TO USE" in dc("logs", "oracle", check=False), timeout=900,
                 every=10)
@@ -677,9 +676,71 @@ def case_oracle():
         sh("oracle", "bash", "-c", "touch /tmp/cdc-ready")
         ok("oracle: archivelog, supplemental logging, CDC user: " + out.strip().splitlines()[-1])
 
-    def sql(q):
-        return sh("oracle", "bash", "-c", f"sqlplus -s app/apppw@localhost:1521/XEPDB1 <<'SQL'\n"
-                  f"SET HEADING OFF FEEDBACK OFF PAGESIZE 0 COLSEP '|'\n{q}\nSQL")
+
+def oracle_sql(q):
+    return sh("oracle", "bash", "-c", f"sqlplus -s app/apppw@localhost:1521/XEPDB1 <<'SQL'\n"
+              f"SET HEADING OFF FEEDBACK OFF PAGESIZE 0 COLSEP '|'\n{q}\nSQL")
+
+
+def case_oracle_restore():
+    """Oracle CDC in a PDB (Flink CDC's legacy reader) restored from a checkpoint: changes made while the
+    job was down arrive, and nothing is read twice (a COUNT(*) over the source would grow)."""
+    oracle_ready()
+    oracle_sql("DELETE FROM items;\nINSERT INTO items VALUES (1, 'a', 5);\nINSERT INTO items VALUES (2, 'b', 7);\n"
+               "INSERT INTO items VALUES (3, 'c', 9);\nCOMMIT;")
+    truth = lambda: sorted(tuple(x.strip() for x in line.split("|"))  # noqa: E731
+                           for line in oracle_sql("SELECT id, name, qty FROM items ORDER BY id;").splitlines()
+                           if line.strip())
+    pg_table("id INT PRIMARY KEY, name TEXT, qty INT")("oracle_restore")
+    pg_table("k INT PRIMARY KEY, n BIGINT")("oracle_restore_count")
+    job = Job("oracle-restore", f"""
+pipeline: oracle_restore
+defaults: {{state_ttl: 1d}}
+flink:
+  config:
+    execution.checkpointing.interval: 2s
+    execution.checkpointing.dir: "file://{os.path.join(WORK, 'oracle-restore', 'checkpoints')}"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+connections:
+  src: {{type: oracle-cdc, properties: {{hostname: localhost, port: 11521, username: c##flinkuser,
+         password: "${{secret:oracle}}", database: XE, pdb: XEPDB1}}}}{RESULTS}
+sources:
+  items: {{connection: src, table: APP.ITEMS, columns: {{ID: INT NOT NULL, NAME: STRING, QTY: INT}}, primary_key: [ID]}}
+models:
+  counted:
+    sql: SELECT 1 AS k, COUNT(*) AS n FROM items
+sinks:
+  mirror: {{from: items, connection: results, table: oracle_restore, mode: upsert, primary_key: [ID]}}
+  count: {{from: counted, connection: results, table: oracle_restore_count, mode: upsert, primary_key: [k]}}
+""")
+    mirror = lambda: sorted(tuple(r) for r in results("SELECT * FROM oracle_restore ORDER BY 1"))  # noqa: E731
+    count = lambda: int((results("SELECT n FROM oracle_restore_count") or [["0"]])[0][0])  # noqa: E731
+    job.start()
+    try:
+        converge("oracle restore: mirrored before the restart", mirror, truth(), job, timeout=300)
+        converge("oracle restore: COUNT(*) before the restart", count, 3, job)
+        time.sleep(8)  # checkpoints after the snapshot
+    finally:
+        job.stop()
+    checkpoint = job.latest_checkpoint()
+    oracle_sql("INSERT INTO items VALUES (4, 'made while down', 1);\nUPDATE items SET qty = 70 WHERE id = 2;\n"
+               "DELETE FROM items WHERE id = 1;\nCOMMIT;")
+    job.start(restore=checkpoint)
+    try:
+        converge("oracle restore: changes made while down arrived", mirror, truth(), job, timeout=300)
+        converge("oracle restore: nothing read twice (COUNT(*) equals the table)", count, len(truth()), job)
+        time.sleep(10)
+        if count() != len(truth()):
+            raise Failed(f"oracle restore: COUNT(*) drifted to {count()} after the restore (rows re-read)")
+        ok("oracle restore: still exact 10 s later")
+    finally:
+        job.stop()
+
+
+def case_oracle():
+    """Oracle CDC (LogMiner, multitenant): snapshot, live changes, batch read through JDBC."""
+    oracle_ready()
+    sql = oracle_sql
     truth = lambda: sorted(tuple(x.strip() for x in line.split("|"))  # noqa: E731
                            for line in sql("SELECT id, name, qty FROM items ORDER BY id;").splitlines() if line.strip())
     mirror_case("oracle-cdc", '{type: oracle-cdc, properties: {hostname: localhost, port: 11521, username: c##flinkuser, '
@@ -695,7 +756,8 @@ CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc"
          "elasticsearch": case_elasticsearch, "dynamodb": case_dynamodb, "kinesis": case_kinesis,
          "hudi": case_hudi, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
          "sqlserver-cleaned-up": case_sqlserver_cleanup, "slot-metrics": case_slot_metrics,
-         "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle}
+         "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle,
+         "oracle-restore": case_oracle_restore}
 
 
 def prepare():

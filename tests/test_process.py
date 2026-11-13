@@ -331,3 +331,33 @@ class PythonRunnerJobTest(unittest.TestCase):
             shutil.rmtree(root)
         finally:
             shutil.rmtree(d)
+
+
+@unittest.skipUnless(READY and __import__("cascade_dsl.jvm", fromlist=["x"]).python_executable(),
+                     "needs FLINK_HOME, runtime/build.sh and PyFlink (CASCADE_PYTHON)")
+class PythonProcessRestoreTest(unittest.TestCase):
+    """restore-test for pipelines with Python process models runs on the Python runner."""
+
+    def test_restore_test_covers_python_process_state(self):
+        from cascade_dsl.plans import restore_test
+        example = os.path.join(os.path.dirname(__file__), "..", "examples", "sessions_py")
+        d = tempfile.mkdtemp(prefix="cascade-pyprocess-restore-")
+        try:
+            old = os.path.join(d, "old")
+            shutil.copytree(example, old)
+            same = os.path.join(d, "config-only")
+            shutil.copytree(old, same)
+            ProcessRestoreTest._edit(same, "config: {gap: PT30M}", "config: {gap: PT45M}")
+            res = restore_test(old, same, FLINK, seconds=5)
+            self.assertTrue(res.get("restored"), res.get("error", "")[-1500:])
+            gone = os.path.join(d, "without-sessions")
+            shutil.copytree(old, gone)
+            with open(os.path.join(gone, "pipeline.yaml")) as f:
+                head = f.read().partition("models:")[0]
+            with open(os.path.join(gone, "pipeline.yaml"), "w") as f:
+                f.write(head + "sinks:\n  raw: {from: clicks, connection: events, topic: raw_clicks}\n")
+            shutil.rmtree(os.path.join(gone, "tests"))
+            res = restore_test(old, gone, FLINK, seconds=5)
+            self.assertFalse(res.get("restored"))
+        finally:
+            shutil.rmtree(d)

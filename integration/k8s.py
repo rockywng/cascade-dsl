@@ -98,13 +98,19 @@ def apply_version(version: str, project: str, previous: str | None = None) -> st
         return yaml.safe_load(f)["metadata"]["name"]
 
 
-def wait_running(previous_job: str | None = None, timeout=420) -> str:
+def wait_running(previous_job: str | None = None, timeout=420, config_map: str | None = None) -> str:
+    """RUNNING and STABLE, as a new job or, with Kubernetes HA, possibly the same job id: after the
+    operator has recovered a lost JobManager it upgrades in last-state mode, which keeps the job id and
+    restores the new job graph from the latest checkpoint. `config_map` then tells the new version apart."""
     def ready():
         state, job, life = job_state()
         if state in ("FAILED",) or life == "FAILED":
             # not Failed: wait_for would retry on that
             raise RuntimeError("FlinkDeployment failed:\n" + json.dumps(deployment().get("status"), indent=1)[-4000:])
-        return job if state == "RUNNING" and life == "STABLE" and job != previous_job else None
+        st = deployment().get("status", {})
+        reconciled = config_map is not None and config_map in json.dumps(st.get("reconciliationStatus", {}))
+        new = job != previous_job or (reconciled and st.get("reconciliationStatus", {}).get("state") == "DEPLOYED")
+        return job if state == "RUNNING" and life == "STABLE" and new else None
     try:
         return it.wait_for("FlinkDeployment RUNNING/STABLE", ready, timeout=timeout, every=5)
     except Failed:
@@ -175,23 +181,23 @@ def phase_upgrade(v1_job: str):
     v2 = it.write_v2()
     cm = apply_version("v2", v2, previous="v1")
     it.check_upgrade_report()
-    job = wait_running(previous_job=v1_job, timeout=600)
+    job = wait_running(previous_job=v1_job, timeout=600, config_map=cm)
     st = deployment()["status"]
     sp = (st.get("jobStatus", {}).get("savepointInfo", {}) or {}).get("lastSavepoint") or {}
     upgrade = st.get("jobStatus", {}).get("upgradeSavepointPath") or sp.get("location")
     spec_cm = deployment()["spec"]["podTemplate"]["metadata"]["annotations"]["cascade.dev/job-config"]
     if spec_cm != cm:
         raise Failed(f"FlinkDeployment still points at {spec_cm}, expected {cm}")
-    ok(f"operator upgraded to v2: job {job[:8]} RUNNING from savepoint {upgrade or '(see status)'}")
+    ok(f"operator upgraded to v2: job {job[:8]} RUNNING, restored from {upgrade or 'its latest checkpoint (last-state, HA)'}")
     it.check_after_upgrade()
 
 
 def phase_v3(v2_job: str):
     step("v3: two backfilled models, rescale 1 -> 2, state TTL 1d -> 2d, through the operator")
     v3 = it.write_v3()
-    apply_version("v3", v3, previous="v2")
+    cm = apply_version("v3", v3, previous="v2")
     it.check_v3_report()
-    job = wait_running(previous_job=v2_job, timeout=600)
+    job = wait_running(previous_job=v2_job, timeout=600, config_map=cm)
     par = deployment()["spec"]["job"]["parallelism"]
     if par != 2:
         raise Failed(f"FlinkDeployment parallelism is {par}, expected 2")

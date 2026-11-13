@@ -361,3 +361,59 @@ class PythonProcessRestoreTest(unittest.TestCase):
             self.assertFalse(res.get("restored"))
         finally:
             shutil.rmtree(d)
+
+
+NESTED = """
+pipeline: nested
+defaults: {state_ttl: 1d}
+sources:
+  events:
+    connection: datagen
+    columns: {id: STRING, n: INT}
+models:
+  shaped:
+    process:
+      language: python
+      file: jobs/shape.py
+      function: shape
+      inputs: [events]
+    columns:
+      id: STRING
+      tags: ARRAY<STRING>
+      attrs: MAP<STRING, INT>
+      point: ROW<x INT, y INT>
+sinks:
+  out: {from: shaped, connection: print}
+"""
+
+SHAPE = '''
+from pyflink.common import Row
+
+
+def shape(ctx, inputs):
+    return inputs[0].map(lambda r: Row(id=r["id"], tags=[r["id"], "t"], attrs={"n": r["n"]},
+                                       point=Row(x=r["n"], y=r["n"] * 2)), output_type=ctx.output_type)
+'''
+
+
+@unittest.skipUnless(READY and __import__("cascade_dsl.jvm", fromlist=["x"]).python_executable(),
+                     "needs FLINK_HOME, runtime/build.sh and PyFlink (CASCADE_PYTHON)")
+class PythonNestedTypesTest(unittest.TestCase):
+    def test_arrays_maps_and_rows(self):
+        root = project(NESTED, base=False, files={"jobs/shape.py": SHAPE, "tests/shape_test.yaml": """
+tests:
+  - name: nested_types
+    target: shaped
+    given:
+      events:
+        - {id: a, n: 2}
+    expect:
+      rows:
+        - {id: a, tags: [a, t], attrs: {n: 2}, point: [2, 4]}
+"""})
+        try:
+            r, results = testing.run(root, FLINK)
+            self.assertIsNotNone(results, [x.format() for x in r.diagnostics.errors])
+            self.assertTrue(results[0].passed, results[0].message)
+        finally:
+            shutil.rmtree(root)

@@ -77,18 +77,54 @@ def python_spec(stmt: str) -> dict | None:
     return spec if spec.get("language") == "python" else None
 
 
+def _split_top(text: str) -> list[str]:
+    """Comma-separated parts at nesting depth 0."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
 def type_info(sql_type: str):
-    """TypeInformation for a declared column type (what the process function's rows carry)."""
+    """TypeInformation for a declared column type (what the process function's rows carry), nested types
+    included: ARRAY<T>, MAP<K, V>, ROW<name T, ...>."""
     from pyflink.common import Types
-    t = sql_type.upper().replace(" NOT NULL", "").strip()
-    base = t.split("(")[0].strip()
+    t = sql_type.strip()
+    t = t[:-len("NOT NULL")].strip() if t.upper().endswith("NOT NULL") else t
+    upper = t.upper()
+    if upper.startswith("ARRAY<") and t.endswith(">"):
+        return Types.OBJECT_ARRAY(type_info(t[6:-1]))
+    if upper.startswith("MAP<") and t.endswith(">"):
+        k, v = _split_top(t[4:-1])
+        return Types.MAP(type_info(k), type_info(v))
+    if upper.startswith("ROW<") and t.endswith(">"):
+        names, types = [], []
+        for field in _split_top(t[4:-1]):
+            name, _, ftype = field.strip().partition(" ")
+            names.append(name.strip("`"))
+            types.append(type_info(ftype))
+        return Types.ROW_NAMED(names, types)
+    base = upper.split("(")[0].strip()
+    if "WITH LOCAL TIME ZONE" in upper or base == "TIMESTAMP_LTZ":
+        return Types.INSTANT()
     simple = {"STRING": Types.STRING(), "VARCHAR": Types.STRING(), "CHAR": Types.STRING(),
               "BIGINT": Types.LONG(), "INT": Types.INT(), "INTEGER": Types.INT(), "SMALLINT": Types.SHORT(),
               "TINYINT": Types.BYTE(), "BOOLEAN": Types.BOOLEAN(), "DOUBLE": Types.DOUBLE(),
               "FLOAT": Types.FLOAT(), "DECIMAL": Types.BIG_DEC(), "DATE": Types.SQL_DATE(),
-              "TIMESTAMP": Types.SQL_TIMESTAMP(), "BYTES": Types.PRIMITIVE_ARRAY(Types.BYTE())}
+              "TIME": Types.SQL_TIME(), "TIMESTAMP": Types.SQL_TIMESTAMP(),
+              "BYTES": Types.PRIMITIVE_ARRAY(Types.BYTE()), "VARBINARY": Types.PRIMITIVE_ARRAY(Types.BYTE())}
     if base not in simple:
-        raise ValueError(f"Python process models support {', '.join(sorted(simple))} columns, not {sql_type}")
+        raise ValueError(f"Python process models don't support the column type {sql_type}")
     return simple[base]
 
 
@@ -164,6 +200,9 @@ def _register(t_env, view: str, stream, spec: dict):
             b.column(name, dt.notNull() if "NOT NULL" in t else dt)
         elif t.strip().startswith("DATE"):
             dt = types.DATE().bridgedTo(cls("java.sql.Date"))
+            b.column(name, dt.notNull() if "NOT NULL" in t else dt)
+        elif _re.match(r"\s*TIME\s*(\(\d+\))?\s*(NOT NULL)?\s*$", t):
+            dt = types.TIME(0).bridgedTo(cls("java.sql.Time"))
             b.column(name, dt.notNull() if "NOT NULL" in t else dt)
         else:
             b.column(name, sql_type)

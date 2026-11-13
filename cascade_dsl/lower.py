@@ -123,6 +123,10 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
     if p.scaling and p.scaling.parallelism:
         settings["parallelism.default"] = str(p.scaling.parallelism)
     settings.update(c.settings)
+    if any(m.process and m.process.get("exact_watermarks") for m in p.models.values()):
+        # PyFlink hands Python functions records in bundles with the watermark per bundle; one record per
+        # bundle makes lateness exact (at a throughput cost)
+        settings["python.fn-execution.bundle.size"] = "1"
     settings.update(p.flink_config)
     for k, v in settings.items():
         stmts.append(Stmt("set", k, f"SET {lit(k)} = {lit(v)};", options={k: v}))

@@ -5,9 +5,16 @@
   "version": "0.1.0",
   "publisher": "cascade",
   "license": "Apache-2.0",
-  "engines": {"vscode": "^1.85.0"},
-  "categories": ["Linters", "Programming Languages"],
-  "activationEvents": ["workspaceContains:**/pipeline.yaml"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/pipeline.yaml"
+  ],
   "main": "./extension.js",
   "contributes": {
     "configuration": {
@@ -15,11 +22,22 @@
       "properties": {
         "cascade.command": {
           "type": "array",
-          "default": ["cascade", "lsp"],
+          "default": [
+            "cascade",
+            "lsp"
+          ],
           "description": "How to start the language server, e.g. [\"python3\", \"-m\", \"cascade_dsl\", \"lsp\"]"
         }
       }
     }
   },
-  "dependencies": {"vscode-languageclient": "^9.0.1"}
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^2.4.1"
+  },
+  "scripts": {
+    "test": "node test/runTest.js"
+  }
 }

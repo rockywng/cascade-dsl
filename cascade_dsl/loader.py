@@ -572,7 +572,7 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
     )
 
 
-PROCESS_KEYS = {"language", "file", "function", "class", "jar", "inputs", "key_by", "config", "changelog", "primary_key", "event_time",
+PROCESS_KEYS = {"language", "file", "function", "exact_watermarks", "class", "jar", "inputs", "key_by", "config", "changelog", "primary_key", "event_time",
                 "side_outputs"}
 
 
@@ -609,7 +609,11 @@ def _load_process(name, m, ctx: _Ctx, root: str) -> dict | None:
     jar = pr.get("jar")
     if jar is not None and not os.path.exists(os.path.join(root, str(jar))):
         ctx.diags.warning("CD164", f"{what}: jar '{jar}' does not exist (build it first)", ctx.loc(pr, "jar"))
-    return {"language": language, "file": str(pr["file"]) if pr.get("file") else None,
+    if pr.get("exact_watermarks") and language != "python":
+        ctx.diags.error("CD005", f"{what}: exact_watermarks is for Python process models (Java ones see every "
+                        "watermark already)", ctx.loc(pr, "exact_watermarks"))
+    return {"language": language, "exact_watermarks": bool(pr.get("exact_watermarks", False)),
+            "file": str(pr["file"]) if pr.get("file") else None,
             "function": str(pr["function"]) if pr.get("function") else None,
             "class": str(pr.get("class", "")), "jar": str(jar) if jar is not None else None,
             "inputs": _str_list(pr.get("inputs"), ctx, pr, "inputs", "inputs"),

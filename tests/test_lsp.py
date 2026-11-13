@@ -93,6 +93,16 @@ sinks:
         text = "connections:\n  bus:\n    type: kafka\n    \n"
         self.assertIn("bootstrap_servers", {c["label"] for c in complete(text, 3, 4)})
 
+    def test_definition_and_references(self):
+        from cascade_dsl.lsp import definition, references
+        text = ("sources:\n  orders:\n    connection: bus\nmodels:\n  clean:\n    sql: SELECT * FROM orders\n"
+                "sinks:\n  out: {from: clean, connection: print}\n")
+        lines = text.split("\n")
+        self.assertEqual(definition(text, 5, lines[5].index("orders") + 2), (1, 2))
+        self.assertEqual(definition(text, 7, lines[7].index("clean") + 1), (4, 2))
+        self.assertEqual([r[0] for r in references(text, 1, 3)], [1, 5])
+        self.assertIsNone(definition(text, 5, lines[5].index("SELECT")))
+
     def test_code_docs(self):
         self.assertIn("idle timeout", code_doc("CD108"))
         self.assertIn("sinks", code_doc("CD404"))

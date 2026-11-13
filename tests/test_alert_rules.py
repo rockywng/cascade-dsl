@@ -41,6 +41,14 @@ def labels(rule, extra=None):
     return {**rule["labels"], **(extra or {})}
 
 
+def annotations(rule, extra=None):
+    """The rule's annotations as Prometheus renders them for an alert with these labels."""
+    import re
+    values = labels(rule, extra)
+    return {k: re.sub(r"\{\{\s*\$labels\.(\w+)\s*\}\}", lambda m: values.get(m.group(1), ""), v)
+            for k, v in rule["annotations"].items()}
+
+
 class AlertRulesTest(unittest.TestCase):
     @unittest.skipUnless(PROMTOOL, "needs promtool (set PROMTOOL or put it on PATH)")
     def test_every_alert_fires_on_its_condition_and_not_when_healthy(self):
@@ -91,7 +99,8 @@ class AlertRulesTest(unittest.TestCase):
             for name, (series, at, extra) in cases.items():
                 tests.append({"interval": "1m", "input_series": series, "alert_rule_test": [
                     {"eval_time": at, "alertname": name,
-                     "exp_alerts": [{"exp_labels": labels(by_name[name], extra)}]}]})
+                     "exp_alerts": [{"exp_labels": labels(by_name[name], extra),
+                                     "exp_annotations": annotations(by_name[name], extra)}]}]})
             # healthy: a running job, checkpoints completing, slots fine -> nothing fires
             healthy = [up,
                        {"series": f"flink_jobmanager_job_numRestarts{sel}", "values": "0x30"},

@@ -5,6 +5,8 @@
 - completion: connector types after `type:`, the connector's properties inside a connection, source or
   sink, and the top-level / source / model / sink keys
 - hover: the meaning of a diagnostic code (CD...) under the cursor
+- go to definition / find references: a source, model, sink, connection or function name -- in SQL,
+  `from:`, `connection:`, `inputs:` -- to where it's declared, and every use of it
 
 Editors: VS Code via editors/vscode (it starts `cascade lsp`); any LSP client otherwise.
 """
@@ -163,6 +165,52 @@ def _ranges(cell: str) -> list[tuple[int, int]]:
     return out
 
 
+# --- definitions and references ------------------------------------------------------------------------
+
+SECTIONS = ("connections", "sources", "models", "sinks", "functions")
+
+
+def definitions(text: str) -> dict[str, tuple[int, int]]:
+    """Name -> (line, column) of every connection, source, model, sink and function declared."""
+    out, section = {}, None
+    for i, line in enumerate(text.split("\n")):
+        top = re.match(r"^([A-Za-z_]+):", line)
+        if top:
+            section = top.group(1)
+            continue
+        m = re.match(r"^  ([A-Za-z_][A-Za-z0-9_]*):", line)
+        if m and section in SECTIONS and m.group(1) not in out:
+            out[m.group(1)] = (i, 2)
+    return out
+
+
+def _word_at(line: str, character: int) -> str | None:
+    for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", line):
+        if m.start() <= character <= m.end():
+            return m.group(0)
+    return None
+
+
+def definition(text: str, line: int, character: int) -> tuple[int, int] | None:
+    lines = text.split("\n")
+    if line >= len(lines):
+        return None
+    word = _word_at(lines[line], character)
+    return definitions(text).get(word) if word else None
+
+
+def references(text: str, line: int, character: int) -> list[tuple[int, int, int]]:
+    """Every whole-word use of the declared name under the cursor: (line, start, end)."""
+    lines = text.split("\n")
+    if line >= len(lines):
+        return []
+    word = _word_at(lines[line], character)
+    if not word or word not in definitions(text):
+        return []
+    pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])")
+    return [(i, m.start(), m.end()) for i, l in enumerate(lines) for m in pat.finditer(l)]
+
+
 # --- the server -----------------------------------------------------------------------------------------
 
 class Server:
@@ -207,7 +255,7 @@ class Server:
             self.send({"jsonrpc": "2.0", "id": mid, "result": {
                 "capabilities": {"textDocumentSync": {"openClose": True, "change": 1, "save": True},
                                  "completionProvider": {"triggerCharacters": [":", " "]},
-                                 "hoverProvider": True},
+                                 "hoverProvider": True, "definitionProvider": True, "referencesProvider": True},
                 "serverInfo": {"name": "cascade"}}})
         elif method in ("textDocument/didOpen",):
             doc = params["textDocument"]
@@ -229,6 +277,18 @@ class Server:
             pos = params["position"]
             text = self.docs.get(params["textDocument"]["uri"], "")
             self.send({"jsonrpc": "2.0", "id": mid, "result": hover(text, pos["line"], pos["character"])})
+        elif method == "textDocument/definition":
+            pos, uri = params["position"], params["textDocument"]["uri"]
+            hit = definition(self.docs.get(uri, ""), pos["line"], pos["character"])
+            self.send({"jsonrpc": "2.0", "id": mid, "result": None if hit is None else {
+                "uri": uri, "range": {"start": {"line": hit[0], "character": hit[1]},
+                                      "end": {"line": hit[0], "character": hit[1]}}}})
+        elif method == "textDocument/references":
+            pos, uri = params["position"], params["textDocument"]["uri"]
+            refs = references(self.docs.get(uri, ""), pos["line"], pos["character"])
+            self.send({"jsonrpc": "2.0", "id": mid, "result": [
+                {"uri": uri, "range": {"start": {"line": a, "character": b}, "end": {"line": a, "character": c}}}
+                for a, b, c in refs]})
         elif method == "shutdown":
             self.send({"jsonrpc": "2.0", "id": mid, "result": None})
         elif method == "exit":

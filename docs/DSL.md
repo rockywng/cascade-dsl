@@ -207,8 +207,9 @@ ARCHIVELOG mode, supplemental logging, and a common user with LogMiner grants. T
 the test. A table in a pluggable database needs the connection's `pdb`. The tests found two problems:
 - **The connector doesn't bundle the Oracle driver,** so the catalog adds `ojdbc8`.
 - **Flink CDC 3.7's incremental reader can't find tables in a PDB.** With `pdb` set, the compiler
-  uses the legacy reader and LogMiner's online catalog, and warns (CD216) that its restore behaviour
-  isn't verified.
+  uses the legacy reader and LogMiner's online catalog. Restoring that reader from a checkpoint is
+  tested (case `oracle-restore`): changes made while the job was down arrive, and nothing is read
+  twice.
 
 **Db2 CDC** is only planned against its jar. It reads changes through IBM's ASN capture, which has to
 be installed and administered inside a privileged, licensed Db2 instance. That's beyond what the
@@ -992,7 +993,7 @@ the data itself, not something missing from the compiler.
 |---|---|
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
 | CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts, CD110 alignment/emit without push-down, CD111 SOURCE_WATERMARK unsupported); batch (CD120 unbounded source, CD121 temporal join, CD122 backfill); `from_pipeline` (CD130 cycle, CD131 upstream doesn't compile, CD132 unknown sink, CD133 sink not readable, CD134 not streamable); process models (CD140 state not checked by upgrades, CD141 key_by column, CD142 event_time / primary_key column); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
-| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage; CD216: Oracle CDC in a PDB uses the legacy reader) |
+| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage) |
 | CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |
 | CD35x | state / TTL |

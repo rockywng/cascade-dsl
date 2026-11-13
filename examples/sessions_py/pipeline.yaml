@@ -4,9 +4,6 @@
 pipeline: click_sessions_py
 owner: growth
 defaults: {state_ttl: 1d}
-# PyFlink hands Python functions records in bundles and the watermark per bundle; this example's late-data
-# branch needs the watermark per record (exact lateness), at the cost of throughput
-flink: {config: {python.fn-execution.bundle.size: "1"}}
 scaling: {max_parallelism: 120, parallelism: 1}
 
 connections:
@@ -32,6 +29,7 @@ models:
       language: python
       file: jobs/sessionize.py
       function: sessionize
+      exact_watermarks: true          # the late-data branch needs the watermark per record
       inputs: [clicks]
       key_by: [user_id]
       config: {gap: PT30M}

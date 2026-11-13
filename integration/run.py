@@ -327,7 +327,7 @@ def check_alert_metrics():
     from cascade_dsl.compiler import compile_pipeline
     r = compile_pipeline(os.path.join(REPO, "integration", "pipeline"))
     cfg = {"monitoring": True, **(r.checked.pipeline.deploy or {})}
-    wanted = monitoring.metric_names(monitoring.rules(r, cfg))
+    wanted = {m for m in monitoring.metric_names(monitoring.rules(r, cfg)) if m.startswith("flink_")}  # pg_: exporter
     wanted |= {m for panel in monitoring.dashboard(r, cfg)["panels"] for t in panel["targets"]
                for m in re.findall(r"\b(flink_[A-Za-z0-9_]+)", t["expr"])}
 

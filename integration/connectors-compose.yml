@@ -28,6 +28,27 @@ services:
     image: ghcr.io/etspaceman/kinesis-mock:0.4.13
     environment: {KINESIS_MOCK_PLAIN_PORT: "4568", INITIALIZE_STREAMS: "orders:1,out:1", LOG_LEVEL: WARN}
     ports: ["14568:4568"]
+  pg-exporter:   # the postgres_exporter the generated replication-slot alerts expect
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.18.1
+    environment: {DATA_SOURCE_NAME: "postgresql://postgres:pw@postgres:5432/app?sslmode=disable"}
+    command: ["--collector.replication_slot"]
+    ports: ["19187:9187"]
+    depends_on: [postgres]
+  pgprimary:   # failover pair: primary ...
+    image: postgres:17
+    environment: {POSTGRES_PASSWORD: pw, POSTGRES_DB: app}
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10",
+              "-c", "synchronized_standby_slots=standby_slot"]
+    volumes: ["./failover/primary-init.sh:/docker-entrypoint-initdb.d/init.sh:ro"]
+    ports: ["25432:5432"]
+  pgstandby:   # ... and its streaming standby, which syncs failover slots
+    image: postgres:17
+    user: postgres
+    environment: {PGDATA: /var/lib/postgresql/data/pgdata}
+    entrypoint: ["/failover/standby.sh"]
+    volumes: ["./failover:/failover:ro"]
+    ports: ["25433:5432"]
+    depends_on: [pgprimary]
   postgres:   # where sources' results land, to be compared; also a CDC source (database app)
     image: postgres:17
     environment: {POSTGRES_PASSWORD: pw, POSTGRES_DB: results}

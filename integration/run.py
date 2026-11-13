@@ -395,7 +395,10 @@ def check_upgrade_report():
     ok("cascade plan warned: the new TemporalJoin starts empty and will miss unchanged customers")
 
 
-def check_after_upgrade():
+def check_after_upgrade(from_checkpoint: bool = False):
+    """`from_checkpoint`: the operator upgraded in last-state mode (after it recovered a JobManager), so
+    the new job restored the latest checkpoint, not a savepoint taken after c1's update was read. If that
+    checkpoint predates the update, the CDC source replays it and the new model's join sees it too."""
     produce("orders", [
         order("o6", "c1", 100.00, "10:03:10"),
         order("o7", "c2", 2.00, "10:05:00"),    # closes the 10:03 window
@@ -411,7 +414,14 @@ def check_after_upgrade():
     # the new model's own TemporalJoin started empty: exactly the hazard the plan report warned about
     # (o7 at 10:05:00 is still buffered: the watermark is 10:04:58)
     counts = lambda: {k["segment"]: v["orders"] for k, v in consume("orders_per_segment", keys=True) if v}  # noqa
-    expect("new model's empty TemporalJoin misses c1 (as warned)", counts, {"unknown": 1})
+    if from_checkpoint:
+        got = wait_for("new model's TemporalJoin (restored from a checkpoint)",
+                       lambda: (lambda c: c if c in ({"unknown": 1}, {"enterprise": 1}) else None)(counts()),
+                       timeout=120, every=3)
+        ok("new model's TemporalJoin: " + ("c1 unknown, as warned" if "unknown" in got else
+                                           "the checkpoint predates c1's update, which was replayed") + f": {got}")
+    else:
+        expect("new model's empty TemporalJoin misses c1 (as warned)", counts, {"unknown": 1})
 
 
 def phase_upgrade(job_id: str):

@@ -189,7 +189,7 @@ def phase_upgrade(v1_job: str):
     if spec_cm != cm:
         raise Failed(f"FlinkDeployment still points at {spec_cm}, expected {cm}")
     ok(f"operator upgraded to v2: job {job[:8]} RUNNING, restored from {upgrade or 'its latest checkpoint (last-state, HA)'}")
-    it.check_after_upgrade()
+    it.check_after_upgrade(from_checkpoint=not str(upgrade or "").startswith("file:"))
 
 
 def phase_v3(v2_job: str):

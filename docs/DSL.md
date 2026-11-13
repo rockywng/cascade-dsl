@@ -1056,6 +1056,11 @@ restores a checkpoint, and that the upgrade after it continues the totals. Other
   `jobmanager.replicas > 1`.
 - `jobmanager: {replicas: 2}` adds a standby JobManager.
 
+After the operator has recovered a lost JobManager, it records the deployment as last-state. The next
+upgrade then restores the latest checkpoint instead of taking a savepoint, and keeps the job ID. State
+is consistent either way. Changes read after that checkpoint are read again, which matters only to
+models that are new in the upgrade (see `backfill`).
+
 **Upgrades through the operator.** The job ConfigMap is named after its content and referenced
 from the pod template. So `kubectl apply -k` of a new version changes the FlinkDeployment spec,
 and the operator does a savepoint upgrade (`upgrade_mode: savepoint`). A running job never sees

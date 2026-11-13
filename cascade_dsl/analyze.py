@@ -166,6 +166,8 @@ def _check_sources(c: Checked):
                 _report_option_problems(c, problems, s.loc, s.name)
                 c.options[s.name] = opts
                 _check_source_metadata(c, s, spec, opts)
+                _check_key_fields(c, s.name, s.endpoint, [col.name for col in s.columns
+                                                          if col.metadata is None and not col.expression], s.loc)
         p.relations[s.name] = RelationInfo(columns=out_cols, rowtime=rowtime, changelog=changelog,
                                            upsert_key=list(s.primary_key) or None)
 
@@ -184,6 +186,16 @@ def _metadata_problem(spec: ConnectorSpec, key: str, declared, writing: bool) ->
     if declared is not None and not declared.same_base(parse_type(typ)):
         return ("CD221", f"metadata '{key}' of connector '{spec.type}' is {typ}, declared as {declared}")
     return None
+
+
+def _check_key_fields(c: Checked, node: str, endpoint: dict, columns: list[str] | None, loc):
+    keys = endpoint.get("key_fields")
+    if keys is None or columns is None:
+        return
+    for k in ([keys] if isinstance(keys, str) else keys):
+        if k not in columns:
+            c.diagnostics.error("CD225", f"{node}: key_fields column '{k}' is not a physical column", loc, node=node,
+                                hint=_suggest(str(k), columns) or "the key carries table columns, not metadata")
 
 
 def _check_source_metadata(c: Checked, s, spec: ConnectorSpec, opts: dict):
@@ -679,6 +691,8 @@ def _check_sinks(c: Checked):
                                            conn=p.connections.get(k.connection))
             _report_option_problems(c, problems, k.loc, k.name)
             c.options[k.name] = opts
+            _check_key_fields(c, k.name, k.endpoint, [x.name for x in rel.columns if x.name not in k.metadata]
+                              if rel and rel.columns is not None else None, k.loc)
             for col, key in k.metadata.items():
                 rcol = next((x for x in (rel.columns or []) if x.name == col), None) if rel else None
                 if rel is not None and rel.columns is not None and rcol is None:

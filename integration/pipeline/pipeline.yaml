@@ -88,6 +88,7 @@ sinks:
     from: revenue_per_minute
     connection: bus
     topic: revenue
+    key_fields: [segment]              # an append topic keyed by segment: one partition per segment
   ltv_topic:
     from: customer_ltv
     connection: bus

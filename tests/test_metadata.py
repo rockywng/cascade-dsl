@@ -1,4 +1,4 @@
-"""Metadata and computed columns, topic lists and patterns."""
+"""Metadata and computed columns, topic lists and patterns, Kafka message keys."""
 import os
 import shutil
 import unittest
@@ -174,6 +174,39 @@ sinks:
 """, base=False)
         self.assertTrue(r.ok, codes(r))
         self.assertNotIn("WHERE ;", r.lowered.sql)
+
+
+class KafkaKeyTest(unittest.TestCase):
+    def test_keyed_append_source_and_sink(self):
+        r = compile_text(KAFKA.replace('"b:9092"', '"b:9092", schema_registry_url: "http://sr"') + """
+sources:
+  ev: {connection: k, topic: a, format: avro-confluent, key_fields: [id], value_includes_key: false,
+       columns: {id: STRING, v: INT}}
+sinks:
+  out: {from: ev, connection: k, topic: b, key_fields: [id], key_format: raw}
+""", base=False)
+        self.assertTrue(r.ok, codes(r))
+        src, sink = table(r, "ev"), table(r, "out")
+        for opt in ("'key.fields' = 'id'", "'value.fields-include' = 'EXCEPT_KEY'", "'key.format' = 'avro-confluent'",
+                    "'value.format' = 'avro-confluent'", "'key.avro-confluent.url' = 'http://sr'",
+                    "'value.avro-confluent.url' = 'http://sr'"):
+            self.assertIn(opt, src)
+        self.assertIn("'key.format' = 'raw'", sink)
+        self.assertIn("'value.format' = 'json'", sink)
+        self.assertNotIn("'format'", sink)
+
+    def test_key_errors(self):
+        r = compile_text(KAFKA + """
+sources:
+  ev: {connection: k, topic: a, key_fields: [idd], columns: {id: STRING}}
+  up: {connection: k, topic: u, changelog: upsert, key_fields: [id], primary_key: [id], columns: {id: STRING NOT NULL}}
+  x: {connection: k, topic: a, key_format: raw, columns: {id: STRING}}
+sinks:
+  o1: {from: ev, connection: print}
+  o2: {from: up, connection: print, mode: upsert, primary_key: [id]}
+  o3: {from: x, connection: print}
+""", base=False)
+        self.assertEqual(sorted(codes(r)), ["CD209", "CD224", "CD225"])
 
 
 @unittest.skipUnless(READY, "set FLINK_HOME and run runtime/build.sh")

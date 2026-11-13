@@ -276,7 +276,9 @@ def ltv_topic() -> dict:
 
 def revenue() -> dict:
     out = {}
-    for r in consume("revenue"):
+    for k, r in consume("revenue", keys=True):
+        if k != {"segment": r["segment"]}:  # key_fields: the message key carries the segment
+            raise Failed(f"revenue record keyed {k}, expected {{'segment': {r['segment']!r}}}")
         key = (r["window_start"][11:16], r["segment"])
         if key in out:
             raise Failed(f"revenue window {key} emitted twice: {out[key]} and {r}")

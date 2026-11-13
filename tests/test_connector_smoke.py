@@ -135,6 +135,11 @@ sinks:
     format: json
     metadata: {t: topic, ts: timestamp, hs: headers}
 """,
+    "kafka-keyed-source": source_case("c: {type: kafka, properties: {bootstrap_servers: 'k:9092'}}",
+                                      "topic: a\nformat: json\nkey_fields: [id]\nvalue_includes_key: false",
+                                      "{id: STRING, v: BIGINT}", None),
+    "kafka-keyed-sink": sink_case("c: {type: kafka, properties: {bootstrap_servers: 'k:9092'}}",
+                                  "topic: out\nkey_fields: [id]\nkey_format: raw", mode="append"),
     "filesystem-source": source_case("c: {type: filesystem}", "path: 'file://{tmp}'\nformat: json",
                                      _meta_columns("filesystem", {"id": "STRING"}), None),
     "postgres-cdc": _cdc_meta("postgres-cdc", ", database: app"),

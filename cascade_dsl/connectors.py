@@ -27,6 +27,9 @@ def optstr(v) -> str:
     return str(v)
 
 
+KEY_PROPS = {}  # filled below Prop: the Kafka message key of append sources and sinks
+
+
 @dataclass
 class Prop:
     flink_key: str | None  # None = handled specially by the connector's `finish` hook
@@ -35,6 +38,14 @@ class Prop:
     secret: bool = False
     values: dict | None = None  # DSL value -> Flink value (also restricts allowed values)
     doc: str = ""
+
+
+KEY_PROPS.update({
+    "key_fields": Prop("key.fields", doc="columns carried in the message key (append topics; upsert uses primary_key)"),
+    "key_format": Prop("key.format", doc="format of the key; default: the value's format"),
+    "value_includes_key": Prop("value.fields-include", values={"True": "ALL", "False": "EXCEPT_KEY"},
+                               doc="true (default): the value also carries the key fields"),
+})
 
 
 @dataclass
@@ -78,6 +89,16 @@ class LowerCtx:
 
 def _kafka_finish(role, mode, fmt, opts, ctx: LowerCtx):
     problems = []
+    keyed = "key.fields" in opts
+    if (("key.format" in opts or "value.fields-include" in opts) and not keyed):
+        problems.append(("CD209", "key_format and value_includes_key need key_fields"))
+    if keyed and (mode == "upsert" or opts.get("__changelog") == "upsert"):
+        problems.append(("CD224", "key_fields is for append topics; an upsert topic's key is the primary_key"))
+    elif keyed:
+        # with a key format, Flink names the value format 'value.format'
+        opts.setdefault("key.format", opts.get("format") or "json")
+        if "format" in opts:
+            opts["value.format"] = opts.pop("format")
     if role == "source" and ("topic" in opts) == ("topic-pattern" in opts):
         problems.append(("CD209", "a Kafka source needs exactly one of 'topic' or 'topic_pattern'"))
     if role == "sink" and mode == "upsert":
@@ -108,7 +129,7 @@ def _kafka_finish(role, mode, fmt, opts, ctx: LowerCtx):
     if fmt in ("avro-confluent", "debezium-avro-confluent"):
         if not registry:
             problems.append(("CD213", f"format '{fmt}' needs connection property 'schema_registry_url'"))
-        elif role == "sink" and mode == "upsert":
+        elif "key.format" in opts:  # upsert topics and keyed append topics: one URL per part
             opts[f"key.{fmt}.url"] = registry
             opts[f"value.{fmt}.url"] = registry
         else:
@@ -248,9 +269,11 @@ register(ConnectorSpec(
                           doc="upsert: a compacted topic of keyed rows, read with upsert-kafka"),
         "startup": Prop("scan.startup.mode", default="group", values={
             "earliest": "earliest-offset", "latest": "latest-offset", "group": "group-offsets"}),
+        **KEY_PROPS,
     },
     sink={
         "topic": Prop("topic", doc="a topic; with a 'topic' metadata column, the list of topics it may name"),
+        **KEY_PROPS,
         "delivery": Prop("sink.delivery-guarantee", default="at-least-once",
                          values={"at-least-once": "at-least-once", "exactly-once": "exactly-once"}),
         "transactional_id_prefix": Prop("sink.transactional-id-prefix"),
@@ -289,9 +312,11 @@ register(ConnectorSpec(
         "consumer_group": Prop("properties.group.id", doc="defaults to <pipeline>.<node>"),
         "startup": Prop("scan.startup.mode", default="group", values={
             "earliest": "earliest-offset", "latest": "latest-offset", "group": "group-offsets"}),
+        **KEY_PROPS,
     },
     sink={
         "event_hub": Prop("topic", required=True),
+        **KEY_PROPS,
         "delivery": Prop("sink.delivery-guarantee", default="at-least-once",
                          values={"at-least-once": "at-least-once", "none": "none"}),
     },

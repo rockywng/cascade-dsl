@@ -508,9 +508,14 @@ Python models in between:
 The function and the classes in its file are pickled by value, so workers need nothing installed.
 Two PyFlink differences:
 - **Watermarks per bundle.** PyFlink hands Python functions records in bundles, with the watermark
-  per bundle (`python.fn-execution.bundle.size`), so lateness checks in `process_element` are only
-  as exact as the bundle. The example's late-data branch sets the bundle size to 1.
-- **Supported column types:** strings, integers, floats, decimals, booleans, dates and timestamps.
+  per bundle, so lateness checks in `process_element` are only as exact as the bundle.
+  `exact_watermarks: true` on the process sets the bundle size to 1, which makes lateness exact at a
+  throughput cost. The example's late-data branch uses it.
+- **Column types:** the scalar types, `TIMESTAMP_LTZ`, and nested `ARRAY<…>`, `MAP<…, …>` and
+  `ROW<…>`.
+
+`cascade restore-test` works for these pipelines too: it runs on the Python runner, with the same
+strict savepoint restore as for Java process models.
 
 ## Functions
 
@@ -869,6 +874,10 @@ The alerts follow the pipeline:
 The integration run scrapes the running job and fails if any metric an alert or panel uses isn't
 reported. An alert on a misspelled metric would never fire.
 
+`tests/test_alert_rules.py` runs `promtool test rules` in CI. Each alert gets synthetic series for
+its condition and must fire with the expected labels and annotations. A healthy series set must
+fire nothing.
+
 ### Other targets
 
 `deploy.target` picks what `cascade deploy` generates. The default, `kubernetes`, is the
@@ -984,8 +993,11 @@ the data itself, not something missing from the compiler.
 - **Completion:** connector types after `type:`; the connector's properties inside a connection,
   source or sink; and section keys.
 - **Hover:** a diagnostic code's meaning.
+- **Go to definition and find references:** for any source, model, sink, connection or function
+  name, whether used in SQL, `from:`, `connection:` or `inputs:`.
 
-`editors/vscode` is a small VS Code extension that starts it. Any other LSP client can run
+`editors/vscode` is a small VS Code extension that starts it. CI runs it in a real headless VS Code
+and checks that the diagnostics arrive and that go-to-definition works. Any other LSP client can run
 `cascade lsp`.
 
 ## Diagnostic codes

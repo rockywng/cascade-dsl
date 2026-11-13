@@ -165,6 +165,73 @@ def phase_v3(v2_job: str):
     it.check_after_v3()
 
 
+def phase_session():
+    """deploy.target: session through the operator: a session cluster (FlinkDeployment without a job), the
+    runner jar served over HTTP in the cluster, and the FlinkSessionJob `cascade deploy` writes."""
+    step("session target: FlinkSessionJob on an operator-managed session cluster")
+    kubectl("delete", "flinkdeployment", "shop-it", "--wait=true", "--timeout=180s", check=False)  # free the node
+    import base64
+    sys.path.insert(0, it.REPO)
+    from cascade_dsl.deploy import _operator_version
+    with open(os.path.join(it.REPO, "runtime", "target", "cascade-runtime.jar"), "rb") as f:
+        jar = base64.b64encode(f.read()).decode()
+    server = [
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "jar-server"},
+         "binaryData": {"cascade-runtime.jar": jar}},
+        {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "jar-server"},
+         "spec": {"selector": {"matchLabels": {"app": "jar-server"}},
+                  "template": {"metadata": {"labels": {"app": "jar-server"}},
+                               "spec": {"containers": [{"name": "http", "image": "python:3.12-alpine",
+                                                        "command": ["python", "-m", "http.server", "8000", "-d", "/srv"],
+                                                        "ports": [{"containerPort": 8000}],
+                                                        "volumeMounts": [{"name": "jar", "mountPath": "/srv"}]}],
+                                        "volumes": [{"name": "jar", "configMap": {"name": "jar-server"}}]}}}},
+        {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "jar-server"},
+         "spec": {"selector": {"app": "jar-server"}, "ports": [{"port": 80, "targetPort": 8000}]}},
+        {"apiVersion": "flink.apache.org/v1beta1", "kind": "FlinkDeployment", "metadata": {"name": "shared-flink"},
+         "spec": {"image": "cascade-it:it", "flinkVersion": _operator_version("2.3.0"), "serviceAccount": "flink",
+                  "flinkConfiguration": {"taskmanager.numberOfTaskSlots": "2"},
+                  "jobManager": {"resource": {"memory": "1024m", "cpu": 0.25}},
+                  "taskManager": {"resource": {"memory": "1536m", "cpu": 0.5}}}},
+    ]
+    kubectl("apply", "-f", "-", input=yaml.safe_dump_all(server))
+    kubectl("rollout", "status", "deploy/jar-server", "--timeout=180s")
+
+    def session_ready():
+        out = kubectl("get", "flinkdeployment", "shared-flink", "-o", "json", check=False)
+        st = json.loads(out).get("status", {}) if out.strip().startswith("{") else {}
+        return st.get("jobManagerDeploymentStatus") == "READY"
+    it.wait_for("session cluster READY", session_ready, timeout=300, every=5)
+    ok("session cluster shared-flink ready; cascade-runtime.jar served at http://jar-server")
+
+    d = os.path.join(it.WORK, "pipeline-session")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    with open(os.path.join(d, "pipeline.yaml"), "w") as f:
+        f.write("""
+pipeline: session_probe
+deploy: {target: session, session_cluster: shared-flink, jar_uri: "http://jar-server/cascade-runtime.jar"}
+sources:
+  gen: {connection: datagen, rows_per_second: 5, columns: {k: INT, v: STRING}}
+models:
+  m: {sql: "SELECT k, UPPER(v) AS v FROM gen"}
+sinks:
+  out: {from: m, connection: blackhole}
+""")
+    out = os.path.join(it.WORK, "deploy-session")
+    it.cascade("deploy", os.path.relpath(d, it.REPO), "-o", out, flink=False)
+    kubectl("apply", "-k", out)
+
+    def job_running():
+        out_ = kubectl("get", "flinksessionjob", "session-probe", "-o", "json", check=False)
+        st = json.loads(out_).get("status", {}) if out_.strip().startswith("{") else {}
+        if (st.get("error") or "") and "Exception" in st.get("error", ""):
+            raise RuntimeError("FlinkSessionJob failed: " + st["error"][-2000:])
+        return st.get("jobStatus", {}).get("state") == "RUNNING"
+    it.wait_for("FlinkSessionJob RUNNING", job_running, timeout=300, every=5)
+    ok("FlinkSessionJob session-probe RUNNING: the operator fetched the runner, the scripts came inline")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="leave the kind cluster running")
@@ -184,6 +251,7 @@ def main():
         v1 = phase_v1()
         phase_upgrade(v1)
         phase_v3(job_state()[1])
+        phase_session()
         print(f"\nPASSED in {time.time() - started:.0f}s")
         code = 0
     except (Failed, RuntimeError) as e:

@@ -54,6 +54,30 @@ services:
     volumes: ["./failover:/failover:ro"]
     ports: ["25433:5432"]
     depends_on: [pgprimary]
+  kafka-tls:   # a broker that only speaks TLS and requires client certificates (certs from connectors.py)
+    image: apache/kafka:4.3.2
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: SSL://:9093,CONTROLLER://:9094
+      KAFKA_ADVERTISED_LISTENERS: SSL://localhost:19093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SSL:SSL,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9094
+      KAFKA_INTER_BROKER_LISTENER_NAME: SSL
+      KAFKA_SSL_KEYSTORE_LOCATION: /certs/broker.p12
+      KAFKA_SSL_KEYSTORE_TYPE: PKCS12
+      KAFKA_SSL_KEYSTORE_PASSWORD: storepw
+      KAFKA_SSL_KEY_PASSWORD: storepw
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /certs/truststore.p12
+      KAFKA_SSL_TRUSTSTORE_TYPE: PKCS12
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: storepw
+      KAFKA_SSL_CLIENT_AUTH: required
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    volumes: ["./.work/connectors/tls:/certs:ro"]
+    ports: ["19093:9093"]
   postgres:   # where sources' results land, to be compared; also a CDC source (database app)
     image: postgres:17
     environment: {POSTGRES_PASSWORD: pw, POSTGRES_DB: results}

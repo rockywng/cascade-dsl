@@ -283,6 +283,11 @@ def cmd_deploy(args) -> int:
         print(f"  needs Secret '{info['secret_name']}' with keys: "
               + ", ".join(sorted(secret_key(s) for s in info["secrets"])) + " (see secret.template.yaml)",
               file=sys.stderr)
+    if info.get("files"):
+        from .loader import file_path
+        names = " ".join(f"--from-file={os.path.basename(file_path(n))}=<path to {n}>" for n in info["files"])
+        print(f"  needs Secret '{info['files_secret']}' with the files it mounts: "
+              f"kubectl create secret generic {info['files_secret']} {names}", file=sys.stderr)
     return 0
 
 

@@ -19,7 +19,14 @@ from .connectors import optstr
 from .types import TypeParseError, parse_type
 
 NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
-VAR_RE = re.compile(r"\$\{(var|secret):([^}]+)\}")
+VAR_RE = re.compile(r"\$\{(var|secret|file):([^}]+)\}")
+# ${file:name}: a file the deployment mounts from a Secret (TLS key and trust stores). Like secrets it
+# stays a placeholder; the runner replaces it with $CASCADE_FILES_DIR/<name> (default FILES_DIR)
+FILES_DIR = "/opt/cascade/files"
+
+
+def file_path(name: str) -> str:
+    return f"{FILES_DIR}/" + re.sub(r"[^A-Za-z0-9._-]", "_", name.strip())
 DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h|d)\s*$")
 UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
@@ -162,6 +169,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
     doc = _ldict(doc)
     ctx.check_keys(doc, TOP_KEYS, "pipeline")
     secrets: set[str] = set()
+    files: set[str] = set()
     variables = _resolve_vars(doc, env, ctx)
 
     def subst(value, where_d, where_k):
@@ -171,6 +179,9 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
                 kind, name = m.group(1), m.group(2).strip()
                 if kind == "secret":
                     secrets.add(name)
+                    return m.group(0)
+                if kind == "file":
+                    files.add(name)
                     return m.group(0)
                 if name not in variables:
                     diags.error("CD004", f"undefined variable '{name}'", ctx.loc(where_d, where_k),
@@ -319,7 +330,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         state_ttl_ms=state_ttl_ms, flink_config=flink_config,
         connections=connections, sources=sources, models=models, sinks=sinks,
         quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, functions=functions, loc=ctx.loc(doc),
-        mode=mode, ml_models=ml_models, replicate=replicate,
+        mode=mode, ml_models=ml_models, replicate=replicate, files=files,
     )
     return p, diags
 

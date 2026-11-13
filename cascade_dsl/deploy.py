@@ -212,7 +212,8 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
         _monitoring_files(r, cfg, out)
     write("kustomization.yaml", _dump(kustomization))
     write("Dockerfile", dockerfile(r, cfg))
-    return {"name": name, "mode": mode, "secrets": secrets, "secret_name": secret_name, "out": out}
+    return {"name": name, "mode": mode, "secrets": secrets, "secret_name": secret_name, "out": out,
+            "files": sorted(p.files), "files_secret": f"{name}-files"}
 
 
 TARGETS = ("kubernetes", "session", "flink-run")
@@ -576,6 +577,10 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
     if monitoring.enabled(cfg):
         container["ports"] = [{"name": "metrics", "containerPort": monitoring.METRICS_PORT}]
     volumes = [{"name": "cascade-job", "configMap": {"name": job_cm}}]
+    if p.files:  # ${file:...} (TLS stores): a Secret of files, mounted where the job's options point
+        from .loader import FILES_DIR
+        container["volumeMounts"].append({"name": "cascade-files", "mountPath": FILES_DIR, "readOnly": True})
+        volumes.append({"name": "cascade-files", "secret": {"secretName": f"{name}-files"}})
     if needs_python(p):
         container["volumeMounts"].append({"name": "cascade-python", "mountPath": PYTHON_DIR, "readOnly": True})
         volumes.append({"name": "cascade-python", "configMap": {"name": py_cm}})

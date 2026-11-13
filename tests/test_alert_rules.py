@@ -28,8 +28,13 @@ models:
     sql: |
       SELECT o.order_id, c.tier FROM clean AS o
       LEFT JOIN customers FOR SYSTEM_TIME AS OF o.ts AS c ON o.order_id = c.customer_id
+  per_minute:
+    sql: |
+      SELECT window_start, COUNT(*) AS n FROM TABLE(TUMBLE(TABLE orders, DESCRIPTOR(ts), INTERVAL '1' MINUTE))
+      GROUP BY window_start, window_end
 sinks:
   out: {from: enriched, connection: print}
+  counts: {from: per_minute, connection: print}
 """
 
 JOB = 'job_name="test_pipe"'
@@ -93,6 +98,8 @@ class AlertRulesTest(unittest.TestCase):
                                                        "values": "1e6x30"}], "6m",
                                                  {"slot_name": "test_pipe_customers"}),
                 "CascadeReplicationSlotGone": ([up], "11m", {}),
+                "CascadeLateRecordsDropped": ([up, {"series": f"{monitoring.LATE}{sel}", "values": "0 0 0 4 4 4"}],
+                                              "4m", {}),
             }
             self.assertEqual(set(cases), set(by_name), "a generated alert has no firing test (or vice versa)")
             tests = []
@@ -113,7 +120,8 @@ class AlertRulesTest(unittest.TestCase):
                        {"series": f"{monitoring.SLOT_CURRENT}{{{SLOT}}}", "values": "2e6x30"},
                        {"series": f"{monitoring.SLOT_FLUSHED}{{{SLOT}}}", "values": "1e6x30"},
                        {"series": f"{monitoring.SLOT_ACTIVE}{{{SLOT}}}", "values": "1x30"},
-                       {"series": f"{monitoring.SLOT_SAFE}{{{SLOT}}}", "values": "5e9x30"}]
+                       {"series": f"{monitoring.SLOT_SAFE}{{{SLOT}}}", "values": "5e9x30"},
+                       {"series": f"{monitoring.LATE}{sel}", "values": "0x30"}]
             tests.append({"interval": "1m", "input_series": healthy, "alert_rule_test": [
                 {"eval_time": "25m", "alertname": n, "exp_alerts": []} for n in sorted(by_name)]})
             with open(os.path.join(d, "test.yml"), "w") as f:

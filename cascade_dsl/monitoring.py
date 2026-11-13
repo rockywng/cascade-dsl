@@ -29,6 +29,9 @@ RECORDS_IN = "flink_taskmanager_job_task_numRecordsInPerSecond"
 PENDING = "flink_taskmanager_job_task_operator_pendingRecords"  # FLIP-33: Kafka sources
 WATERMARK = "flink_taskmanager_job_task_currentInputWatermark"
 EXPECT = "flink_taskmanager_job_task_operator_cascade_model_expectation_action_cascade_expectation"
+# window aggregations count the rows they drop for arriving after the watermark passed their window
+# (WindowAggOperator; interval joins and OVER aggregations drop late rows without a metric)
+LATE = "flink_taskmanager_job_task_operator_numLateRecordsDropped"
 # postgres_exporter (prometheus-community), replication_slot collector: checked by integration/connectors.py
 SLOT_CURRENT = "pg_replication_slot_slot_current_wal_lsn"
 SLOT_FLUSHED = "pg_replication_slot_slot_confirmed_flush_lsn"
@@ -47,6 +50,7 @@ def settings(cfg: dict) -> dict:
     return {"max_backpressure_ms": float(alerts.get("max_backpressure_ms", 500)),
             "max_pending_records": float(alerts.get("max_pending_records", 100000)),
             "max_violation_ratio": float(alerts.get("max_violation_ratio", 0.01)),
+            "max_late_records": float(alerts.get("max_late_records", 0)),
             "max_slot_lag_bytes": float(alerts.get("max_slot_lag_bytes", 1 << 30)),
             "min_slot_safe_wal_bytes": float(alerts.get("min_slot_safe_wal_bytes", 1 << 30)),
             "labels": {str(k): str(v) for k, v in ((m.get("labels") if isinstance(m, dict) else None) or {}).items()}}
@@ -97,6 +101,12 @@ def rules(r, cfg: dict) -> dict:
     if any(x.event_time for x in p.sources.values()):
         out.append(alert("EventTimeStalled", f"changes(max({WATERMARK}{{{job}}})[15m:1m]) == 0", "0m", "warning",
                          f"{p.name}: event time hasn't advanced for 15 minutes (windows don't close)"))
+    windows = sorted(n for n, rel in p.relations.items() if any(op.kind == "window_agg" for op in rel.stateful_ops))
+    if windows:
+        out.append(alert("LateRecordsDropped", f"sum(increase({LATE}{{{job}}}[10m])) > {s['max_late_records']:g}",
+                         "0m", "warning",
+                         f"{p.name}: window aggregations ({', '.join(windows)}) dropped rows that arrived after their "
+                         "window closed in the last 10 minutes; raise max_out_of_orderness if they matter"))
     if any(e.on_violation in ("drop", "quarantine") for m in p.models.values() for e in m.expectations):
         ratio = (f"sum by (cascade_model, expectation) (rate({EXPECT}_violations{{{job}}}[5m])) / "
                  f"sum by (cascade_model, expectation) (rate({EXPECT}_checked{{{job}}}[5m]))")
@@ -127,6 +137,13 @@ def rules(r, cfg: dict) -> dict:
 
 
 def postgres_slots(r) -> list[str]:
+    p = r.checked.pipeline
+    if p.replicate is not None:  # a replication's Postgres slot (replicate.py)
+        conn = p.connections.get(str(p.replicate.get("from")))
+        if conn is None or conn.type != "postgres-cdc":
+            return []
+        from .replicate import slot_name
+        return [p.replicate.get("slot_name") or slot_name(p)]
     opts = r.checked.options
     return sorted({o["slot.name"] for o in opts.values() if "slot.name" in o
                    and "postgres-cdc" in (o.get("connector"), o.get("delegate"))})

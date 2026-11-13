@@ -228,7 +228,23 @@ public final class SqlRunner {
         return "CASCADE_SECRET_" + secret.trim().replaceAll("[^A-Za-z0-9]", "_").toUpperCase();
     }
 
+    /** ${file:name}: where the deployment mounts files (TLS stores), as cascade_dsl.loader.file_path. */
+    static final Pattern FILE = Pattern.compile("\\$\\{file:([^}]+)\\}");
+
+    static String files(String text, Map<String, String> env) {
+        String dir = env.getOrDefault("CASCADE_FILES_DIR", "/opt/cascade/files");
+        Matcher m = FILE.matcher(text);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String name = m.group(1).trim().replaceAll("[^A-Za-z0-9._-]", "_");
+            m.appendReplacement(sb, Matcher.quoteReplacement((dir + "/" + name).replace("'", "''")));
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+
     public static String substitute(String text, Map<String, String> env) {
+        text = files(text, env);
         Matcher m = SECRET.matcher(text);
         StringBuffer sb = new StringBuffer();
         TreeSet<String> missing = new TreeSet<>();

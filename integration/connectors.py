@@ -32,7 +32,7 @@ from cascade_dsl.jvm import script  # noqa: E402
 COMPOSE = os.path.join(it.HERE, "connectors-compose.yml")
 WORK = os.path.join(it.WORK, "connectors")
 RUNTIME = os.path.join(it.REPO, "runtime", "target", "cascade-runtime.jar")
-SECRETS = {"CASCADE_SECRET_PW": "pw", "CASCADE_SECRET_MSSQL": "Cascade-pw1", "CASCADE_SECRET_ORACLE": "flinkpw", "CASCADE_SECRET_AWS_KEY": "x",
+SECRETS = {"CASCADE_SECRET_PW": "pw", "CASCADE_SECRET_KAFKA_STORE": "storepw", "CASCADE_SECRET_MSSQL": "Cascade-pw1", "CASCADE_SECRET_ORACLE": "flinkpw", "CASCADE_SECRET_AWS_KEY": "x",
            "CASCADE_SECRET_AWS_SECRET": "x"}
 
 RESULTS = """
@@ -443,6 +443,81 @@ sinks:
     if rep.proc.returncode == 0 or "cascade_shop_replica" not in log:
         raise Failed("replicate: a restore without its replication slot must be refused:\n" + _error(log))
     ok("replicate: a restore whose replication slot is gone is refused (no silent gap)")
+
+
+def tls_certs() -> str:
+    """A CA, a broker certificate for localhost and a client certificate, all signed by the CA (keytool)."""
+    d = os.path.join(WORK, "tls")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    kt = lambda *a: it.run(["keytool", *a], timeout=120)  # noqa: E731
+    pw = ["-storepass", "storepw", "-keypass", "storepw", "-storetype", "PKCS12"]
+    ca = os.path.join(d, "ca.p12")
+    kt("-genkeypair", "-alias", "ca", "-keyalg", "RSA", "-dname", "CN=cascade-test-ca", "-ext", "bc:c",
+       "-validity", "2", "-keystore", ca, *pw)
+    kt("-exportcert", "-rfc", "-alias", "ca", "-keystore", ca, "-storepass", "storepw", "-file",
+       os.path.join(d, "ca.pem"))
+    kt("-importcert", "-noprompt", "-alias", "ca", "-file", os.path.join(d, "ca.pem"),
+       "-keystore", os.path.join(d, "truststore.p12"), *pw)
+    for who, dname, ext in (("broker", "CN=localhost", ["-ext", "san=dns:localhost"]), ("client", "CN=cascade", [])):
+        store = os.path.join(d, f"{who}.p12")
+        kt("-genkeypair", "-alias", who, "-keyalg", "RSA", "-dname", dname, "-validity", "2", "-keystore", store, *pw)
+        kt("-certreq", "-alias", who, "-keystore", store, "-storepass", "storepw", "-file", os.path.join(d, f"{who}.csr"))
+        kt("-gencert", "-alias", "ca", "-keystore", ca, "-storepass", "storepw", "-infile",
+           os.path.join(d, f"{who}.csr"), "-outfile", os.path.join(d, f"{who}.pem"), "-rfc", "-validity", "2", *ext)
+        kt("-importcert", "-noprompt", "-alias", "ca", "-file", os.path.join(d, "ca.pem"), "-keystore", store, *pw)
+        kt("-importcert", "-alias", who, "-file", os.path.join(d, f"{who}.pem"), "-keystore", store, *pw)
+    for f in os.listdir(d):
+        os.chmod(os.path.join(d, f), 0o644)  # the broker runs as another user
+    return d
+
+
+def case_kafka_tls():
+    """Kafka over mutual TLS: trust and key stores are ${file:...} references, resolved by the runner from
+    CASCADE_FILES_DIR (in Kubernetes, the <name>-files Secret cascade deploy mounts)."""
+    certs = tls_certs()
+    dc("up", "-d", "--force-recreate", "kafka-tls")
+    conn = ('{type: kafka, properties: {bootstrap_servers: "localhost:19093", security_protocol: SSL, '
+            'ssl_truststore: "${file:kafka/truststore.p12}", ssl_truststore_type: PKCS12, '
+            'ssl_truststore_password: "${secret:kafka/store}", ssl_keystore: "${file:kafka/client.p12}", '
+            'ssl_keystore_type: PKCS12, ssl_keystore_password: "${secret:kafka/store}", '
+            'ssl_key_password: "${secret:kafka/store}"}}')
+    files = os.path.join(WORK, "tls-files")
+    shutil.rmtree(files, ignore_errors=True)
+    os.makedirs(files)
+    for f in ("truststore.p12", "client.p12"):  # as the Secret would hold them: kafka/x -> kafka_x
+        shutil.copy(os.path.join(certs, f), os.path.join(files, f"kafka_{f}"))
+    os.environ["CASCADE_FILES_DIR"] = files
+    try:
+        def write():
+            sink_job("kafka-tls-sink", conn, "topic: tls.items, format: json", mode="append").run()
+            return True
+        it.wait_for("a write over mutual TLS (broker starting)", write, timeout=180, every=10)
+        ok("kafka-tls: 100 rows written over mutual TLS")
+        table = "kafka_tls"
+        pg_table("id BIGINT PRIMARY KEY, name TEXT, qty INT")(table)
+        job = Job("kafka-tls-source", f"""
+pipeline: kafka_tls_source
+connections:
+  src: {conn}{RESULTS}
+sources:
+  items:
+    connection: src
+    topic: tls.items
+    format: json
+    startup: earliest
+    columns: {{id: BIGINT NOT NULL, name: STRING, qty: INT}}
+sinks:
+  out: {{from: items, connection: results, table: {table}, mode: upsert, primary_key: [id]}}
+""")
+        job.start()
+        try:
+            converge("kafka-tls: read back over mutual TLS (100 rows)",
+                     lambda: int(results(f"SELECT count(*) FROM {table}")[0][0]), 100, job=job)
+        finally:
+            job.stop()
+    finally:
+        os.environ.pop("CASCADE_FILES_DIR", None)
 
 
 def sink_job(name: str, connection: str, sink: str, mode: str = "upsert") -> Job:
@@ -905,7 +980,8 @@ CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc"
          "hudi": case_hudi, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
          "sqlserver-cleaned-up": case_sqlserver_cleanup, "slot-metrics": case_slot_metrics,
          "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle,
-         "oracle-restore": case_oracle_restore, "replicate-postgres": case_replicate_postgres}
+         "oracle-restore": case_oracle_restore, "replicate-postgres": case_replicate_postgres,
+         "kafka-tls": case_kafka_tls}
 
 
 def prepare():

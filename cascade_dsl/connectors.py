@@ -265,6 +265,17 @@ register(ConnectorSpec(
         "sasl_mechanism": Prop("properties.sasl.mechanism"),
         "sasl_jaas_config": Prop("properties.sasl.jaas.config", secret=True),
         "schema_registry_url": Prop("__schema_registry_url"),
+        # TLS: store files are ${file:...} references, mounted from a Secret by cascade deploy
+        "ssl_truststore": Prop("properties.ssl.truststore.location", doc="${file:...} of the trust store"),
+        "ssl_truststore_password": Prop("properties.ssl.truststore.password", secret=True),
+        "ssl_truststore_type": Prop("properties.ssl.truststore.type", doc="JKS, PKCS12 or PEM"),
+        "ssl_keystore": Prop("properties.ssl.keystore.location", doc="${file:...} of the client key store (mTLS)"),
+        "ssl_keystore_password": Prop("properties.ssl.keystore.password", secret=True),
+        "ssl_keystore_type": Prop("properties.ssl.keystore.type", doc="JKS, PKCS12 or PEM"),
+        "ssl_key_password": Prop("properties.ssl.key.password", secret=True),
+        "ssl_endpoint_identification": Prop("properties.ssl.endpoint.identification.algorithm",
+                                            values={"https": "https", "none": ""},
+                                            doc="https (default) checks the broker's host name"),
     },
     source={
         "topic": Prop("topic", doc="a topic, or a list of topics"),

@@ -65,18 +65,19 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9094
       KAFKA_INTER_BROKER_LISTENER_NAME: SSL
-      KAFKA_SSL_KEYSTORE_LOCATION: /certs/broker.p12
+      # the image's configure script takes store files and password files from /etc/kafka/secrets
+      KAFKA_SSL_KEYSTORE_FILENAME: broker.p12
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: store_creds
+      KAFKA_SSL_KEY_CREDENTIALS: store_creds
       KAFKA_SSL_KEYSTORE_TYPE: PKCS12
-      KAFKA_SSL_KEYSTORE_PASSWORD: storepw
-      KAFKA_SSL_KEY_PASSWORD: storepw
-      KAFKA_SSL_TRUSTSTORE_LOCATION: /certs/truststore.p12
+      KAFKA_SSL_TRUSTSTORE_FILENAME: truststore.p12
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: store_creds
       KAFKA_SSL_TRUSTSTORE_TYPE: PKCS12
-      KAFKA_SSL_TRUSTSTORE_PASSWORD: storepw
       KAFKA_SSL_CLIENT_AUTH: required
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-    volumes: ["./.work/connectors/tls:/certs:ro"]
+    volumes: ["./.work/connectors/tls:/etc/kafka/secrets"]
     ports: ["19093:19093"]   # the advertised address works inside the container too
   postgres:   # where sources' results land, to be compared; also a CDC source (database app)
     image: postgres:17

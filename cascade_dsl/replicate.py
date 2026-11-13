@@ -136,6 +136,10 @@ def guard(p) -> str | None:
     spec = {"source": "replicate", "slot": r.get("slot_name") or slot_name(p), "hostname": sp["hostname"],
             "port": str(sp.get("port", 5432)), "database": sp["database"], "username": sp["username"],
             "plugin": "pgoutput", "on_slot_loss": "refuse"}
+    src_def = definition(p)["source"]  # tables CdcRunner checks for REPLICA IDENTITY FULL
+    spec["tables"] = src_def["tables"]
+    if src_def.get("tables.exclude"):
+        spec["exclude"] = src_def["tables.exclude"]
     pw = str(sp["password"])
     if SECRET_RE.match(pw):
         from .deploy import env_name

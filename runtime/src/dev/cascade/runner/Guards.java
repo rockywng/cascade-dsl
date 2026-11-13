@@ -148,7 +148,7 @@ public final class Guards {
         }
     }
 
-    private static Connection connect(Map<String, Object> spec, Map<String, String> env) throws Exception {
+    static Connection connect(Map<String, Object> spec, Map<String, String> env) throws Exception {
         String url = "jdbc:postgresql://" + spec.get("hostname") + ":" + spec.get("port") + "/" + spec.get("database");
         Properties props = new Properties();
         props.setProperty("user", String.valueOf(spec.get("username")));

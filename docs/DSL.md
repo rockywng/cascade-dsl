@@ -981,6 +981,10 @@ replicate:
 - **`cascade compile`** writes `cdc-pipeline.yaml`.
 - **`cascade deploy`** writes a FlinkDeployment running `dev.cascade.runner.CdcRunner`, and a Dockerfile
   that adds the Flink CDC 3.7 distribution (pinned by sha512) and its pipeline connectors.
+- **Postgres tables need `REPLICA IDENTITY FULL`.** Flink CDC's pipeline source needs before-images of
+  updates and deletes. The runner checks every matching table at start and refuses, listing the
+  `ALTER TABLE ... REPLICA IDENTITY FULL` statements to run. Tables created later need it too, or the
+  job fails at their first update.
 - **At startup** the runner fills in secrets and runs the Postgres slot guard: a restore whose
   replication slot is gone is refused, because Flink CDC would silently start a new slot. It then builds
   the job with Flink CDC's composer. Monitoring adds the slot alerts.

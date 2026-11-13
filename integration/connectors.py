@@ -404,6 +404,14 @@ sinks:
         return results(f"SELECT {select} FROM {name} ORDER BY id")
 
     orders = "{id: INT NOT NULL, amount: INT}"
+    rep.start()  # the tables lack REPLICA IDENTITY FULL: refused before the job starts
+    rep.proc.wait(180)
+    with open(rep.log) as f:
+        log = f.read()
+    if rep.proc.returncode == 0 or "REPLICA IDENTITY FULL" not in log or "shop.orders" not in log:
+        raise Failed("replicate: tables without REPLICA IDENTITY FULL must be refused at start:\n" + _error(log))
+    ok("replicate: tables without REPLICA IDENTITY FULL are refused at start, naming them")
+    sql("ALTER TABLE shop.orders REPLICA IDENTITY FULL; ALTER TABLE shop.customers REPLICA IDENTITY FULL")
     rep.start()
     try:
         converge("replicate: snapshot of every table in the schema",
@@ -418,7 +426,8 @@ sinks:
         converge("replicate: an added column reaches the Paimon table (schema evolution)",
                  lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
                  [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"]], job=rep)
-        sql("CREATE TABLE shop.refunds (id INT PRIMARY KEY, amount INT); INSERT INTO shop.refunds VALUES (1, 5)")
+        sql("CREATE TABLE shop.refunds (id INT PRIMARY KEY, amount INT); "
+            "ALTER TABLE shop.refunds REPLICA IDENTITY FULL; INSERT INTO shop.refunds VALUES (1, 5)")
         converge("replicate: a table created while running is replicated",
                  lambda: lake("refunds", "{id: INT NOT NULL, amount: INT}", "id, amount"), [["1", "5"]], job=rep)
         time.sleep(6)  # a checkpoint after the last change
@@ -468,11 +477,15 @@ def tls_certs() -> str:
         kt("-importcert", "-noprompt", "-alias", "ca", "-file", os.path.join(d, "ca.pem"), "-keystore", store, *pw)
         kt("-importcert", "-alias", who, "-file", os.path.join(d, f"{who}.pem"), "-keystore", store, *pw)
     with open(os.path.join(d, "client.properties"), "w") as f:  # for kafka-topics.sh in the container
-        f.write("security.protocol=SSL\nssl.truststore.location=/certs/truststore.p12\nssl.truststore.type=PKCS12\n"
-                "ssl.truststore.password=storepw\nssl.keystore.location=/certs/client.p12\n"
+        f.write("security.protocol=SSL\nssl.truststore.location=/etc/kafka/secrets/truststore.p12\n"
+                "ssl.truststore.type=PKCS12\nssl.truststore.password=storepw\n"
+                "ssl.keystore.location=/etc/kafka/secrets/client.p12\n"
                 "ssl.keystore.type=PKCS12\nssl.keystore.password=storepw\nssl.key.password=storepw\n")
+    with open(os.path.join(d, "store_creds"), "w") as f:
+        f.write("storepw")
     for f in os.listdir(d):
         os.chmod(os.path.join(d, f), 0o644)  # the broker runs as another user
+    os.chmod(d, 0o777)
     return d
 
 
@@ -495,10 +508,10 @@ def case_kafka_tls():
     try:
         def topic():
             out = sh("kafka-tls", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:19093",
-                     "--command-config", "/certs/client.properties", "--create", "--if-not-exists",
+                     "--command-config", "/etc/kafka/secrets/client.properties", "--create", "--if-not-exists",
                      "--topic", "tls.items", check=False)
             return "tls.items" in sh("kafka-tls", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server",
-                                     "localhost:19093", "--command-config", "/certs/client.properties", "--list",
+                                     "localhost:19093", "--command-config", "/etc/kafka/secrets/client.properties", "--list",
                                      check=False) or (print(out[-400:]) and False)
         try:
             it.wait_for("the TLS broker (topic created over mutual TLS)", topic, timeout=180, every=5)

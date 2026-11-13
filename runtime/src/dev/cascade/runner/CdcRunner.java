@@ -81,8 +81,78 @@ public final class CdcRunner {
                 }
             }
             Guards.resolve(guards, restoring, env); // replications refuse a lost slot (no renames)
+            for (String g : guards) {
+                checkReplicaIdentity(g, env);
+            }
         }
         run(yaml, senv);
+    }
+
+    /**
+     * Flink CDC's Postgres pipeline source needs the before-image of updates and deletes: every table it
+     * replicates must have REPLICA IDENTITY FULL, or the job fails at the first update and crash-loops.
+     * Checked at every start, for the tables the patterns match now.
+     */
+    @SuppressWarnings("unchecked")
+    static void checkReplicaIdentity(String guard, Map<String, String> env) throws Exception {
+        Map<String, Object> spec = new org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(guard.substring(Guards.REQUIRE_SLOT.length()).trim(), Map.class);
+        Object tables = spec.get("tables");
+        if (tables == null) {
+            return;
+        }
+        List<java.util.regex.Pattern[]> include = patterns(String.valueOf(tables));
+        List<java.util.regex.Pattern[]> exclude = patterns(String.valueOf(spec.getOrDefault("exclude", "")));
+        List<String> offenders = new ArrayList<>();
+        try (java.sql.Connection c = Guards.connect(spec, env);
+             java.sql.ResultSet rs = c.createStatement().executeQuery(
+                     "SELECT n.nspname, c.relname, c.relreplident FROM pg_class c "
+                             + "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p')")) {
+            while (rs.next()) {
+                String schema = rs.getString(1);
+                String table = rs.getString(2);
+                if (matches(include, schema, table) && !matches(exclude, schema, table)
+                        && !"f".equals(rs.getString(3))) {
+                    offenders.add(schema + "." + table);
+                }
+            }
+        }
+        if (!offenders.isEmpty()) {
+            StringBuilder fix = new StringBuilder();
+            for (String t : offenders) {
+                fix.append("\n  ALTER TABLE ").append(t).append(" REPLICA IDENTITY FULL;");
+            }
+            throw new IllegalStateException("replication: these tables lack REPLICA IDENTITY FULL, which Flink CDC "
+                    + "needs for updates and deletes (the job would fail at the first one): "
+                    + String.join(", ", offenders) + fix);
+        }
+    }
+
+    /** Flink CDC patterns, comma-separated: database.schema.table, '.' a delimiter and '\\.' any char. */
+    static List<java.util.regex.Pattern[]> patterns(String list) {
+        List<java.util.regex.Pattern[]> out = new ArrayList<>();
+        for (String p : list.split(",")) {
+            if (p.trim().isEmpty()) {
+                continue;
+            }
+            String[] parts = p.trim().split("(?<!\\\\)\\.");
+            if (parts.length < 2) {
+                continue;
+            }
+            out.add(new java.util.regex.Pattern[] {
+                java.util.regex.Pattern.compile(parts[parts.length - 2].replace("\\.", ".")),
+                java.util.regex.Pattern.compile(parts[parts.length - 1].replace("\\.", "."))});
+        }
+        return out;
+    }
+
+    static boolean matches(List<java.util.regex.Pattern[]> pats, String schema, String table) {
+        for (java.util.regex.Pattern[] p : pats) {
+            if (p[0].matcher(schema).matches() && p[1].matcher(table).matches()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static void run(String yaml, StreamExecutionEnvironment senv) throws Exception {

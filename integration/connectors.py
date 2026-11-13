@@ -684,12 +684,11 @@ def case_oracle():
                            for line in sql("SELECT id, name, qty FROM items ORDER BY id;").splitlines() if line.strip())
     mirror_case("oracle-cdc", '{type: oracle-cdc, properties: {hostname: localhost, port: 11521, username: c##flinkuser, '
                 'password: "${secret:oracle}", database: XE, pdb: XEPDB1}}',
-                "    table: APP.ITEMS\n    options: {debezium.log.mining.strategy: online_catalog, "
-                "scan.incremental.snapshot.enabled: 'false'}",
+                "    table: APP.ITEMS",
                 "{ID: INT NOT NULL, NAME: STRING, QTY: INT}", "ID", truth,
                 lambda: sql("INSERT INTO items VALUES (4, 'd', 1);\nUPDATE items SET qty = 70 WHERE id = 2;\n"
                             "DELETE FROM items WHERE id = 3;\nCOMMIT;"),
-                pg_table('"ID" INT PRIMARY KEY, "NAME" TEXT, "QTY" INT'))
+                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"))  # Flink's Postgres dialect doesn't quote names
 
 
 CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,

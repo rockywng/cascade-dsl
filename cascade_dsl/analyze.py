@@ -165,6 +165,12 @@ def _check_sources(c: Checked):
                     conn=p.connections.get(s.connection))
                 _report_option_problems(c, problems, s.loc, s.name)
                 c.options[s.name] = opts
+                if opts.get("connector") == "oracle-cdc" and opts.get("scan.incremental.snapshot.enabled") == "false":
+                    d.warning("CD216", f"source '{s.name}': Oracle CDC in a pluggable database uses Flink CDC's legacy "
+                              "reader (the incremental one can't find tables in a PDB in Flink CDC 3.7); how it "
+                              "resumes after a restore isn't verified by cascade's tests", s.loc, node=s.name,
+                              hint="verify with `cascade restore-test` against a test database before relying on "
+                                   "savepoint upgrades")
         p.relations[s.name] = RelationInfo(columns=out_cols, rowtime=rowtime, changelog=changelog,
                                            upsert_key=list(s.primary_key) or None)
 

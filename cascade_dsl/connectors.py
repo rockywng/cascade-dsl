@@ -296,6 +296,19 @@ def _passthrough_table(role, mode, fmt, opts, ctx):
     return []
 
 
+def _oracle_finish(role, mode, fmt, opts, ctx):
+    problems = _db_table_finish("schema-name", "table-name")(role, mode, fmt, opts, ctx)
+    if opts.get("debezium.database.pdb.name"):
+        # Flink CDC 3.7's incremental reader discovers tables over a connection to the container root and
+        # finds none in a pluggable database ("db history ... missing"; integration/connectors.py): the
+        # legacy reader reads them. LogMiner's online catalog avoids mining the dictionary from redo.
+        opts.setdefault("scan.incremental.snapshot.enabled", "false")
+        opts.setdefault("debezium.log.mining.strategy", "online_catalog")
+    else:
+        opts.setdefault("scan.incremental.snapshot.enabled", "true")
+    return problems
+
+
 register(ConnectorSpec(
     type="oracle-cdc", roles={"source"},
     doc="Oracle change data capture via Flink CDC (LogMiner). Emits an updating changelog.",
@@ -306,7 +319,7 @@ register(ConnectorSpec(
     artifact="org.apache.flink:flink-sql-connector-oracle-cdc",
     # like MySQL's, the jar doesn't bundle the driver (found by integration/connectors.py: "No suitable driver")
     extra_artifacts=lambda props: ["com.oracle.database.jdbc:ojdbc8"],
-    finish=_incremental(_db_table_finish("schema-name", "table-name")),
+    finish=_oracle_finish,
 ))
 for _db, _port, _doc in (("sqlserver", 1433, "SQL Server"), ("db2", 50000, "Db2")):
     register(ConnectorSpec(

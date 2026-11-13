@@ -5,7 +5,7 @@ name: connectors
 # DynamoDB, Kinesis (sink and source), Hudi (sink and source), Delta. See integration/connectors.py.
 on:
   push:
-    branches: [main, "connectors-*", "followups"]
+    branches: [main, "connectors-*"]
   workflow_dispatch:
     inputs:
       only:

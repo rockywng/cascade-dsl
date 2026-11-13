@@ -77,18 +77,54 @@ def python_spec(stmt: str) -> dict | None:
     return spec if spec.get("language") == "python" else None
 
 
+def _split_top(text: str) -> list[str]:
+    """Comma-separated parts at nesting depth 0."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
 def type_info(sql_type: str):
-    """TypeInformation for a declared column type (what the process function's rows carry)."""
+    """TypeInformation for a declared column type (what the process function's rows carry), nested types
+    included: ARRAY<T>, MAP<K, V>, ROW<name T, ...>."""
     from pyflink.common import Types
-    t = sql_type.upper().replace(" NOT NULL", "").strip()
-    base = t.split("(")[0].strip()
+    t = sql_type.strip()
+    t = t[:-len("NOT NULL")].strip() if t.upper().endswith("NOT NULL") else t
+    upper = t.upper()
+    if upper.startswith("ARRAY<") and t.endswith(">"):
+        return Types.OBJECT_ARRAY(type_info(t[6:-1]))
+    if upper.startswith("MAP<") and t.endswith(">"):
+        k, v = _split_top(t[4:-1])
+        return Types.MAP(type_info(k), type_info(v))
+    if upper.startswith("ROW<") and t.endswith(">"):
+        names, types = [], []
+        for field in _split_top(t[4:-1]):
+            name, _, ftype = field.strip().partition(" ")
+            names.append(name.strip("`"))
+            types.append(type_info(ftype))
+        return Types.ROW_NAMED(names, types)
+    base = upper.split("(")[0].strip()
+    if "WITH LOCAL TIME ZONE" in upper or base == "TIMESTAMP_LTZ":
+        return Types.INSTANT()
     simple = {"STRING": Types.STRING(), "VARCHAR": Types.STRING(), "CHAR": Types.STRING(),
               "BIGINT": Types.LONG(), "INT": Types.INT(), "INTEGER": Types.INT(), "SMALLINT": Types.SHORT(),
               "TINYINT": Types.BYTE(), "BOOLEAN": Types.BOOLEAN(), "DOUBLE": Types.DOUBLE(),
               "FLOAT": Types.FLOAT(), "DECIMAL": Types.BIG_DEC(), "DATE": Types.SQL_DATE(),
-              "TIMESTAMP": Types.SQL_TIMESTAMP(), "BYTES": Types.PRIMITIVE_ARRAY(Types.BYTE())}
+              "TIME": Types.SQL_TIME(), "TIMESTAMP": Types.SQL_TIMESTAMP(),
+              "BYTES": Types.PRIMITIVE_ARRAY(Types.BYTE()), "VARBINARY": Types.PRIMITIVE_ARRAY(Types.BYTE())}
     if base not in simple:
-        raise ValueError(f"Python process models support {', '.join(sorted(simple))} columns, not {sql_type}")
+        raise ValueError(f"Python process models don't support the column type {sql_type}")
     return simple[base]
 
 
@@ -164,6 +200,9 @@ def _register(t_env, view: str, stream, spec: dict):
             b.column(name, dt.notNull() if "NOT NULL" in t else dt)
         elif t.strip().startswith("DATE"):
             dt = types.DATE().bridgedTo(cls("java.sql.Date"))
+            b.column(name, dt.notNull() if "NOT NULL" in t else dt)
+        elif _re.match(r"\s*TIME\s*(\(\d+\))?\s*(NOT NULL)?\s*$", t):
+            dt = types.TIME(0).bridgedTo(cls("java.sql.Time"))
             b.column(name, dt.notNull() if "NOT NULL" in t else dt)
         else:
             b.column(name, sql_type)
@@ -244,6 +283,87 @@ def run_tests(directory: str, out: str, timeout: int):
         json.dump({"results": results}, f)
 
 
+def _submit_script(path: str, restore: str | None = None, allow_state_loss: bool = False):
+    """A whole script (setup, process directives, inserts) as one job, on the local MiniCluster."""
+    env, t_env = environment(restore=restore, local=True)
+    if restore:
+        env._j_stream_execution_environment.getConfiguration()  # noqa: B018 -- restore set in environment()
+        t_env.get_config().set("execution.state-recovery.ignore-unclaimed-state", str(allow_state_loss).lower())
+    with open(path) as f:
+        stmts = [s.strip() for s in f.read().split(f"\n{SEPARATOR}\n") if s.strip()]
+    inserts = [s for s in stmts if s.upper().startswith("INSERT")]
+    apply_setup(t_env, [s for s in stmts if not s.upper().startswith("INSERT")])
+    j_set = t_env._j_tenv.createStatementSet()
+    for s in inserts:
+        j_set.addInsertSql(s[:-1] if s.endswith(";") else s)
+    j_set.attachAsDataStream()
+    return env.execute_async("cascade-restore-test")
+
+
+def _wait_running(client, seconds: int) -> str:
+    import time
+    deadline = time.time() + seconds
+    status = None
+    while time.time() < deadline:
+        status = client.get_job_status().result().name
+        if status in ("RUNNING", "FAILED", "CANCELED", "FINISHED"):
+            return status
+        time.sleep(0.5)
+    return status or "UNKNOWN"
+
+
+def restore_test(old: str, new: str, savepoints: str, seconds: int, allow_state_loss: bool, out: str):
+    """Like the tools' restore-test-statements, for pipelines with Python process models: run the old
+    script, savepoint it, restore the new script from it strictly (no unclaimed state)."""
+    import time
+
+    def log(msg):
+        print(f"cascade restore-test: {msg}", file=sys.stderr, flush=True)
+    result = {}
+    old_job = new_job = None
+    try:
+        old_job = _submit_script(old)
+        log(f"old job {_wait_running(old_job, 60)}")
+        time.sleep(seconds)
+        log("savepoint")
+        # PyFlink 2.3's JobClient.trigger_savepoint calls a Java overload Flink 2 removed (no format type)
+        fmt = _jvm().org.apache.flink.core.execution.SavepointFormatType.CANONICAL
+        savepoint = old_job._j_job_client.triggerSavepoint("file://" + os.path.abspath(savepoints), fmt).get()
+        result["savepoint"] = savepoint
+        log(f"savepoint {savepoint}")
+        try:
+            old_job.cancel().result()
+        except Exception:  # noqa: BLE001 -- already gone
+            pass
+        old_job = None
+        new_job = _submit_script(new, restore=savepoint, allow_state_loss=allow_state_loss)
+        status = _wait_running(new_job, 60)
+        time.sleep(3)
+        try:
+            status = new_job.get_job_status().result().name
+        except Exception:  # noqa: BLE001 -- its MiniCluster is gone: the job ended
+            status = "FAILED"
+        result["restored"] = status == "RUNNING"
+        result["status"] = status
+        if status != "RUNNING":
+            try:
+                new_job.get_job_execution_result().result()
+            except Exception as e:  # noqa: BLE001
+                result["error"] = str(e)[-4000:]
+    except Exception as e:  # noqa: BLE001
+        result["restored"] = False
+        result["error"] = f"{type(e).__name__}: {str(e)[-4000:]}"
+    finally:
+        for job in (old_job, new_job):
+            if job is not None:
+                try:
+                    job.cancel().result()
+                except Exception:  # noqa: BLE001
+                    pass
+    with open(out, "w") as f:
+        json.dump(result, f)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="pyrunner")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -256,11 +376,20 @@ def main(argv=None):
     t.add_argument("dir")
     t.add_argument("out")
     t.add_argument("timeout", type=int)
+    r = sub.add_parser("restore-test")
+    r.add_argument("old")
+    r.add_argument("new")
+    r.add_argument("savepoints")
+    r.add_argument("seconds", type=int)
+    r.add_argument("out")
+    r.add_argument("--allow-state-loss", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "job":
         run_job(a.setup, a.statements, a.wait, a.restore)
-    else:
+    elif a.cmd == "tests":
         run_tests(a.dir, a.out, a.timeout)
+    else:
+        restore_test(a.old, a.new, a.savepoints, a.seconds, a.allow_state_loss, a.out)
 
 
 if __name__ == "__main__":

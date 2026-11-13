@@ -1,0 +1,1 @@
+{"cascade.command": ["python3", "-m", "cascade_dsl", "lsp"]}

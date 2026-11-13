@@ -207,12 +207,14 @@ ARCHIVELOG mode, supplemental logging, and a common user with LogMiner grants. T
 the test. A table in a pluggable database needs the connection's `pdb`. The tests found two problems:
 - **The connector doesn't bundle the Oracle driver,** so the catalog adds `ojdbc8`.
 - **Flink CDC 3.7's incremental reader can't find tables in a PDB.** With `pdb` set, the compiler
-  uses the legacy reader and LogMiner's online catalog, and warns (CD216) that its restore behaviour
-  isn't verified.
+  uses the legacy reader and LogMiner's online catalog. Restoring that reader from a checkpoint is
+  tested (case `oracle-restore`): changes made while the job was down arrive, and nothing is read
+  twice.
 
 **Db2 CDC** is only planned against its jar. It reads changes through IBM's ASN capture, which has to
-be installed and administered inside a privileged, licensed Db2 instance. That's beyond what the
-test harness should set up.
+be installed and administered inside a privileged, licensed Db2 instance. Debezium publishes no image
+with it, so there's no trustworthy Db2 to test against in CI. The jar check did find that the connector
+doesn't bundle IBM's driver, like MySQL's and Oracle's, so the catalog adds `com.ibm.db2:jcc`.
 
 `cascade fetch-jars <project>` downloads a pipeline's connector jars into `~/.cache/cascade/jars`.
 It prints a `CASCADE_EXTRA_JARS=...` line; with that set, `cascade plan`, `test` and `verify` work
@@ -506,9 +508,14 @@ Python models in between:
 The function and the classes in its file are pickled by value, so workers need nothing installed.
 Two PyFlink differences:
 - **Watermarks per bundle.** PyFlink hands Python functions records in bundles, with the watermark
-  per bundle (`python.fn-execution.bundle.size`), so lateness checks in `process_element` are only
-  as exact as the bundle. The example's late-data branch sets the bundle size to 1.
-- **Supported column types:** strings, integers, floats, decimals, booleans, dates and timestamps.
+  per bundle, so lateness checks in `process_element` are only as exact as the bundle.
+  `exact_watermarks: true` on the process sets the bundle size to 1, which makes lateness exact at a
+  throughput cost. The example's late-data branch uses it.
+- **Column types:** the scalar types, `TIMESTAMP_LTZ`, and nested `ARRAY<…>`, `MAP<…, …>` and
+  `ROW<…>`.
+
+`cascade restore-test` works for these pipelines too: it runs on the Python runner, with the same
+strict savepoint restore as for Java process models.
 
 ## Functions
 
@@ -867,6 +874,10 @@ The alerts follow the pipeline:
 The integration run scrapes the running job and fails if any metric an alert or panel uses isn't
 reported. An alert on a misspelled metric would never fire.
 
+`tests/test_alert_rules.py` runs `promtool test rules` in CI. Each alert gets synthetic series for
+its condition and must fire with the expected labels and annotations. A healthy series set must
+fire nothing.
+
 ### Other targets
 
 `deploy.target` picks what `cascade deploy` generates. The default, `kubernetes`, is the
@@ -982,8 +993,11 @@ the data itself, not something missing from the compiler.
 - **Completion:** connector types after `type:`; the connector's properties inside a connection,
   source or sink; and section keys.
 - **Hover:** a diagnostic code's meaning.
+- **Go to definition and find references:** for any source, model, sink, connection or function
+  name, whether used in SQL, `from:`, `connection:` or `inputs:`.
 
-`editors/vscode` is a small VS Code extension that starts it. Any other LSP client can run
+`editors/vscode` is a small VS Code extension that starts it. CI runs it in a real headless VS Code
+and checks that the diagnostics arrive and that go-to-definition works. Any other LSP client can run
 `cascade lsp`.
 
 ## Diagnostic codes
@@ -992,7 +1006,7 @@ the data itself, not something missing from the compiler.
 |---|---|
 | CD0xx | YAML structure, unknown keys (with suggestions), vars, types |
 | CD1xx | names, sources, event time, primary keys (CD108 job-wide idle timeout, CD109 conflicting idle timeouts, CD110 alignment/emit without push-down, CD111 SOURCE_WATERMARK unsupported); batch (CD120 unbounded source, CD121 temporal join, CD122 backfill); `from_pipeline` (CD130 cycle, CD131 upstream doesn't compile, CD132 unknown sink, CD133 sink not readable, CD134 not streamable); process models (CD140 state not checked by upgrades, CD141 key_by column, CD142 event_time / primary_key column); functions (CD160 missing module, CD161 function not defined, CD162 shadows a built-in, CD163 module name clash, CD164 jar not built) |
-| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage; CD216: Oracle CDC in a PDB uses the legacy reader) |
+| CD2xx | connectors, properties, formats, secrets (CD215: a JDBC sink restarts the TaskManager during a database outage) |
 | CD30x–CD32x | model SQL, references, cycles, Python model build errors (CD304), contracts, expectations |
 | CD33x–CD34x | windows and time attributes, temporal joins |
 | CD35x | state / TTL |

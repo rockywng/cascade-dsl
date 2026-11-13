@@ -331,3 +331,89 @@ class PythonRunnerJobTest(unittest.TestCase):
             shutil.rmtree(root)
         finally:
             shutil.rmtree(d)
+
+
+@unittest.skipUnless(READY and __import__("cascade_dsl.jvm", fromlist=["x"]).python_executable(),
+                     "needs FLINK_HOME, runtime/build.sh and PyFlink (CASCADE_PYTHON)")
+class PythonProcessRestoreTest(unittest.TestCase):
+    """restore-test for pipelines with Python process models runs on the Python runner."""
+
+    def test_restore_test_covers_python_process_state(self):
+        from cascade_dsl.plans import restore_test
+        example = os.path.join(os.path.dirname(__file__), "..", "examples", "sessions_py")
+        d = tempfile.mkdtemp(prefix="cascade-pyprocess-restore-")
+        try:
+            old = os.path.join(d, "old")
+            shutil.copytree(example, old)
+            same = os.path.join(d, "config-only")
+            shutil.copytree(old, same)
+            ProcessRestoreTest._edit(same, "config: {gap: PT30M}", "config: {gap: PT45M}")
+            res = restore_test(old, same, FLINK, seconds=5)
+            self.assertTrue(res.get("restored"), res.get("error", "")[-1500:])
+            gone = os.path.join(d, "without-sessions")
+            shutil.copytree(old, gone)
+            with open(os.path.join(gone, "pipeline.yaml")) as f:
+                head = f.read().partition("models:")[0]
+            with open(os.path.join(gone, "pipeline.yaml"), "w") as f:
+                f.write(head + "sinks:\n  raw: {from: clicks, connection: events, topic: raw_clicks}\n")
+            shutil.rmtree(os.path.join(gone, "tests"))
+            res = restore_test(old, gone, FLINK, seconds=5)
+            self.assertFalse(res.get("restored"))
+        finally:
+            shutil.rmtree(d)
+
+
+NESTED = """
+pipeline: nested
+defaults: {state_ttl: 1d}
+sources:
+  events:
+    connection: datagen
+    columns: {id: STRING, n: INT}
+models:
+  shaped:
+    process:
+      language: python
+      file: jobs/shape.py
+      function: shape
+      inputs: [events]
+    columns:
+      id: STRING
+      tags: ARRAY<STRING>
+      attrs: MAP<STRING, INT>
+      point: ROW<x INT, y INT>
+sinks:
+  out: {from: shaped, connection: print}
+"""
+
+SHAPE = '''
+from pyflink.common import Row
+
+
+def shape(ctx, inputs):
+    return inputs[0].map(lambda r: Row(id=r["id"], tags=[r["id"], "t"], attrs={"n": r["n"]},
+                                       point=Row(x=r["n"], y=r["n"] * 2)), output_type=ctx.output_type)
+'''
+
+
+@unittest.skipUnless(READY and __import__("cascade_dsl.jvm", fromlist=["x"]).python_executable(),
+                     "needs FLINK_HOME, runtime/build.sh and PyFlink (CASCADE_PYTHON)")
+class PythonNestedTypesTest(unittest.TestCase):
+    def test_arrays_maps_and_rows(self):
+        root = project(NESTED, base=False, files={"jobs/shape.py": SHAPE, "tests/shape_test.yaml": """
+tests:
+  - name: nested_types
+    target: shaped
+    given:
+      events:
+        - {id: a, n: 2}
+    expect:
+      rows:
+        - {id: a, tags: [a, t], attrs: {n: 2}, point: [2, 4]}
+"""})
+        try:
+            r, results = testing.run(root, FLINK)
+            self.assertIsNotNone(results, [x.format() for x in r.diagnostics.errors])
+            self.assertTrue(results[0].passed, results[0].message)
+        finally:
+            shutil.rmtree(root)

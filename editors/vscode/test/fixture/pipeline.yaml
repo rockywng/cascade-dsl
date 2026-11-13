@@ -1,0 +1,14 @@
+pipeline: vscode_fixture
+defaults: {state_ttl: 1d}
+connections:
+  bus: {type: kafka, properties: {bootstrap_servers: "localhost:9092"}}
+sources:
+  orders:
+    connection: bus
+    topic: orders
+    columns: {order_id: STRING, amount: INT}
+models:
+  clean:
+    sql: SELECT order_id FROM ordrs
+sinks:
+  out: {from: clean, connection: print}

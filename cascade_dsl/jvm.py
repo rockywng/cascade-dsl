@@ -201,6 +201,19 @@ class Tools:
                 with open(path, "w") as f:
                     f.write(script(stmts))
                 paths.append(path)
+            if any('"language": "python"' in script(s) for s in (old, new)):
+                # Python process models: the restore test runs on the Python runner
+                py = python_executable()
+                if py is None:
+                    raise ToolsError("Python process models need PyFlink: pip install apache-flink, or CASCADE_PYTHON")
+                runner = os.path.join(os.path.dirname(__file__), "pyrunner.py")
+                p = subprocess.run([py, "-P", runner, "restore-test", paths[0], paths[1], os.path.join(d, "savepoints"),
+                                    str(seconds), out] + (["--allow-state-loss"] if allow_state_loss else []),
+                                   capture_output=True, text=True, timeout=timeout,
+                                   env={**os.environ, "CASCADE_JARS": os.pathsep.join([self.tools_jar, runtime_jar()])})
+                if not os.path.exists(out):
+                    raise ToolsError("Python restore test failed:\n" + (p.stderr or p.stdout)[-4000:])
+                return self._read(out)
             self._run(["restore-test-statements", paths[0], paths[1], os.path.join(d, "savepoints"), str(seconds),
                        out, "allow" if allow_state_loss else "strict"], timeout)
             return self._read(out)

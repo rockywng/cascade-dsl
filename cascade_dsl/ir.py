@@ -223,6 +223,7 @@ class Pipeline:
     scaling: Scaling | None = None
     functions: dict[str, Function] = field(default_factory=dict)
     ml_models: dict[str, "MLModel"] = field(default_factory=dict)
+    replicate: dict | None = None  # whole-database replication (replicate.py)
     deploy: dict | None = None  # deployment settings (image, resources, checkpoints, ...), vars resolved
     schema_lock: dict | None = None  # cascade.lock.json "models" section, if present
     mode: str = "streaming"  # streaming | batch

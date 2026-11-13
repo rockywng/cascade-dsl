@@ -30,6 +30,7 @@ from .lower import Stmt
 from .udfs import PYRUNNER, needs_python, python_files, python_functions, python_processes
 
 RUNNER = "dev.cascade.runner.SqlRunner"
+CDC_RUNNER = "dev.cascade.runner.CdcRunner"  # replications (replicate.py)
 PYTHON_DRIVER = "org.apache.flink.client.python.PythonDriver"
 JOB_DIR = "/opt/cascade/job"
 RUNTIME_JAR = "/opt/flink/usrlib/cascade-runtime.jar"
@@ -116,34 +117,46 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     keep_guard = _guard_filter(plan_dir)
     setup = [rewrite(st) for st in lowered.statements if st.kind != "insert" and (st.kind != "guard" or keep_guard(st))]
     files = {"setup.sql": _header(r, "setup") + script(setup)}
-    if plan_dir and any(m.process for m in p.models.values()):
-        raise DeployError("pipelines with process models deploy as statements (a compiled plan can't contain "
-                          "DataStream code); drop --plan-dir")
-    from .plans import uses_variant
-    if plan_dir and uses_variant(p):
-        raise DeployError("this pipeline uses VARIANT, which Flink 2.3 can't write into a compiled plan; drop "
-                          "--plan-dir (the job is planned at startup)")
-    if plan_dir and p.mode == "batch":
-        raise DeployError("batch pipelines deploy as statements (Flink compiles plans for streaming jobs only); "
-                          "drop --plan-dir")
-    if plan_dir:
-        plan_path = os.path.join(plan_dir, "plan.json")
-        if not os.path.exists(plan_path):
-            raise DeployError(f"{plan_dir} has no plan.json (create it with `cascade plan`)")
-        with open(plan_path) as f:
-            plan = json.load(f)
-        _check_plan_matches(plan, lowered.statements)
-        files["plan.json"] = json.dumps(plan, indent=1)
-        args = ["--setup", f"{JOB_DIR}/setup.sql", "--plan", f"{JOB_DIR}/plan.json"]
-        mode = "plan"
-        ops = os.path.join(plan_dir, "operators.json")
-        if os.path.exists(ops):
-            shutil.copy(ops, os.path.join(out, "operators.json"))
+    if lowered.cdc_pipeline is not None:  # replicate: a Flink CDC pipeline, run by CdcRunner
+        if plan_dir:
+            raise DeployError("a replication has no compiled plan (it isn't SQL); drop --plan-dir")
+        if target != "kubernetes":
+            raise DeployError("replications deploy to target: kubernetes (the image carries Flink CDC)")
+        files = {"cdc-pipeline.yaml": lowered.cdc_pipeline}
+        args = ["--pipeline", f"{JOB_DIR}/cdc-pipeline.yaml"]
+        if lowered.cdc_guard:
+            files["guard.sql"] = lowered.cdc_guard + "\n"
+            args += ["--guard", f"{JOB_DIR}/guard.sql"]
+        mode = "replicate"
     else:
-        inserts = [st for st in lowered.statements if st.kind == "insert"]
-        files["statements.sql"] = _header(r, "statements") + script(inserts)
-        args = ["--setup", f"{JOB_DIR}/setup.sql", "--statements", f"{JOB_DIR}/statements.sql"]
-        mode = "statements"
+        if plan_dir and any(m.process for m in p.models.values()):
+            raise DeployError("pipelines with process models deploy as statements (a compiled plan can't contain "
+                              "DataStream code); drop --plan-dir")
+        from .plans import uses_variant
+        if plan_dir and uses_variant(p):
+            raise DeployError("this pipeline uses VARIANT, which Flink 2.3 can't write into a compiled plan; drop "
+                              "--plan-dir (the job is planned at startup)")
+        if plan_dir and p.mode == "batch":
+            raise DeployError("batch pipelines deploy as statements (Flink compiles plans for streaming jobs only); "
+                              "drop --plan-dir")
+        if plan_dir:
+            plan_path = os.path.join(plan_dir, "plan.json")
+            if not os.path.exists(plan_path):
+                raise DeployError(f"{plan_dir} has no plan.json (create it with `cascade plan`)")
+            with open(plan_path) as f:
+                plan = json.load(f)
+            _check_plan_matches(plan, lowered.statements)
+            files["plan.json"] = json.dumps(plan, indent=1)
+            args = ["--setup", f"{JOB_DIR}/setup.sql", "--plan", f"{JOB_DIR}/plan.json"]
+            mode = "plan"
+            ops = os.path.join(plan_dir, "operators.json")
+            if os.path.exists(ops):
+                shutil.copy(ops, os.path.join(out, "operators.json"))
+        else:
+            inserts = [st for st in lowered.statements if st.kind == "insert"]
+            files["statements.sql"] = _header(r, "statements") + script(inserts)
+            args = ["--setup", f"{JOB_DIR}/setup.sql", "--statements", f"{JOB_DIR}/statements.sql"]
+            mode = "statements"
 
     if target == "flink-run":
         return _flink_run(r, out, files, mode, secrets, cfg)
@@ -599,7 +612,8 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
                 # Python process models: the job is driven from Python (cascade_dsl/pyrunner.py)
                 "jarURI": f"local:///opt/flink/opt/flink-python-{cfg.get('flink_version', DEFAULT_FLINK)}.jar"
                 if python_processes(p) else f"local://{RUNTIME_JAR}",
-                "entryClass": PYTHON_DRIVER if python_processes(p) else RUNNER,
+                "entryClass": PYTHON_DRIVER if python_processes(p) else (
+                    CDC_RUNNER if r.lowered.cdc_pipeline is not None else RUNNER),
                 "args": (["-py", f"{PYTHON_DIR}/{PYRUNNER}", "job", *args]) if python_processes(p) else args,
                 "parallelism": (sc.parallelism if sc and sc.parallelism else 1),
                 # a batch run has no state to carry over; a new spec reruns the job
@@ -667,6 +681,15 @@ def dockerfile(r: Result, cfg: dict) -> str:
                   f"RUN python3 -m venv /opt/pyflink && /opt/pyflink/bin/pip install --no-cache-dir "
                   f"apache-flink=={flink}",
                   "RUN cp /opt/flink/opt/flink-python-*.jar /opt/flink/lib/",
+                  "USER 9999"]
+    if r.lowered.cdc_pipeline is not None:
+        from . import replicate
+        url = replicate.CDC_DIST_URL
+        lines += ["", f"# Flink CDC {replicate.CDC_VERSION} (pipeline runtime for replicate:), checked against its sha512",
+                  f"ADD --checksum=sha512:{replicate.CDC_DIST_SHA512} {url} /tmp/flink-cdc.tgz",
+                  "USER root",
+                  "RUN tar xzf /tmp/flink-cdc.tgz -C /tmp && cp /tmp/flink-cdc-*/lib/flink-cdc-dist-*.jar /opt/flink/lib/ \\",
+                  "    && rm -rf /tmp/flink-cdc*",
                   "USER 9999"]
     lines += ["", f"COPY runtime/target/cascade-runtime.jar {RUNTIME_JAR}"]
     project = os.path.relpath(p.root_dir)

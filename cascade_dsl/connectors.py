@@ -244,6 +244,10 @@ TESTED_VERSIONS = {
     "org.apache.hudi:hudi-flink2.0-bundle": "1.2.1",                          # smoke
     "commons-logging:commons-logging": "1.4.0",
     "org.apache.iceberg:iceberg-flink-runtime-2.3": "1.12.0",  # needs Hadoop and a catalog: not smoked
+    "org.apache.flink:flink-cdc-pipeline-connector-postgres": "3.7.0-2.2",   # replicate: (Flink CDC pipelines)
+    "org.apache.flink:flink-cdc-pipeline-connector-mysql": "3.7.0-2.2",
+    "org.apache.flink:flink-cdc-pipeline-connector-paimon": "3.7.0-2.2",
+    "org.apache.flink:flink-cdc-pipeline-connector-kafka": "3.7.0-2.2",
     "org.apache.flink:flink-model-openai": "2.3.0",                           # ML_PREDICT provider, smoke
 }
 

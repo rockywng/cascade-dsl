@@ -297,6 +297,154 @@ def case_mongodb():
 
 # --- sinks (and read-backs) ------------------------------------------------------------------------
 
+# --- whole-database replication (replicate:, a Flink CDC pipeline run by CdcRunner) ------------------
+
+def cdc_dist() -> str:
+    """Flink CDC's distribution jar, checked against the sha512 the compiler pins for the image."""
+    from cascade_dsl import replicate
+    d = os.path.join(it.WORK, "flink-cdc")
+    jar = os.path.join(d, f"flink-cdc-dist-{replicate.CDC_VERSION}-{replicate.CDC_FLINK}.jar")
+    if not os.path.exists(jar):
+        os.makedirs(d, exist_ok=True)
+        tgz = os.path.join(d, "dist.tgz")
+        urllib.request.urlretrieve(replicate.CDC_DIST_URL, tgz)
+        import hashlib
+        with open(tgz, "rb") as f:
+            if hashlib.sha512(f.read()).hexdigest() != replicate.CDC_DIST_SHA512:
+                raise Failed("Flink CDC distribution: sha512 mismatch")
+        import tarfile
+        with tarfile.open(tgz) as t:
+            member = next(m for m in t.getmembers() if m.name.endswith(os.path.basename(jar)))
+            member.name = os.path.basename(jar)
+            t.extract(member, d)
+    return jar
+
+
+class Replication:
+    """A replicate: project compiled by cascade, run by CdcRunner on a local MiniCluster."""
+
+    def __init__(self, name: str, yaml_text: str):
+        self.dir = os.path.join(WORK, name)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        with open(os.path.join(self.dir, "pipeline.yaml"), "w") as f:
+            f.write(yaml_text)
+        r = compile_pipeline(self.dir)
+        if not r.ok:
+            raise Failed(f"{name}: does not compile: " + "; ".join(d.format() for d in r.diagnostics.errors))
+        with open(os.path.join(self.dir, "cdc-pipeline.yaml"), "w") as f:
+            f.write(r.lowered.cdc_pipeline)
+        with open(os.path.join(self.dir, "guard.sql"), "w") as f:
+            f.write(r.lowered.cdc_guard or "")
+        self.jars = fetch(r.lowered.manifest["artifacts"], "2.3") + [cdc_dist()]
+        self.log = os.path.join(self.dir, "job.log")
+        self.proc = None
+
+    def start(self, restore: str | None = None):
+        cp = os.pathsep.join([RUNTIME, os.path.join(it.FLINK_BASE, "lib", "*"), *self.jars])
+        opens = [f"--add-opens=java.base/{p}=ALL-UNNAMED" for p in
+                 ("java.util", "java.lang", "java.nio", "java.lang.reflect", "java.net", "java.io", "sun.nio.ch",
+                  "java.util.concurrent", "java.time", "java.text", "java.math")]
+        cmd = ["java", *opens, "-cp", cp, "dev.cascade.runner.CdcRunner",
+               "--pipeline", os.path.join(self.dir, "cdc-pipeline.yaml"), "--guard", os.path.join(self.dir, "guard.sql"),
+               "--conf", "execution.checkpointing.interval=2s",
+               "--conf", f"execution.checkpointing.dir=file://{self.dir}/checkpoints"] \
+            + (["--restore", restore] if restore else [])
+        self.out = open(self.log, "a")
+        self.proc = subprocess.Popen(cmd, stdout=self.out, stderr=subprocess.STDOUT, env={**os.environ, **SECRETS})
+
+    latest_checkpoint = Job.latest_checkpoint
+    check_alive = Job.check_alive
+    stop = Job.stop
+
+
+def case_replicate_postgres():
+    """A whole schema replicated into Paimon by Flink CDC: the snapshot, live changes, an added column and a
+    table created while running all arrive; a restore from a checkpoint resumes; a lost slot is refused."""
+    sql = lambda q: sh("postgres", "psql", "-U", "postgres", "-d", "app", "-tAF", "\t", "-c", q)  # noqa: E731
+    if "app" not in sh("postgres", "psql", "-U", "postgres", "-tAc", "SELECT datname FROM pg_database"):
+        sh("postgres", "psql", "-U", "postgres", "-c", "CREATE DATABASE app")
+    sql("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'cascade_shop_replica'")
+    sql("DROP SCHEMA IF EXISTS shop CASCADE; CREATE SCHEMA shop; "
+        "CREATE TABLE shop.orders (id INT PRIMARY KEY, amount INT); "
+        "CREATE TABLE shop.customers (id INT PRIMARY KEY, name TEXT); "
+        "INSERT INTO shop.orders VALUES (1, 10), (2, 20), (3, 30); INSERT INTO shop.customers VALUES (1, 'ann')")
+    wh = os.path.join(WORK, "lake", "replica")
+    shutil.rmtree(wh, ignore_errors=True)
+    rep = Replication("replicate-postgres", f"""
+pipeline: shop_replica
+connections:
+  app: {{type: postgres-cdc, properties: {{hostname: localhost, port: 15432, database: app, username: postgres,
+        password: "${{secret:pw}}"}}}}
+  lake: {{type: paimon, properties: {{warehouse: "file://{wh}"}}}}
+replicate:
+  from: app
+  tables: ["shop.*"]
+  to: lake
+  table_options: {{bucket: "1"}}
+""")
+
+    def lake(table: str, columns: str, select: str) -> list:
+        """The Paimon table as Postgres sees it after a batch copy (cascade, paimon source -> results)."""
+        name = f"rep_{table}"
+        results(f"DROP TABLE IF EXISTS {name}")
+        pg_cols = ", ".join(f"{c.split(':')[0].strip()} " + {"INT": "INT", "STRING": "TEXT"}[c.split(':')[1].strip()
+                            .replace(" NOT NULL", "")] for c in columns.strip("{}").split(","))
+        results(f"CREATE TABLE {name} ({pg_cols}, PRIMARY KEY (id))")
+        Job(f"read-{table}", f"""
+pipeline: read_{table}
+mode: batch
+connections:
+  lake: {{type: paimon, properties: {{warehouse: "file://{wh}"}}}}{RESULTS}
+sources:
+  t: {{connection: lake, table: shop.{table}, columns: {columns}, primary_key: [id]}}
+sinks:
+  out: {{from: t, connection: results, table: {name}, mode: upsert, primary_key: [id]}}
+""").run()
+        return results(f"SELECT {select} FROM {name} ORDER BY id")
+
+    orders = "{id: INT NOT NULL, amount: INT}"
+    rep.start()
+    try:
+        converge("replicate: snapshot of every table in the schema",
+                 lambda: (lake("orders", orders, "id, amount"), lake("customers", "{id: INT NOT NULL, name: STRING}",
+                                                                   "id, name")),
+                 ([["1", "10"], ["2", "20"], ["3", "30"]], [["1", "ann"]]), job=rep, timeout=300)
+        sql("INSERT INTO shop.orders VALUES (4, 40); UPDATE shop.orders SET amount = 21 WHERE id = 2; "
+            "DELETE FROM shop.orders WHERE id = 3")
+        converge("replicate: inserts, updates and deletes", lambda: lake("orders", orders, "id, amount"),
+                 [["1", "10"], ["2", "21"], ["4", "40"]], job=rep)
+        sql("ALTER TABLE shop.orders ADD COLUMN note TEXT; INSERT INTO shop.orders VALUES (5, 50, 'new column')")
+        converge("replicate: an added column reaches the Paimon table (schema evolution)",
+                 lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
+                 [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"]], job=rep)
+        sql("CREATE TABLE shop.refunds (id INT PRIMARY KEY, amount INT); INSERT INTO shop.refunds VALUES (1, 5)")
+        converge("replicate: a table created while running is replicated",
+                 lambda: lake("refunds", "{id: INT NOT NULL, amount: INT}", "id, amount"), [["1", "5"]], job=rep)
+        time.sleep(6)  # a checkpoint after the last change
+        checkpoint = rep.latest_checkpoint()
+    finally:
+        rep.stop()
+    sql("INSERT INTO shop.orders VALUES (6, 60, 'while down')")
+    rep.start(restore=checkpoint)
+    try:
+        converge("replicate: restored from a checkpoint, the change made while down arrives",
+                 lambda: lake("orders", "{id: INT NOT NULL, amount: INT, note: STRING}", "id, COALESCE(note, '-')"),
+                 [["1", "-"], ["2", "-"], ["4", "-"], ["5", "new column"], ["6", "while down"]], job=rep)
+        time.sleep(6)
+        checkpoint = rep.latest_checkpoint()
+    finally:
+        rep.stop()
+    sql("SELECT pg_drop_replication_slot('cascade_shop_replica')")
+    rep.start(restore=checkpoint)
+    rep.proc.wait(120)
+    with open(rep.log) as f:
+        log = f.read()
+    if rep.proc.returncode == 0 or "cascade_shop_replica" not in log:
+        raise Failed("replicate: a restore without its replication slot must be refused:\n" + _error(log))
+    ok("replicate: a restore whose replication slot is gone is refused (no silent gap)")
+
+
 def sink_job(name: str, connection: str, sink: str, mode: str = "upsert") -> Job:
     pk = ", primary_key: [id]" if mode == "upsert" else ""
     return Job(name, f"""
@@ -757,7 +905,7 @@ CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc"
          "hudi": case_hudi, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
          "sqlserver-cleaned-up": case_sqlserver_cleanup, "slot-metrics": case_slot_metrics,
          "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle,
-         "oracle-restore": case_oracle_restore}
+         "oracle-restore": case_oracle_restore, "replicate-postgres": case_replicate_postgres}
 
 
 def prepare():

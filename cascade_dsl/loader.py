@@ -25,7 +25,7 @@ UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "environments",
             "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions", "mode",
-            "ml_models"}
+            "ml_models", "replicate"}
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
 SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict",
@@ -295,6 +295,14 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
                      mname)
         ml_models[mname] = _load_ml_model(mname, mdef, ctx)
 
+    replicate = None
+    if doc.get("replicate") is not None:
+        from .replicate import KEYS as REPLICATE_KEYS
+        replicate = subst(ctx.require_mapping(doc["replicate"], "replicate", doc, "replicate"), doc, "replicate")
+        ctx.check_keys(replicate, REPLICATE_KEYS, "replicate")
+        replicate = dict(replicate)
+        replicate["__loc"] = ctx.loc(doc, "replicate")
+
     deploy = None
     if doc.get("deploy") is not None:
         deploy = _load_deploy(subst(ctx.require_mapping(doc["deploy"], "deploy", doc, "deploy"), doc, "deploy"), ctx)
@@ -311,7 +319,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
         state_ttl_ms=state_ttl_ms, flink_config=flink_config,
         connections=connections, sources=sources, models=models, sinks=sinks,
         quarantine=quarantine, secrets=secrets, scaling=scaling, deploy=deploy, functions=functions, loc=ctx.loc(doc),
-        mode=mode, ml_models=ml_models,
+        mode=mode, ml_models=ml_models, replicate=replicate,
     )
     return p, diags
 

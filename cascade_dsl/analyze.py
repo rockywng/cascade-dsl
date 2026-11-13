@@ -47,6 +47,11 @@ def check(p: Pipeline, diags: Diagnostics | None = None) -> Checked:
     d = diags or Diagnostics()
     c = Checked(p, d)
     from . import backfill
+    if p.replicate is not None:
+        from . import replicate
+        _check_connections(c)
+        replicate.check(c)
+        return c
     backfill.apply(p, d)
     _check_namespace(c)
     _check_functions(c)

@@ -42,6 +42,14 @@ def cmd_compile(args) -> int:
     if _failed(r, args.strict) or r.lowered is None:
         return 1
     os.makedirs(args.out, exist_ok=True)
+    if r.lowered.cdc_pipeline is not None:  # replicate: the Flink CDC pipeline definition
+        with open(os.path.join(args.out, "cdc-pipeline.yaml"), "w") as f:
+            f.write(r.lowered.cdc_pipeline)
+        with open(os.path.join(args.out, "manifest.json"), "w") as f:
+            json.dump(r.lowered.manifest, f, indent=2)
+            f.write("\n")
+        print(f"wrote {args.out}/cdc-pipeline.yaml and {args.out}/manifest.json", file=sys.stderr)
+        return 0
     with open(os.path.join(args.out, "pipeline.sql"), "w") as f:
         f.write(r.lowered.sql)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
@@ -570,4 +578,20 @@ def main(argv=None) -> int:
     sp.set_defaults(fn=cmd_connectors)
 
     args = ap.parse_args(argv)
+    if args.fn in (cmd_test, cmd_verify, cmd_plan, cmd_infer, cmd_check_upgrade, cmd_restore_test) \
+            and _is_replication(args):
+        print("error: a replication (replicate:) has no SQL job to test, verify or plan: Flink CDC builds it at "
+              "startup. Its end-to-end check is integration/connectors.py --only replicate-postgres", file=sys.stderr)
+        return 2
     return args.fn(args)
+
+
+def _is_replication(args) -> bool:
+    from .compiler import load_project
+    from .diagnostics import CompileError
+    path = getattr(args, "path", None) or getattr(args, "new", None)
+    try:
+        p, _ = load_project(path, getattr(args, "env", None))
+    except (CompileError, OSError):
+        return False
+    return p.replicate is not None

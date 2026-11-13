@@ -228,7 +228,7 @@ public final class SqlRunner {
         return "CASCADE_SECRET_" + secret.trim().replaceAll("[^A-Za-z0-9]", "_").toUpperCase();
     }
 
-    static String substitute(String text, Map<String, String> env) {
+    public static String substitute(String text, Map<String, String> env) {
         Matcher m = SECRET.matcher(text);
         StringBuffer sb = new StringBuffer();
         TreeSet<String> missing = new TreeSet<>();

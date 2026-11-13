@@ -43,6 +43,8 @@ def localize(lowered: Lowered, c: Checked, mode: str, workdir: str,
     out: list[Stmt] = []
     py = _python_executable() if any(f.language == "python" for f in p.functions.values()) else None
     for st in lowered.statements:
+        if st.kind in ("source", "sink", "quarantine"):
+            st = st.without_metadata()  # stand-ins have no connector metadata: those columns become data
         if mode == "test" and st.kind == "ensure":
             continue  # fixtures stand in for the table
         if mode == "test" and st.kind == "set" and st.name == "execution.runtime-mode":
@@ -93,8 +95,9 @@ def _source_options(st: Stmt, updating: bool, mode: str, workdir: str, rps: int,
             return {"connector": "filesystem", "path": path, "format": "debezium-json",
                     "source.monitor-interval": "1s"}
         opts = {"connector": "datagen", "rows-per-second": str(rps)}
+        physical = set(st.physical_names())
         for name, typ in st.columns:
-            if typ.split("(")[0].split(" ")[0] in STRING_TYPES:
+            if name in physical and typ.split("(")[0].split(" ")[0] in STRING_TYPES:
                 opts[f"fields.{name}.length"] = "1"
         return opts
     raise ValueError(f"unknown mode {mode}")
@@ -112,7 +115,8 @@ def _fixture_source(st: Stmt, updating: bool, workdir: str, rows, c: Checked, wa
         col = "`" + src.event_time.column + "`"
         extra.append(f"WATERMARK FOR {col} AS SOURCE_WATERMARK()")
     return Stmt(st.kind, st.name, st.sql, st.comment, st.columns, extra,
-                {"connector": "cascade-fixture", "path": path, "changelog": "all" if updating else "insert-only"})
+                {"connector": "cascade-fixture", "path": path, "changelog": "all" if updating else "insert-only"},
+                meta=st.meta)
 
 
 def _epoch_ms(v) -> int | None:
@@ -150,7 +154,7 @@ def _fixture_lines(st: Stmt, updating: bool, rows: list[dict], c: Checked, water
                               (the source's WATERMARK strategy, applied deterministically)
                 manual        only explicit `_watermark` rows
                 end_of_input  none until all input is read (every window fires at the end)"""
-    names = [n for n, _ in st.columns]
+    names = st.physical_names()
     src = c.pipeline.sources[st.name]
     et = src.event_time
     lines: list[str] = []

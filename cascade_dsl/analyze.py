@@ -165,8 +165,45 @@ def _check_sources(c: Checked):
                     conn=p.connections.get(s.connection))
                 _report_option_problems(c, problems, s.loc, s.name)
                 c.options[s.name] = opts
+                _check_source_metadata(c, s, spec, opts)
         p.relations[s.name] = RelationInfo(columns=out_cols, rowtime=rowtime, changelog=changelog,
                                            upsert_key=list(s.primary_key) or None)
+
+
+def _metadata_problem(spec: ConnectorSpec, key: str, declared, writing: bool) -> tuple[str, str] | None:
+    """(code, message) when a metadata key is unknown, unwritable, or declared with another type."""
+    if spec.metadata is None or any(key.startswith(pre) for pre in spec.metadata_prefixes):
+        return None  # not catalogued (custom connectors, lakes): the planner checks it in `cascade verify`
+    if key not in spec.metadata:
+        known = ", ".join(k for k, (_, w) in spec.metadata.items() if w or not writing) or "(none)"
+        return ("CD220", f"connector '{spec.type}' has no {'writable ' if writing else ''}metadata '{key}'; "
+                         f"available: {known}")
+    typ, writable = spec.metadata[key]
+    if writing and not writable:
+        return ("CD220", f"connector '{spec.type}' metadata '{key}' is read-only")
+    if declared is not None and not declared.same_base(parse_type(typ)):
+        return ("CD221", f"metadata '{key}' of connector '{spec.type}' is {typ}, declared as {declared}")
+    return None
+
+
+def _check_source_metadata(c: Checked, s, spec: ConnectorSpec, opts: dict):
+    d = c.diagnostics
+    for col in s.columns:
+        if col.metadata is not None:
+            problem = _metadata_problem(spec, col.metadata, col.type, writing=False)
+            if problem and problem[0] == "CD221":
+                d.warning(problem[0], f"source '{s.name}' column '{col.name}': {problem[1]}", col.loc, node=s.name,
+                          hint="Flink casts it if it can; declare the connector's type to be exact")
+            elif problem:
+                d.error(problem[0], f"source '{s.name}' column '{col.name}': {problem[1]}", col.loc, node=s.name)
+            if opts.get("connector") == "cascade-healing-cdc":
+                d.error("CD222", f"source '{s.name}' column '{col.name}': metadata columns can't be read with "
+                        "on_slot_loss: resnapshot", col.loc, node=s.name,
+                        hint="the healing source re-reads the table and reconciles rows by key, so per-change "
+                             "metadata (op_ts, row_kind) would describe the re-read, not the change")
+        if (col.metadata is not None or col.expression) and col.name in s.primary_key:
+            d.error("CD106", f"source '{s.name}': primary_key column '{col.name}' must be a physical column, "
+                    "not metadata or computed", col.loc, node=s.name)
 
 
 IDLE_GLOBAL = "table.exec.source.idle-timeout"
@@ -642,6 +679,27 @@ def _check_sinks(c: Checked):
                                            conn=p.connections.get(k.connection))
             _report_option_problems(c, problems, k.loc, k.name)
             c.options[k.name] = opts
+            for col, key in k.metadata.items():
+                rcol = next((x for x in (rel.columns or []) if x.name == col), None) if rel else None
+                if rel is not None and rel.columns is not None and rcol is None:
+                    d.error("CD223", f"sink '{k.name}': metadata column '{col}' is not a column of '{k.from_}'",
+                            k.loc, node=k.name)
+                    continue
+                problem = _metadata_problem(spec, key, rcol.type if rcol else None, writing=True)
+                if problem and problem[0] == "CD221":
+                    d.warning(problem[0], f"sink '{k.name}' column '{col}': {problem[1]}", k.loc, node=k.name,
+                              hint="cast the column in the model")
+                elif problem:
+                    d.error(problem[0], f"sink '{k.name}' column '{col}': {problem[1]}", k.loc, node=k.name)
+            if spec.type == "kafka":
+                if "topic" not in k.endpoint:
+                    d.error("CD209", f"sink '{k.name}': a Kafka sink needs 'topic'", k.loc, node=k.name,
+                            hint="with a column written to the 'topic' metadata, 'topic' is the list of topics "
+                                 "it may name")
+                elif "topic" in k.metadata.values() and not isinstance(k.endpoint["topic"], list):
+                    d.error("CD209", f"sink '{k.name}' routes rows by its 'topic' metadata column, so 'topic' "
+                            "must be the list of topics it may name", k.loc, node=k.name,
+                            hint="e.g. topic: [orders.eu, orders.us]; rows naming another topic fail the job")
         if spec is not None and spec.type == "jdbc":
             d.info("CD215", f"sink '{k.name}': while the database is unreachable, the JDBC sink fails the job, "
                    "and its close() rethrows the write error during failover, which Flink treats as fatal: "

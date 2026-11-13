@@ -91,10 +91,73 @@ CASES = {
 }
 
 
+def _meta_columns(conn_type: str, physical: dict) -> str:
+    """Every catalogued metadata key of a connector, as columns: the real factory must accept each one
+    with the declared type (a wrong key or type fails planning)."""
+    from cascade_dsl.connectors import CATALOG
+    cols = dict(physical)
+    for i, (key, (typ, _)) in enumerate(sorted(CATALOG[conn_type].metadata.items())):
+        cols[f"m{i}"] = f"{{type: '{typ}', metadata: '{key}', virtual: true}}"
+    return "{" + ", ".join(f"{k}: {v}" for k, v in cols.items()) + "}"
+
+
+def _cdc_meta(kind: str, extra: str = "", table: str = "app.orders", pk="id", physical=None) -> str:
+    return source_case(f"""
+c:
+  type: {kind}
+  properties: {{hostname: db, username: u, password: "${{secret:db/pw}}"{extra}}}
+""", f"table: {table}", _meta_columns(kind, physical or {"id": "BIGINT NOT NULL"}), pk)
+
+
+METADATA_CASES = {
+    "kafka-source": source_case("c: {type: kafka, properties: {bootstrap_servers: 'k:9092'}}",
+                                "topic: [a, b]\nformat: json", _meta_columns("kafka", {"id": "STRING"}), None),
+    "kafka-sink": """
+pipeline: smoke
+connections:
+  c: {type: kafka, properties: {bootstrap_servers: 'k:9092'}}
+sources:
+  gen:
+    connection: datagen
+    columns: {id: STRING NOT NULL, v: BIGINT}
+models:
+  m:
+    sql: >
+      SELECT id, v, CAST(id AS STRING) AS t, CURRENT_TIMESTAMP AS ts,
+             MAP['h', CAST(id AS BYTES)] AS hs FROM gen
+    columns: {id: STRING NOT NULL, v: BIGINT, t: STRING NOT NULL, ts: TIMESTAMP_LTZ(3) NOT NULL,
+              hs: "MAP<STRING, BYTES> NOT NULL"}
+sinks:
+  out:
+    from: m
+    connection: c
+    topic: [a, b]
+    format: json
+    metadata: {t: topic, ts: timestamp, hs: headers}
+""",
+    "filesystem-source": source_case("c: {type: filesystem}", "path: 'file://{tmp}'\nformat: json",
+                                     _meta_columns("filesystem", {"id": "STRING"}), None),
+    "postgres-cdc": _cdc_meta("postgres-cdc", ", database: app"),
+    "mysql-cdc": _cdc_meta("mysql-cdc"),
+    "oracle-cdc": _cdc_meta("oracle-cdc", ", database: ORCL"),
+    "sqlserver-cdc": _cdc_meta("sqlserver-cdc", ", database: app", table="dbo.orders"),
+    "db2-cdc": _cdc_meta("db2-cdc", ", database: app", table="DB2INST1.ORDERS"),
+    "mongodb-cdc": source_case("c: {type: mongodb-cdc, properties: {hosts: 'mongo:27017'}}",
+                               "database: app\ncollection: orders",
+                               _meta_columns("mongodb-cdc", {"_id": "STRING NOT NULL"}), "_id"),
+}
+
+
 @unittest.skipUnless(READY, "set CASCADE_CONNECTOR_SMOKE=1 (downloads connector jars) with a Flink home")
 class ConnectorSmokeTest(unittest.TestCase):
+    def test_every_catalogued_metadata_key_plans(self):
+        self._plan_all(METADATA_CASES)
+
     def test_every_connector_plans_against_its_real_jar(self):
-        for name, text in CASES.items():
+        self._plan_all(CASES)
+
+    def _plan_all(self, cases):
+        for name, text in cases.items():
             with self.subTest(connector=name):
                 root = tempfile.mkdtemp(prefix="cascade-smoke-")
                 data = tempfile.mkdtemp(prefix="cascade-smoke-data-")

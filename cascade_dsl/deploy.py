@@ -24,7 +24,7 @@ import yaml
 
 from . import __version__
 from .compiler import Result
-from .connectors import PATCHES, TESTED_VERSIONS
+from .connectors import PATCHES, TESTED_VERSIONS, optstr
 from .jvm import script
 from .lower import Stmt
 from .udfs import PYRUNNER, needs_python, python_files, python_functions, python_processes
@@ -273,7 +273,7 @@ def _session_conf(cfg: dict) -> dict:
         conf["execution.checkpointing.dir"] = str(cp["dir"])
     if cfg.get("savepoints"):
         conf["execution.checkpointing.savepoint-dir"] = str(cfg["savepoints"])
-    conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
+    conf.update({str(k): optstr(v) for k, v in (cfg.get("flink_config") or {}).items()})
     return conf
 
 
@@ -481,6 +481,32 @@ def _content_hash(files: dict) -> str:
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:10]
 
 
+def _high_availability(p, cfg: dict, jm_replicas: int) -> dict:
+    """Kubernetes HA for stateful jobs. Without it a JobManager crash (OOM, node loss, eviction) brings the
+    application back as a new job with empty state: the operator only restores checkpoints it knows
+    about through HA metadata. With it, the new JobManager recovers the same job from its latest
+    checkpoint (integration/k8s.py kills the JobManager to check this)."""
+    ha = cfg.get("high_availability")
+    mode = cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint")
+    cp_dir = (cfg.get("checkpoints") or {}).get("dir")
+    if ha is None:
+        ha = mode != "stateless" and bool(cp_dir)
+    if ha is False:
+        if jm_replicas > 1:
+            raise DeployError("deploy.jobmanager.replicas > 1 needs high availability (standby JobManagers "
+                              "take over through it)")
+        if mode == "last-state":
+            raise DeployError("upgrade_mode last-state needs high availability: the operator reads the "
+                              "latest checkpoint from HA metadata")
+        return {}
+    storage = (ha.get("storage_dir") if isinstance(ha, dict) else None) or \
+        (str(cp_dir).rstrip("/") + "/ha" if cp_dir else None)
+    if not storage:
+        raise DeployError("high availability needs deploy.high_availability.storage_dir or deploy.checkpoints.dir "
+                          "(durable storage for JobManager metadata, e.g. s3://state/ha)")
+    return {"high-availability.type": "kubernetes", "high-availability.storageDir": str(storage)}
+
+
 def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: list[str], secret_name: str,
                       cfg: dict, job_cm: str, py_cm: str | None) -> dict:
     p = r.checked.pipeline
@@ -519,12 +545,13 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
     if needs_python(p):
         conf["python.executable"] = PYFLINK_PYTHON
         conf["python.client.executable"] = PYFLINK_PYTHON
+    jm = cfg.get("jobmanager") or {}
+    conf.update(_high_availability(p, cfg, int(jm.get("replicas", 1))))
     from . import monitoring
     if monitoring.enabled(cfg):
         conf.update(monitoring.REPORTER)
-    conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
+    conf.update({str(k): optstr(v) for k, v in (cfg.get("flink_config") or {}).items()})
 
-    jm = cfg.get("jobmanager") or {}
     env = [{"name": env_name(s), "valueFrom": {"secretKeyRef": {"name": secret_name, "key": secret_key(s)}}}
            for s in sorted(p.secrets)]
     container = {"name": "flink-main-container",

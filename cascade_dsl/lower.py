@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 from . import __version__
 from .analyze import Checked, aligned_parallelisms
-from .connectors import CATALOG, SECRET_RE, spec_for
+from .connectors import CATALOG, SECRET_RE, optstr, spec_for
 from .ir import OutputColumn, Pipeline
 from .util import h, normalize_sql
 
@@ -61,10 +61,28 @@ class Stmt:
     options: dict = field(default_factory=dict)  # tables: WITH options
     query: str = ""  # insert: the SELECT feeding the target
     on_conflict: str | None = None  # insert
+    # tables: column -> ("metadata", "METADATA FROM 'k' [VIRTUAL]") or ("computed", expression). Local
+    # stand-ins (localize.py) drop metadata, so fixtures and generators supply those columns as data.
+    meta: dict = field(default_factory=dict)
+
+    def column_ddl(self, n: str, t: str) -> str:
+        kind, text = self.meta.get(n, (None, None))
+        if kind == "computed":
+            return f"{q(n)} AS {text}"
+        return f"{q(n)} {t} {text}" if kind == "metadata" else f"{q(n)} {t}"
+
+    def physical_names(self) -> list[str]:
+        """Columns a row of data carries (computed columns are derived from them)."""
+        return [n for n, _ in self.columns if self.meta.get(n, ("",))[0] != "computed"]
+
+    def without_metadata(self) -> "Stmt":
+        meta = {n: m for n, m in self.meta.items() if m[0] != "metadata"}
+        return Stmt(self.kind, self.name, self.sql, self.comment, self.columns, self.extra, self.options,
+                    self.query, self.on_conflict, meta)
 
     def render(self) -> str:
         if self.kind in ("source", "sink", "quarantine"):
-            body = [f"  {q(n)} {t}" for n, t in self.columns] + [f"  {x}" for x in self.extra]
+            body = [f"  {self.column_ddl(n, t)}" for n, t in self.columns] + [f"  {x}" for x in self.extra]
             return f"CREATE TEMPORARY TABLE {q(self.name)} (\n" + ",\n".join(body) + "\n) " \
                 + with_clause(self.options) + ";"
         if self.kind == "insert":
@@ -74,7 +92,7 @@ class Stmt:
 
     def with_options(self, options: dict) -> "Stmt":
         return Stmt(self.kind, self.name, self.sql, self.comment, self.columns, self.extra, options,
-                    self.query, self.on_conflict)
+                    self.query, self.on_conflict, self.meta)
 
 
 def render_script(stmts: list[Stmt], header: list[str] | None = None, statement_set: str = "EXECUTE") -> str:
@@ -157,13 +175,17 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
                              if s.event_time.max_out_of_orderness_ms else f"WATERMARK FOR {et} AS {et}")
         if s.primary_key:
             extra.append(f"PRIMARY KEY ({', '.join(map(q, s.primary_key))}) NOT ENFORCED")
-        ensure = _ensure_table(p, s.connection, s.endpoint, [(col.name, col.type.text) for col in s.columns],
+        ensure = _ensure_table(p, s.connection, s.endpoint, [(col.name, col.type.text) for col in s.columns
+                                                             if not col.expression and col.metadata is None],
                                s.primary_key)
         if ensure:
             stmts.append(ensure)
         stmts.append(Stmt("source", s.name, comment=f"source: {s.name}" + (f" -- {s.description}" if s.description else ""),
                           columns=[(col.name, col.type.text) for col in s.columns], extra=extra,
-                          options=c.options.get(s.name, {})))
+                          options=c.options.get(s.name, {}),
+                          meta={col.name: ("computed", col.expression) if col.expression
+                                else ("metadata", col.ddl_suffix()) for col in s.columns
+                                if col.expression or col.metadata is not None}))
 
     for s in p.sources.values():
         guard = _slot_guard(c, s)
@@ -179,11 +201,13 @@ def lower(c: Checked, partial: bool = False) -> Lowered:
             cols = [(col.name, col.type.with_nullable(True).text if col.name not in k.primary_key
                      else col.type.with_nullable(False).text) for col in rel.columns]
             extra = [f"PRIMARY KEY ({', '.join(map(q, k.primary_key))}) NOT ENFORCED"] if k.primary_key else []
-            ensure = _ensure_table(p, k.connection, k.endpoint, cols, k.primary_key)
+            ensure = _ensure_table(p, k.connection, k.endpoint, [x for x in cols if x[0] not in k.metadata],
+                                   k.primary_key)
             if ensure:
                 stmts.append(ensure)
             stmts.append(Stmt("sink", k.name, comment=f"sink: {k.name} <- {k.from_} ({k.mode})",
-                              columns=cols, extra=extra, options=c.options[k.name]))
+                              columns=cols, extra=extra, options=c.options[k.name],
+                              meta={col: ("metadata", f"METADATA FROM '{key}'") for col, key in k.metadata.items()}))
             select = ", ".join(q(col.name) for col in rel.columns)
             stmts.append(Stmt("insert", k.name, query=f"SELECT {select}\nFROM {q(k.from_)}",
                               on_conflict=k.on_conflict))
@@ -270,7 +294,8 @@ def _lower_model(c: Checked, name: str, stmts: list[Stmt], partial: bool):
         if e.on_violation in ("drop", "quarantine"):
             conds.append(f"{EXPECT_FN}(({e.check}) IS TRUE, {lit(name)}, {lit(e.name)}, {lit(e.on_violation)})")
     where = "\n  AND ".join(conds)
-    view(name, f"SELECT *\nFROM {q(base)}\nWHERE {where}")
+    # a contract cast with no expectations has nothing to filter (an empty WHERE didn't parse)
+    view(name, f"SELECT *\nFROM {q(base)}" + (f"\nWHERE {where}" if conds else ""))
 
     quarantined = [e for e in m.expectations if e.on_violation == "quarantine"]
     if quarantined:
@@ -296,7 +321,7 @@ def _ensure_table(p, connection: str, endpoint: dict, columns: list, primary_key
     db, _, table = str(endpoint["table"]).partition(".")
     spec = {"catalog": {"type": "paimon", "warehouse": str(conn.properties.get("warehouse", ""))},
             "database": db, "table": table, "columns": [list(c) for c in columns], "primary_key": list(primary_key),
-            "options": {str(k): str(v) for k, v in (endpoint.get("table_options") or {}).items()}}
+            "options": {str(k): optstr(v) for k, v in (endpoint.get("table_options") or {}).items()}}
     return Stmt("ensure", f"{db}.{table}", f"{ENSURE_TABLE} {json.dumps(spec, sort_keys=True)}",
                 comment=f"create Paimon table {db}.{table} if it doesn't exist")
 

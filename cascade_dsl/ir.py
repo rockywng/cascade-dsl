@@ -19,6 +19,14 @@ class Column:
     name: str
     type: SqlType
     loc: Location | None = None
+    metadata: str | None = None  # connector metadata key (METADATA FROM '...')
+    virtual: bool = False  # metadata that is read only (never written by INSERT)
+    expression: str | None = None  # computed column: `name AS expression`
+
+    def ddl_suffix(self) -> str | None:
+        if self.metadata is None:
+            return None
+        return f"METADATA FROM '{self.metadata}'" + (" VIRTUAL" if self.virtual else "")
 
 
 @dataclass
@@ -131,6 +139,7 @@ class Sink:
     primary_key: list[str]
     options: dict
     on_conflict: str | None = None  # error | nothing | deduplicate (Flink >= 2.3 upsert sinks)
+    metadata: dict = field(default_factory=dict)  # column -> connector metadata key it writes
     description: str | None = None
     loc: Location | None = None
 

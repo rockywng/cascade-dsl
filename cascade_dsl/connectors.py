@@ -17,6 +17,16 @@ STREAM_FORMATS = {"json", "avro", "avro-confluent", "csv", "raw", "protobuf"} | 
 FILE_FORMATS = {"json", "csv", "parquet", "avro", "orc", "raw", "debezium-json", "canal-json"}
 
 
+def optstr(v) -> str:
+    """A WITH option value. Lists are Flink's ';'-separated lists (topics, hosts): rendering a
+    Python list as text gave '['a', 'b']', a single topic of that name, so the job read nothing."""
+    if isinstance(v, (list, tuple)):
+        return ";".join(optstr(x) for x in v)
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
 @dataclass
 class Prop:
     flink_key: str | None  # None = handled specially by the connector's `finish` hook
@@ -45,6 +55,10 @@ class ConnectorSpec:
     doc: str = ""
     # (role, mode, fmt, options, ctx) -> mutate options; return list of (code, message) problems
     finish: Callable | None = None
+    # metadata key -> (Flink type, writable by sinks); None = not checked (the planner decides)
+    metadata: dict | None = None
+    # metadata key prefixes the format contributes (Kafka: 'value.' for debezium-json's fields)
+    metadata_prefixes: tuple = ()
 
     def source_is_changelog(self, fmt: str | None, has_pk: bool = False) -> bool:
         if self.source_changelog == "by_format":
@@ -64,6 +78,8 @@ class LowerCtx:
 
 def _kafka_finish(role, mode, fmt, opts, ctx: LowerCtx):
     problems = []
+    if role == "source" and ("topic" in opts) == ("topic-pattern" in opts):
+        problems.append(("CD209", "a Kafka source needs exactly one of 'topic' or 'topic_pattern'"))
     if role == "sink" and mode == "upsert":
         opts["connector"] = "upsert-kafka"
         opts.pop("format", None)
@@ -225,7 +241,8 @@ register(ConnectorSpec(
         "schema_registry_url": Prop("__schema_registry_url"),
     },
     source={
-        "topic": Prop("topic", required=True),
+        "topic": Prop("topic", doc="a topic, or a list of topics"),
+        "topic_pattern": Prop("topic-pattern", doc="a Java regex of topics to read (instead of topic)"),
         "group_id": Prop("properties.group.id"),
         "changelog": Prop("__changelog", values={"append": "append", "upsert": "upsert"},
                           doc="upsert: a compacted topic of keyed rows, read with upsert-kafka"),
@@ -233,7 +250,7 @@ register(ConnectorSpec(
             "earliest": "earliest-offset", "latest": "latest-offset", "group": "group-offsets"}),
     },
     sink={
-        "topic": Prop("topic", required=True),
+        "topic": Prop("topic", doc="a topic; with a 'topic' metadata column, the list of topics it may name"),
         "delivery": Prop("sink.delivery-guarantee", default="at-least-once",
                          values={"at-least-once": "at-least-once", "exactly-once": "exactly-once"}),
         "transactional_id_prefix": Prop("sink.transactional-id-prefix"),
@@ -595,6 +612,36 @@ register(ConnectorSpec(
         "lists its jars (group:artifact:version), `properties` and source/sink keys are raw WITH options.",
 ))
 
+# --- metadata columns (METADATA FROM '...'), from each connector's documentation ----------
+
+KAFKA_METADATA = {
+    "topic": ("STRING NOT NULL", True), "partition": ("INT NOT NULL", False),
+    "headers": ("MAP<STRING, BYTES> NOT NULL", True), "leader-epoch": ("INT", False),
+    "offset": ("BIGINT NOT NULL", False), "timestamp": ("TIMESTAMP_LTZ(3) NOT NULL", True),
+    "timestamp-type": ("STRING NOT NULL", False),
+}
+for _t in ("kafka", "eventhubs"):
+    CATALOG[_t].metadata = KAFKA_METADATA
+    CATALOG[_t].metadata_prefixes = ("value.", "key.")
+_CDC_COMMON = {"table_name": ("STRING NOT NULL", False), "database_name": ("STRING NOT NULL", False),
+               "op_ts": ("TIMESTAMP_LTZ(3) NOT NULL", False)}
+CATALOG["postgres-cdc"].metadata = {**_CDC_COMMON, "schema_name": ("STRING NOT NULL", False),
+                                    "row_kind": ("STRING NOT NULL", False)}
+CATALOG["mysql-cdc"].metadata = {**_CDC_COMMON, "row_kind": ("STRING NOT NULL", False)}
+CATALOG["oracle-cdc"].metadata = {**_CDC_COMMON, "schema_name": ("STRING NOT NULL", False)}
+CATALOG["sqlserver-cdc"].metadata = {**_CDC_COMMON, "schema_name": ("STRING NOT NULL", False)}
+CATALOG["db2-cdc"].metadata = {**_CDC_COMMON, "schema_name": ("STRING NOT NULL", False)}
+CATALOG["mongodb-cdc"].metadata = {"database_name": ("STRING NOT NULL", False),
+                                   "collection_name": ("STRING NOT NULL", False),
+                                   "op_ts": ("TIMESTAMP_LTZ(3) NOT NULL", False),
+                                   "row_kind": ("STRING NOT NULL", False)}
+CATALOG["filesystem"].metadata = {"file.path": ("STRING NOT NULL", False), "file.name": ("STRING NOT NULL", False),
+                                  "file.size": ("BIGINT NOT NULL", False),
+                                  "file.modification-time": ("TIMESTAMP_LTZ(3) NOT NULL", False)}
+for _t in ("jdbc", "datagen", "print", "blackhole", "elasticsearch", "dynamodb"):
+    CATALOG[_t].metadata = {}
+
+
 SECRET_KEY_RE = re.compile(r"(password|secret|token|credential|private[._-]?key|jaas)", re.I)
 
 
@@ -626,7 +673,7 @@ def _custom_options(conn, role, connection_props, endpoint, fmt, passthrough):
     if fmt:
         opts["format"] = fmt
     opts.update(passthrough)
-    return {k: str(v) for k, v in opts.items()}, problems
+    return {k: optstr(v) for k, v in opts.items()}, problems
 
 
 def build_options(spec: ConnectorSpec, role: str, connection_props: dict, endpoint: dict,
@@ -686,4 +733,4 @@ def build_options(spec: ConnectorSpec, role: str, connection_props: dict, endpoi
     opts = {k: v for k, v in opts.items() if not k.startswith("__")}
     for k, v in passthrough.items():
         opts[k] = v
-    return {k: str(v) for k, v in opts.items()}, problems
+    return {k: optstr(v) for k, v in opts.items()}, problems

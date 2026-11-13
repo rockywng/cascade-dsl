@@ -137,6 +137,33 @@ class DeployTest(unittest.TestCase):
             build(r, self.out)
         build(r, self.out, image="img:1")
 
+    def _ha_conf(self, deploy: str):
+        r = compile_pipeline(project("defaults: {state_ttl: 1d}\nsinks:\n  out: {from: orders, connection: print}\n"
+                                     "deploy: " + deploy + "\n"))
+        self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+        out = tempfile.mkdtemp(dir=self.out)
+        build(r, out)
+        return load_all(out)["flinkdeployment.yaml"]["spec"]
+
+    def test_high_availability_by_default_for_stateful_jobs(self):
+        spec = self._ha_conf('{image: x, checkpoints: {dir: "s3://st/cp"}}')
+        self.assertEqual(spec["flinkConfiguration"]["high-availability.type"], "kubernetes")
+        self.assertEqual(spec["flinkConfiguration"]["high-availability.storageDir"], "s3://st/cp/ha")
+        spec = self._ha_conf('{image: x, checkpoints: {dir: "s3://st/cp"}, high_availability: {storage_dir: '
+                             '"s3://st/ha"}, jobmanager: {replicas: 2}}')
+        self.assertEqual(spec["flinkConfiguration"]["high-availability.storageDir"], "s3://st/ha")
+        self.assertEqual(spec["jobManager"]["replicas"], 2)
+        for off in ('{image: x, checkpoints: {dir: "s3://st/cp"}, high_availability: false}',
+                    '{image: x, checkpoints: {dir: "s3://st/cp"}, upgrade_mode: stateless}'):
+            self.assertNotIn("high-availability.type", self._ha_conf(off)["flinkConfiguration"])
+
+    def test_high_availability_requirements(self):
+        for bad in ('{image: x, checkpoints: {dir: "s3://st/cp"}, high_availability: false, upgrade_mode: last-state}',
+                    '{image: x, checkpoints: {dir: "s3://st/cp"}, high_availability: false, jobmanager: {replicas: 2}}',
+                    '{image: x, high_availability: true}'):
+            with self.subTest(deploy=bad), self.assertRaises(DeployError):
+                self._ha_conf(bad)
+
     def test_secret_names(self):
         self.assertEqual(env_name("kafka/prod/bootstrap"), "CASCADE_SECRET_KAFKA_PROD_BOOTSTRAP")
         self.assertEqual(secret_key("db/pw#1"), "db.pw-1")

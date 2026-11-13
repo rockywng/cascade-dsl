@@ -15,6 +15,7 @@ import yaml
 from .diagnostics import CompileError, Diagnostics, Location
 from .ir import (Column, Connection, EventTime, Expectation, Function, Model, Pipeline, Quarantine,
                  Scaling, Sink, Source)
+from .connectors import optstr
 from .types import TypeParseError, parse_type
 
 NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -26,12 +27,14 @@ TOP_KEYS = {"pipeline", "description", "owner", "defaults", "flink", "vars", "en
             "connections", "sources", "models", "sinks", "quarantine", "scaling", "deploy", "functions", "mode"}
 SOURCE_COMMON = {"connection", "columns", "primary_key", "event_time", "processing_time",
                  "options", "description", "format"}
-SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict"}
+SINK_COMMON = {"from", "connection", "mode", "primary_key", "options", "description", "format", "on_conflict",
+               "metadata"}
 MODEL_KEYS = {"process", "sql", "sql_file", "columns", "expectations", "description", "allow_unbounded_state", "scaling",
               "backfill"}
 DEPLOY_KEYS = {"image", "namespace", "service_account", "flink_version", "jobmanager", "taskmanager",
                "checkpoints", "savepoints", "upgrade_mode", "secrets", "artifacts", "labels", "flink_config",
-               "jars", "pod_template", "target", "session_cluster", "jar_uri", "run", "monitoring", "secrets_from"}
+               "jars", "pod_template", "target", "session_cluster", "jar_uri", "run", "monitoring", "secrets_from",
+               "high_availability"}
 SCALING_KEYS = {"max_parallelism", "parallelism", "min", "max", "target_utilization", "max_lag", "autoscale"}
 
 
@@ -207,7 +210,7 @@ def load_document(doc: dict, rel_file: str, root: str, env: str | None,
 
     flink = ctx.require_mapping(doc.get("flink"), "flink", doc, "flink")
     ctx.check_keys(flink, {"config", "version"}, "flink")
-    flink_config = {str(k): str(v) for k, v in
+    flink_config = {str(k): optstr(v) for k, v in
                     ctx.require_mapping(flink.get("config"), "flink.config", flink, "config").items()}
 
     connections = {}
@@ -364,6 +367,10 @@ def _load_deploy(d, ctx: _Ctx) -> dict:
                 parse_duration_ms(cp[key])
             except ValueError as e:
                 ctx.diags.error("CD006", str(e), ctx.loc(cp, key))
+    ha = d.get("high_availability")
+    if ha is not None and not isinstance(ha, bool):
+        ctx.check_keys(ctx.require_mapping(ha, "deploy.high_availability", d, "high_availability"),
+                       {"storage_dir"}, "deploy.high_availability")
     if d.get("upgrade_mode", "savepoint") not in ("savepoint", "last-state", "stateless"):
         ctx.diags.error("CD014", "deploy.upgrade_mode must be savepoint, last-state or stateless",
                         ctx.loc(d, "upgrade_mode"))
@@ -412,6 +419,9 @@ def _load_scaling(d, ctx: _Ctx, allowed: set, what: str) -> Scaling:
     return sc
 
 
+META_RE = re.compile(r"^(.+?)\s+METADATA(?:\s+FROM\s+'([^']+)')?(\s+VIRTUAL)?$", re.IGNORECASE)
+
+
 def _load_columns(raw, ctx: _Ctx, parent, key, what) -> list[Column]:
     cols = []
     raw = ctx.require_mapping(raw, f"{what} columns", parent, key)
@@ -419,8 +429,31 @@ def _load_columns(raw, ctx: _Ctx, parent, key, what) -> list[Column]:
         if not isinstance(cname, str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cname):
             ctx.diags.error("CD003", f"invalid column name '{cname}' in {what}", ctx.loc(raw, cname))
             continue
+        meta, virtual, expression = None, False, None
+        if isinstance(ctype, dict):
+            spec = ctype
+            ctx.check_keys(spec, {"type", "metadata", "virtual", "expression"}, f"{what} column '{cname}'")
+            ctype = spec.get("type")
+            if ctype is None:
+                ctx.diags.error("CD005", f"column '{cname}' in {what} needs a 'type'", ctx.loc(raw, cname))
+                continue
+            if spec.get("metadata") is not None:
+                meta = cname if spec["metadata"] is True else str(spec["metadata"])
+            virtual = bool(spec.get("virtual", False))
+            if spec.get("expression") is not None:
+                expression = str(spec["expression"]).strip()
+            if meta and expression:
+                ctx.diags.error("CD005", f"column '{cname}' in {what}: give either 'metadata' or 'expression'",
+                                ctx.loc(raw, cname))
+            if virtual and not meta:
+                ctx.diags.error("CD005", f"column '{cname}' in {what}: 'virtual' applies to metadata columns",
+                                ctx.loc(raw, cname))
+        else:
+            mm = META_RE.match(" ".join(str(ctype).split()))
+            if mm:
+                ctype, meta, virtual = mm.group(1), mm.group(2) or cname, bool(mm.group(3))
         try:
-            cols.append(Column(cname, parse_type(ctype), ctx.loc(raw, cname)))
+            cols.append(Column(cname, parse_type(ctype), ctx.loc(raw, cname), meta, virtual, expression))
         except TypeParseError as e:
             ctx.diags.error("CD010", f"bad type for column '{cname}' in {what}: {e}", ctx.loc(raw, cname),
                             hint="use Flink SQL types, e.g. STRING, BIGINT, DECIMAL(10, 2), TIMESTAMP(3)")
@@ -643,4 +676,6 @@ def _load_sink(name, k, ctx: _Ctx) -> Sink:
         primary_key=_str_list(k.get("primary_key"), ctx, k, "primary_key", "primary_key"),
         options={str(kk): str(v) for kk, v in ctx.require_mapping(k.get("options"), "options", k, "options").items()},
         on_conflict=on_conflict, description=k.get("description"), loc=ctx.loc(k),
+        metadata={str(c): (str(c) if v is True else str(v))
+                  for c, v in ctx.require_mapping(k.get("metadata"), "metadata", k, "metadata").items()},
     )

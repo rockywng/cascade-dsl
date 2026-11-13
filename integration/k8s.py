@@ -135,6 +135,40 @@ def phase_v1() -> str:
     return job
 
 
+def rest(path: str) -> dict:
+    """The JobManager's REST API through the API server's service proxy (the image has no curl)."""
+    out = kubectl("get", "--raw", f"/api/v1/namespaces/default/services/shop-it-rest:8081/proxy{path}", check=False)
+    return json.loads(out) if out.strip().startswith("{") else {}
+
+
+def phase_jm_failover(job: str):
+    step("JobManager failover: kill the JobManager pod; Kubernetes HA recovers the job from its checkpoint")
+    conf = deployment()["spec"]["flinkConfiguration"]
+    if conf.get("high-availability.type") != "kubernetes":
+        raise Failed(f"cascade deploy did not configure HA: {conf}")
+    it.wait_for("a completed checkpoint after v1's orders",
+                       lambda: (rest(f"/jobs/{job}/checkpoints").get("counts") or {}).get("completed", 0) >= 2,
+                       timeout=120, every=3)
+    pods = kubectl("get", "pods", "-l", "app=shop-it,component=jobmanager", "-o", "name").split()
+    kubectl("delete", *pods, "--wait=false")
+    ok(f"deleted {', '.join(pods)}")
+
+    def recovered():
+        now = kubectl("get", "pods", "-l", "app=shop-it,component=jobmanager", "-o", "name").split()
+        if set(now) & set(pods):
+            return None
+        cp = rest(f"/jobs/{job}/checkpoints")
+        state = rest(f"/jobs/{job}").get("state")
+        restored = (cp.get("latest") or {}).get("restored")
+        return restored if state == "RUNNING" and restored else None
+    restored = it.wait_for("the same job RUNNING again, restored from a checkpoint", recovered, timeout=300, every=5)
+    ok(f"job {job[:8]} kept its id and restored checkpoint {restored.get('id')} "
+       f"({restored.get('external_path', '')})")
+    # Nothing new was produced: the sinks still hold v1's results (state is checked again after the
+    # upgrade, whose totals continue from what this recovered job holds)
+    it.expect("JDBC upsert sink unchanged after the failover", it.ltv_table, {"c1": (15.0, 2), "c2": (21.0, 2)})
+
+
 def phase_upgrade(v1_job: str):
     step("upgrade: kubectl apply -k of v2; the operator does stop-with-savepoint + restore")
     it.change_customer_before_upgrade()
@@ -264,6 +298,7 @@ def main():
         os.makedirs(os.path.join(it.WORK, "jobs"), exist_ok=True)
         cluster()
         v1 = phase_v1()
+        phase_jm_failover(v1)
         phase_upgrade(v1)
         phase_v3(job_state()[1])
         phase_session()

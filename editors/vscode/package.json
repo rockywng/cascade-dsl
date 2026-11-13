@@ -1,0 +1,25 @@
+{
+  "name": "cascade-dsl",
+  "displayName": "cascade pipelines",
+  "description": "Diagnostics, completion and hover for cascade pipeline.yaml (runs `cascade lsp`)",
+  "version": "0.1.0",
+  "publisher": "cascade",
+  "license": "Apache-2.0",
+  "engines": {"vscode": "^1.85.0"},
+  "categories": ["Linters", "Programming Languages"],
+  "activationEvents": ["workspaceContains:**/pipeline.yaml"],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "cascade",
+      "properties": {
+        "cascade.command": {
+          "type": "array",
+          "default": ["cascade", "lsp"],
+          "description": "How to start the language server, e.g. [\"python3\", \"-m\", \"cascade_dsl\", \"lsp\"]"
+        }
+      }
+    }
+  },
+  "dependencies": {"vscode-languageclient": "^9.0.1"}
+}

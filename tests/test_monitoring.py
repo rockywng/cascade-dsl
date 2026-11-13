@@ -46,7 +46,12 @@ class MonitoringTest(unittest.TestCase):
         self.assertIn("> 150", stalled["expr"])  # 5 x the 30 s interval
         ratio = next(x for x in rules if x["alert"] == "CascadeExpectationViolations")
         self.assertIn("> 0.05", ratio["expr"])
-        self.assertTrue(all('job_name="test_pipe"' in x["expr"] for x in rules))
+        flink = [x for x in rules if not x["alert"].startswith("CascadeReplicationSlot")]
+        self.assertTrue(all('job_name="test_pipe"' in x["expr"] for x in flink))
+        # the customers source is Postgres CDC: its slot (and later generations) are watched too
+        slot = [x for x in rules if x["alert"].startswith("CascadeReplicationSlot")]
+        self.assertEqual(len(slot), 4)
+        self.assertTrue(all('slot_name=~"test_pipe_customers(_g[0-9a-z]+)?"' in x["expr"] for x in slot))
 
     def test_deploy_writes_monitoring_and_enables_the_reporter(self):
         deploy.build(self.r, self.out)

@@ -572,7 +572,7 @@ def _load_model(name, m, ctx: _Ctx, root: str) -> Model:
     )
 
 
-PROCESS_KEYS = {"class", "jar", "inputs", "key_by", "config", "changelog", "primary_key", "event_time",
+PROCESS_KEYS = {"language", "file", "function", "class", "jar", "inputs", "key_by", "config", "changelog", "primary_key", "event_time",
                 "side_outputs"}
 
 
@@ -582,9 +582,17 @@ def _load_process(name, m, ctx: _Ctx, root: str) -> dict | None:
     ctx.check_keys(pr, PROCESS_KEYS, what)
     if "columns" not in m:
         ctx.diags.error("CD005", f"model '{name}': a process model must declare its output `columns`", ctx.loc(m))
-    for k in ("class", "inputs"):
+    language = str(pr.get("language", "java"))
+    if language not in ("java", "python"):
+        ctx.diags.error("CD006", f"{what}.language must be java or python", ctx.loc(pr, "language"))
+    for k in (("class", "inputs") if language == "java" else ("file", "function", "inputs")):
         if not pr.get(k):
             ctx.diags.error("CD005", f"{what} is missing '{k}'", ctx.loc(pr))
+    if language == "python" and pr.get("file"):
+        from .udfs import check_python_module
+        problem = check_python_module(os.path.join(root, str(pr["file"])), str(pr.get("function", "")))
+        if problem:
+            ctx.diags.error("CD160", f"{what}: {problem}", ctx.loc(pr, "file"))
     changelog = str(pr.get("changelog", "append"))
     if changelog not in ("append", "upsert", "retract"):
         ctx.diags.error("CD006", f"{what}.changelog must be append, upsert or retract", ctx.loc(pr, "changelog"))
@@ -601,7 +609,9 @@ def _load_process(name, m, ctx: _Ctx, root: str) -> dict | None:
     jar = pr.get("jar")
     if jar is not None and not os.path.exists(os.path.join(root, str(jar))):
         ctx.diags.warning("CD164", f"{what}: jar '{jar}' does not exist (build it first)", ctx.loc(pr, "jar"))
-    return {"class": str(pr.get("class", "")), "jar": str(jar) if jar is not None else None,
+    return {"language": language, "file": str(pr["file"]) if pr.get("file") else None,
+            "function": str(pr["function"]) if pr.get("function") else None,
+            "class": str(pr.get("class", "")), "jar": str(jar) if jar is not None else None,
             "inputs": _str_list(pr.get("inputs"), ctx, pr, "inputs", "inputs"),
             "key_by": _str_list(pr.get("key_by"), ctx, pr, "key_by", "key_by"),
             "config": {str(k): str(v) for k, v in ctx.require_mapping(pr.get("config"), "config", pr, "config").items()},

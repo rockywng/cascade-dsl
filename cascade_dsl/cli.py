@@ -261,6 +261,11 @@ def cmd_deploy(args) -> int:
     if info["mode"] == "statements":
         print("  note: without --plan-dir the job is planned at startup and operator UIDs are not pinned; "
               "use `cascade plan` for upgrades that must keep state", file=sys.stderr)
+    if info.get("target") == "session":
+        with open(os.path.join(info["out"], "REQUIREMENTS")) as f:
+            for line in f:
+                if "allowed-schemes" in line:
+                    print("  warning:" + line.lstrip("#").rstrip(), file=sys.stderr)
     if info["secrets"] and not info.get("secret_name"):
         from .deploy import env_name
         print("  needs these environment variables where the job runs: "
@@ -394,6 +399,11 @@ def cmd_init(args) -> int:
         f.write("target/\n.cascade/\ndeploy/\nplan/\n")
     print(f"created {path}/pipeline.yaml, tests/revenue_test.yaml; next: cascade validate {path}", file=sys.stderr)
     return 0
+
+
+def cmd_lsp(args) -> int:
+    from .lsp import main as lsp_main
+    return lsp_main()
 
 
 def cmd_lineage(args) -> int:
@@ -539,6 +549,9 @@ def main(argv=None) -> int:
     sp.add_argument("--name", help="pipeline name (default: the directory name)")
     sp.add_argument("--owner", default="data")
     sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("lsp", help="language server for pipeline.yaml (LSP over stdio; editors/vscode uses it)")
+    sp.set_defaults(fn=cmd_lsp)
 
     sp = sub.add_parser("lineage", help="Mermaid graph of the pipelines under a directory and who reads whom")
     sp.add_argument("root")

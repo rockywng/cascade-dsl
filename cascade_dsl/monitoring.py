@@ -29,6 +29,11 @@ RECORDS_IN = "flink_taskmanager_job_task_numRecordsInPerSecond"
 PENDING = "flink_taskmanager_job_task_operator_pendingRecords"  # FLIP-33: Kafka sources
 WATERMARK = "flink_taskmanager_job_task_currentInputWatermark"
 EXPECT = "flink_taskmanager_job_task_operator_cascade_model_expectation_action_cascade_expectation"
+# postgres_exporter (prometheus-community), replication_slot collector: checked by integration/connectors.py
+SLOT_CURRENT = "pg_replication_slot_slot_current_wal_lsn"
+SLOT_FLUSHED = "pg_replication_slot_slot_confirmed_flush_lsn"
+SLOT_ACTIVE = "pg_replication_slot_slot_is_active"
+SLOT_SAFE = "pg_replication_slot_safe_wal_size_bytes"
 
 
 def enabled(cfg: dict) -> bool:
@@ -42,6 +47,8 @@ def settings(cfg: dict) -> dict:
     return {"max_backpressure_ms": float(alerts.get("max_backpressure_ms", 500)),
             "max_pending_records": float(alerts.get("max_pending_records", 100000)),
             "max_violation_ratio": float(alerts.get("max_violation_ratio", 0.01)),
+            "max_slot_lag_bytes": float(alerts.get("max_slot_lag_bytes", 1 << 30)),
+            "min_slot_safe_wal_bytes": float(alerts.get("min_slot_safe_wal_bytes", 1 << 30)),
             "labels": {str(k): str(v) for k, v in ((m.get("labels") if isinstance(m, dict) else None) or {}).items()}}
 
 
@@ -96,14 +103,40 @@ def rules(r, cfg: dict) -> dict:
         out.append(alert("ExpectationViolations", f"{ratio} > {s['max_violation_ratio']:g}", "10m", "warning",
                          f"{p.name}: more than {s['max_violation_ratio']:.0%} of rows violate an expectation "
                          "({{ $labels.cascade_model }}.{{ $labels.expectation }})"))
+    slots = postgres_slots(r)
+    if slots:
+        # needs postgres_exporter scraping the source database (it reads pg_replication_slots); the slot
+        # name and the generations the runner moves it to on loss (<slot>_g<time>)
+        sel = 'slot_name=~"' + "|".join(f"{s}(_g[0-9a-z]+)?" for s in slots) + '"'
+        out += [
+            alert("ReplicationSlotLag", f"max by (slot_name) ({SLOT_CURRENT}{{{sel}}} - {SLOT_FLUSHED}{{{sel}}}) "
+                  f"> {s['max_slot_lag_bytes']:g}", "10m", "warning",
+                  f"{p.name}: replication slot {{{{ $labels.slot_name }}}} is more than "
+                  f"{s['max_slot_lag_bytes']:g} bytes behind (Postgres keeps that WAL until it catches up)"),
+            alert("ReplicationSlotInactive", f"max by (slot_name) ({SLOT_ACTIVE}{{{sel}}}) == 0", "10m", "warning",
+                  f"{p.name}: nothing reads replication slot {{{{ $labels.slot_name }}}}"),
+            alert("ReplicationSlotAtRisk", f"min by (slot_name) ({SLOT_SAFE}{{{sel}}}) "
+                  f"< {s['min_slot_safe_wal_bytes']:g}", "5m", "critical",
+                  f"{p.name}: replication slot {{{{ $labels.slot_name }}}} is close to max_slot_wal_keep_size; "
+                  "if Postgres invalidates it, changes are lost"),
+            alert("ReplicationSlotGone", f"absent({SLOT_CURRENT}{{{sel}}})", "10m", "critical",
+                  f"{p.name}: no replication slot for its Postgres CDC sources ({', '.join(slots)}): it was dropped "
+                  "or invalidated; the next restore refuses or re-snapshots (on_slot_loss)"),
+        ]
     return {"groups": [{"name": f"cascade-{p.name}", "rules": out}]}
+
+
+def postgres_slots(r) -> list[str]:
+    opts = r.checked.options
+    return sorted({o["slot.name"] for o in opts.values() if "slot.name" in o
+                   and "postgres-cdc" in (o.get("connector"), o.get("delegate"))})
 
 
 def metric_names(rule_groups: dict) -> set[str]:
     names = set()
     for g in rule_groups["groups"]:
         for rule in g["rules"]:
-            names |= set(re.findall(r"\b(flink_[A-Za-z0-9_]+)", rule["expr"]))
+            names |= set(re.findall(r"\b((?:flink|pg)_[A-Za-z0-9_]+)", rule["expr"]))
     return names
 
 

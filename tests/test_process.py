@@ -236,3 +236,98 @@ class ProcessRestoreTest(unittest.TestCase):
         assert old in text
         with open(path, "w") as f:
             f.write(text.replace(old, new))
+
+
+class PythonProcessCompileTest(unittest.TestCase):
+    def test_python_process_model_compiles_and_deploys_through_pyflink(self):
+        from cascade_dsl import deploy
+        text = PIPE.replace("      class: com.acme.Dedup\n", "      language: python\n      file: jobs/dedup.py\n"
+                                                               "      function: dedup\n")
+        root = project(text.replace("PROC_EXTRA", ""), files={"jobs/dedup.py": "def dedup(ctx, inputs):\n"
+                                                                                "    return inputs[0]\n"})
+        out = tempfile.mkdtemp()
+        try:
+            r = compile_pipeline(root)
+            self.assertTrue(r.ok, [d.format() for d in r.diagnostics.items])
+            st = next(s for s in r.lowered.statements if s.kind == "process")
+            spec = json.loads(st.sql.split(" ", 2)[2])
+            self.assertEqual((spec["language"], spec["function"]), ("python", "dedup"))
+            deploy.build(r, out, image="img")
+            import yaml
+            with open(os.path.join(out, "flinkdeployment.yaml")) as f:
+                job = yaml.safe_load(f)["spec"]["job"]
+            self.assertEqual(job["entryClass"], "org.apache.flink.client.python.PythonDriver")
+            self.assertEqual(job["args"][:3], ["-py", "/opt/cascade/python/cascade_pyrunner.py", "job"])
+            with open(os.path.join(out, "python-configmap.yaml")) as f:
+                files = yaml.safe_load(f)["data"]
+            self.assertTrue({"cascade_pyrunner.py", "dedup.py"} <= set(files))
+            with open(os.path.join(out, "configmap.yaml")) as f:
+                self.assertIn('"file": "/opt/cascade/python/dedup.py"', yaml.safe_load(f)["data"]["setup.sql"])
+        finally:
+            shutil.rmtree(root)
+            shutil.rmtree(out)
+
+    def test_missing_function_is_reported(self):
+        text = PIPE.replace("      class: com.acme.Dedup\n", "      language: python\n      file: jobs/dedup.py\n"
+                                                               "      function: nope\n")
+        root = project(text.replace("PROC_EXTRA", ""), files={"jobs/dedup.py": "def dedup(ctx, inputs):\n    pass\n"})
+        try:
+            self.assertIn("CD160", compile_pipeline(root).diagnostics.codes())
+        finally:
+            shutil.rmtree(root)
+
+
+@unittest.skipUnless(READY and __import__("cascade_dsl.jvm", fromlist=["x"]).python_executable(),
+                     "needs FLINK_HOME, runtime/build.sh and PyFlink (CASCADE_PYTHON)")
+class PythonProcessExecutionTest(unittest.TestCase):
+    def test_python_sessions_example(self):
+        r, results = testing.run(os.path.join(os.path.dirname(__file__), "..", "examples", "sessions_py"), FLINK)
+        self.assertIsNotNone(results, [x.format() for x in r.diagnostics.errors])
+        self.assertEqual(len(results), 3)
+        for t in results:
+            self.assertTrue(t.passed, f"{t.case.name}: {t.message}")
+
+
+@unittest.skipUnless(READY and __import__("cascade_dsl.jvm", fromlist=["x"]).python_executable(),
+                     "needs FLINK_HOME, runtime/build.sh and PyFlink (CASCADE_PYTHON)")
+class PythonRunnerJobTest(unittest.TestCase):
+    """pyrunner.py job: what PythonDriver runs in a deployment, end to end on files."""
+
+    def test_python_runner_runs_the_job(self):
+        import glob
+        from cascade_dsl.jvm import python_executable, runtime_jar, script
+        d = tempfile.mkdtemp(prefix="cascade-pyrunner-")
+        try:
+            os.makedirs(os.path.join(d, "data", "in"))
+            with open(os.path.join(d, "data", "in", "clicks.csv"), "w") as f:
+                f.write("u1,/a,2026-01-01 10:00:00\nu2,/a,2026-01-01 10:05:00\nu1,/b,2026-01-01 10:10:00\n"
+                        "u1,/c,2026-01-01 11:00:00\n")
+            src = os.path.join(os.path.dirname(__file__), "..", "examples", "sessions_py", "jobs", "sessionize.py")
+            text = FILES.replace("DATA", os.path.join(d, "data")).replace(
+                "      class: com.acme.process.Sessionize\n      jar: JAR\n",
+                f"      language: python\n      file: {os.path.abspath(src)}\n      function: sessionize\n")
+            root = project(text, base=False)
+            r = compile_pipeline(root)
+            self.assertTrue(r.ok, [x.format() for x in r.diagnostics.items])
+            with open(os.path.join(root, "setup.sql"), "w") as f:
+                f.write(script([s for s in r.lowered.statements if s.kind != "insert"]))
+            with open(os.path.join(root, "statements.sql"), "w") as f:
+                f.write(script([s for s in r.lowered.statements if s.kind == "insert"]))
+            runner = os.path.join(os.path.dirname(__file__), "..", "cascade_dsl", "pyrunner.py")
+            p = subprocess.run([python_executable(), "-P", runner, "job", "--setup", os.path.join(root, "setup.sql"),
+                                "--statements", os.path.join(root, "statements.sql"), "--await"],
+                               capture_output=True, text=True, timeout=600,
+                               env={**os.environ, "CASCADE_JARS": runtime_jar()})
+            self.assertEqual(p.returncode, 0, (p.stderr or p.stdout)[-3000:])
+            rows = set()
+            for part in glob.glob(os.path.join(d, "data", "out", "**", "*"), recursive=True):
+                if os.path.isfile(part) and not os.path.basename(part).startswith("."):
+                    with open(part) as f:
+                        rows |= {line.strip() for line in f if line.strip()}
+            self.assertEqual(rows, {
+                'u1,"2026-01-01 10:00:00","2026-01-01 10:10:00",2,"2026-01-01 10:40:00"',
+                'u1,"2026-01-01 11:00:00","2026-01-01 11:00:00",1,"2026-01-01 11:30:00"',
+                'u2,"2026-01-01 10:05:00","2026-01-01 10:05:00",1,"2026-01-01 10:35:00"'})
+            shutil.rmtree(root)
+        finally:
+            shutil.rmtree(d)

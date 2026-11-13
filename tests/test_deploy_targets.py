@@ -48,7 +48,8 @@ def build(deploy_block: str, data: str = "/tmp/x"):
 
 class SessionTargetTest(unittest.TestCase):
     def test_session_job_carries_its_scripts(self):
-        root, out, r = build("{target: session, session_cluster: shared-flink, jar_uri: 's3://b/cascade-runtime.jar'}")
+        root, out, r = build("{target: session, session_cluster: shared-flink, jar_uri: 's3://b/cascade-runtime.jar', "
+                             "checkpoints: {dir: 's3://b/cp'}}")
         try:
             info = deploy.build(r, out)
             self.assertEqual(info["target"], "session")
@@ -102,7 +103,8 @@ class InlineScriptsRunTest(unittest.TestCase):
         os.makedirs(os.path.join(data, "in"))
         with open(os.path.join(data, "in", "p.csv"), "w") as f:
             f.write("c1,10\nc2,5\nc1,7\n")
-        root, out, r = build("{target: session, session_cluster: s, jar_uri: 'https://x/r.jar'}", data)
+        root, out, r = build("{target: session, session_cluster: s, jar_uri: 'https://x/r.jar', "
+                             "checkpoints: {dir: 'file:///tmp/cp'}}", data)
         try:
             deploy.build(r, out)
             with open(os.path.join(out, "flinksessionjob.yaml")) as f:

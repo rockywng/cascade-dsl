@@ -194,6 +194,7 @@ TESTED_VERSIONS = {
     "org.apache.flink:flink-connector-jdbc-db2": "4.1.0-2.2",
     "com.microsoft.sqlserver:mssql-jdbc": "13.6.2.jre11",
     "com.oracle.database.jdbc:ojdbc11": "23.26.4.0.0",
+    "com.oracle.database.jdbc:ojdbc8": "19.33.0.0",  # the oracle-cdc driver (Debezium 1.9: the 19c line)
     "com.ibm.db2:jcc": "12.1.5.0",
     "org.apache.hadoop:hadoop-client-api": "3.4.2",
     "org.apache.hadoop:hadoop-client-runtime": "3.4.2",
@@ -295,14 +296,30 @@ def _passthrough_table(role, mode, fmt, opts, ctx):
     return []
 
 
+def _oracle_finish(role, mode, fmt, opts, ctx):
+    problems = _db_table_finish("schema-name", "table-name")(role, mode, fmt, opts, ctx)
+    if opts.get("debezium.database.pdb.name"):
+        # Flink CDC 3.7's incremental reader discovers tables over a connection to the container root and
+        # finds none in a pluggable database ("db history ... missing"; integration/connectors.py): the
+        # legacy reader reads them. LogMiner's online catalog avoids mining the dictionary from redo.
+        opts.setdefault("scan.incremental.snapshot.enabled", "false")
+        opts.setdefault("debezium.log.mining.strategy", "online_catalog")
+    else:
+        opts.setdefault("scan.incremental.snapshot.enabled", "true")
+    return problems
+
+
 register(ConnectorSpec(
     type="oracle-cdc", roles={"source"},
     doc="Oracle change data capture via Flink CDC (LogMiner). Emits an updating changelog.",
-    connection={**_CDC_COMMON, "port": Prop("port", default=1521), "database": Prop("database-name", required=True)},
+    connection={**_CDC_COMMON, "port": Prop("port", default=1521), "database": Prop("database-name", required=True),
+                "pdb": Prop("debezium.database.pdb.name", doc="the pluggable database, in a multitenant (CDB) setup")},
     source={"table": Prop("__table", required=True, doc="schema.table"), "startup": _CDC_STARTUP},
     source_changelog="updating", source_requires_pk=True,
     artifact="org.apache.flink:flink-sql-connector-oracle-cdc",
-    finish=_incremental(_db_table_finish("schema-name", "table-name")),
+    # like MySQL's, the jar doesn't bundle the driver (found by integration/connectors.py: "No suitable driver")
+    extra_artifacts=lambda props: ["com.oracle.database.jdbc:ojdbc8"],
+    finish=_oracle_finish,
 ))
 for _db, _port, _doc in (("sqlserver", 1433, "SQL Server"), ("db2", 50000, "Db2")):
     register(ConnectorSpec(

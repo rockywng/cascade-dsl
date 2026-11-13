@@ -27,9 +27,10 @@ from .compiler import Result
 from .connectors import PATCHES, TESTED_VERSIONS
 from .jvm import script
 from .lower import Stmt
-from .udfs import python_files, python_functions
+from .udfs import PYRUNNER, needs_python, python_files, python_functions, python_processes
 
 RUNNER = "dev.cascade.runner.SqlRunner"
+PYTHON_DRIVER = "org.apache.flink.client.python.PythonDriver"
 JOB_DIR = "/opt/cascade/job"
 RUNTIME_JAR = "/opt/flink/usrlib/cascade-runtime.jar"
 USRLIB = "/opt/flink/usrlib"
@@ -153,7 +154,7 @@ def build(r: Result, out: str, plan_dir: str | None = None, image: str | None = 
     # (Kubernetes updates mounted ConfigMaps in place), and a new version changes the pod template,
     # which is what makes the operator perform a savepoint upgrade.
     job_cm = f"{name}-job-{_content_hash(files)}"
-    py_files = python_files(p) if python_functions(p) else None
+    py_files = python_files(p) if needs_python(p) else None
     py_cm_name = f"{name}-python-{_content_hash(py_files)}" if py_files else None
     if target == "session":
         return _session_job(r, out, name, meta(name), files, mode, secrets, cfg)
@@ -261,6 +262,21 @@ def _monitoring_files(r: Result, cfg: dict, out: str):
         json.dump(monitoring.dashboard(r, cfg), f, indent=1)
 
 
+def _session_conf(cfg: dict) -> dict:
+    """Job-level configuration of a session job: the operator needs a checkpoint directory for savepoint
+    and last-state upgrades, and the job's own checkpointing settings."""
+    conf = {}
+    cp = cfg.get("checkpoints") or {}
+    if cp.get("interval"):
+        conf["execution.checkpointing.interval"] = str(cp["interval"])
+    if cp.get("dir"):
+        conf["execution.checkpointing.dir"] = str(cp["dir"])
+    if cfg.get("savepoints"):
+        conf["execution.checkpointing.savepoint-dir"] = str(cfg["savepoints"])
+    conf.update({str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()})
+    return conf
+
+
 def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mode: str, secrets: list,
                  cfg: dict) -> dict:
     """A FlinkSessionJob on an existing (operator-managed) session cluster."""
@@ -271,11 +287,15 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
         raise DeployError("target: session needs deploy.session_cluster (the FlinkDeployment running the session "
                           "cluster) and deploy.jar_uri (where the operator fetches cascade-runtime.jar: https://, "
                           "s3://, ...)")
-    from .udfs import python_functions
-    if python_functions(p):
+    from .udfs import needs_python
+    if needs_python(p):
         raise DeployError("Python UDFs need their files on the cluster; a session job can't ship them. "
                           "Use target: kubernetes")
     sc = p.scaling
+    mode_ = cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint")
+    if mode_ in ("savepoint", "last-state") and not (cfg.get("checkpoints") or {}).get("dir"):
+        raise DeployError(f"upgrade_mode {mode_} needs deploy.checkpoints.dir (the operator refuses the session job "
+                          "without a checkpoint directory)")
     job = {
         "apiVersion": "flink.apache.org/v1beta1", "kind": "FlinkSessionJob", "metadata": metadata,
         "spec": {
@@ -284,8 +304,7 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
                     "parallelism": (sc.parallelism if sc and sc.parallelism else 1),
                     "upgradeMode": cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint"),
                     "state": "running"},
-            **({"flinkConfiguration": {str(k): str(v) for k, v in (cfg.get("flink_config") or {}).items()}}
-               if cfg.get("flink_config") else {}),
+            "flinkConfiguration": _session_conf(cfg),
         },
     }
     with open(os.path.join(out, "flinksessionjob.yaml"), "w") as f:
@@ -294,6 +313,11 @@ def _session_job(r: Result, out: str, name: str, metadata: dict, files: dict, mo
     if monitoring.enabled(cfg):
         _monitoring_files(r, cfg, out)
     notes = ["# Session cluster requirements for this job (it shares the cluster's image and pods):",
+             *([f"#   the operator fetches {jar}: it allows only https by default; for another scheme add it to "
+                "kubernetes.operator.user.artifacts.allowed-schemes (operator configuration; a list separated by ;, e.g. https;http)"]
+               if not str(jar).startswith("https://") else []),
+             "#   the jar host must resolve to a public address: the operator refuses private, loopback and link-"
+             "local hosts (kubernetes.operator.user.artifacts.disallow-restricted-hosts, SSRF protection)",
              "#   connector jars: " + (", ".join(sorted(r.lowered.manifest["artifacts"])) or "none"),
              "#   secrets as environment variables on the JobManager and TaskManagers: "
              + (", ".join(env_name(s) for s in secrets) or "none")]
@@ -332,6 +356,10 @@ def _job_local(st: Stmt, out: str) -> Stmt:
         if spec.get("jar"):
             _sh.copy(spec["jar"], job)
             spec["jar"] = f"job/{os.path.basename(spec['jar'])}"
+        if spec.get("file"):  # a Python process model, next to the Python runner
+            _sh.copy(spec["file"], job)
+            _sh.copy(os.path.join(os.path.dirname(__file__), "pyrunner.py"), os.path.join(job, PYRUNNER))
+            spec["file"] = f"job/{os.path.basename(spec['file'])}"
         return Stmt(st.kind, st.name, f"{PROCESS_DIRECTIVE} {json.dumps(spec, sort_keys=True)}", st.comment)
     return st
 
@@ -365,7 +393,10 @@ def _flink_run(r: Result, out: str, files: dict, mode: str, secrets: list, cfg: 
              'cd "$(dirname "$0")"',
              ': "${FLINK_HOME:?set FLINK_HOME}"',
              ': "${CASCADE_RUNTIME_JAR:?set CASCADE_RUNTIME_JAR to cascade-runtime.jar}"',
-             f'exec "$FLINK_HOME/bin/flink" run {" ".join(opts)} -c {RUNNER} "$CASCADE_RUNTIME_JAR" {args} "$@"'.replace("  ", " ")]
+             (f'exec "$FLINK_HOME/bin/flink" run {" ".join(opts)} -py job/{PYRUNNER} '
+              f'-pyfs "$CASCADE_RUNTIME_JAR" job {args} "$@"' if python_processes(r.checked.pipeline) else
+              f'exec "$FLINK_HOME/bin/flink" run {" ".join(opts)} -c {RUNNER} "$CASCADE_RUNTIME_JAR" {args} "$@"')
+             .replace("  ", " ")]
     from . import monitoring
     if monitoring.enabled(cfg):
         _monitoring_files(r, cfg, out)
@@ -391,6 +422,8 @@ def _in_image(st: Stmt) -> Stmt:
         spec = json.loads(st.sql[len(PROCESS_DIRECTIVE):])
         if spec.get("jar"):
             spec["jar"] = f"{USRLIB}/{os.path.basename(spec['jar'])}"
+        if spec.get("file"):  # a Python process model: shipped in the Python ConfigMap
+            spec["file"] = f"{PYTHON_DIR}/{os.path.basename(spec['file'])}"
         return Stmt(st.kind, st.name, f"{PROCESS_DIRECTIVE} {json.dumps(spec, sort_keys=True)}", st.comment)
     return st
 
@@ -483,7 +516,7 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
         if sc.max_lag_ms:
             # catch up within the lag budget after a rescale
             conf["job.autoscaler.catch-up.duration"] = f"{max(sc.max_lag_ms // 1000, 1)}s"
-    if python_functions(p):
+    if needs_python(p):
         conf["python.executable"] = PYFLINK_PYTHON
         conf["python.client.executable"] = PYFLINK_PYTHON
     from . import monitoring
@@ -499,7 +532,7 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
     if monitoring.enabled(cfg):
         container["ports"] = [{"name": "metrics", "containerPort": monitoring.METRICS_PORT}]
     volumes = [{"name": "cascade-job", "configMap": {"name": job_cm}}]
-    if python_functions(p):
+    if needs_python(p):
         container["volumeMounts"].append({"name": "cascade-python", "mountPath": PYTHON_DIR, "readOnly": True})
         volumes.append({"name": "cascade-python", "configMap": {"name": py_cm}})
     if env:
@@ -532,9 +565,11 @@ def _flink_deployment(r: Result, name: str, metadata: dict, image: str, args: li
             "taskManager": {"resource": {"memory": _memory(tm.get("memory", "4g")), "cpu": float(tm.get("cpu", 1))}},
             "podTemplate": pod_template,
             "job": {
-                "jarURI": f"local://{RUNTIME_JAR}",
-                "entryClass": RUNNER,
-                "args": args,
+                # Python process models: the job is driven from Python (cascade_dsl/pyrunner.py)
+                "jarURI": f"local:///opt/flink/opt/flink-python-{cfg.get('flink_version', DEFAULT_FLINK)}.jar"
+                if python_processes(p) else f"local://{RUNTIME_JAR}",
+                "entryClass": PYTHON_DRIVER if python_processes(p) else RUNNER,
+                "args": (["-py", f"{PYTHON_DIR}/{PYRUNNER}", "job", *args]) if python_processes(p) else args,
                 "parallelism": (sc.parallelism if sc and sc.parallelism else 1),
                 # a batch run has no state to carry over; a new spec reruns the job
                 "upgradeMode": cfg.get("upgrade_mode", "stateless" if p.mode == "batch" else "savepoint"),
@@ -592,8 +627,8 @@ def dockerfile(r: Result, cfg: dict) -> str:
                f"{artifact}-${{{arg}}}.jar")
         lines.append(f'RUN test -n "${{{arg}}}" && wget -q -P /opt/flink/lib "{url}"')
     p = r.checked.pipeline
-    if python_functions(p):
-        lines += ["", "# Python UDFs: PyFlink in its own virtualenv, Python support on Flink's classpath",
+    if needs_python(p):
+        lines += ["", "# Python UDFs / process models: PyFlink in its own virtualenv, Python support on Flink's classpath",
                   "# (Flink images run as flink, uid 9999; installing packages needs root)",
                   "USER root",
                   "RUN apt-get update -y && apt-get install -y --no-install-recommends python3 python3-venv \\",

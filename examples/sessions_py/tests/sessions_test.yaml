@@ -1,0 +1,41 @@
+tests:
+  - name: sessions_close_after_the_gap
+    target: sessions
+    watermarks: end_of_input
+    given:
+      clicks:
+        - {user_id: u1, url: /a, ts: "2026-01-01 10:00:00"}
+        - {user_id: u2, url: /a, ts: "2026-01-01 10:05:00"}
+        - {user_id: u1, url: /b, ts: "2026-01-01 10:10:00"}
+        - {user_id: u1, url: /c, ts: "2026-01-01 11:00:00"}
+    expect:
+      rows:
+        - {user_id: u1, session_start: "2026-01-01 10:00:00", session_end: "2026-01-01 10:10:00", clicks: 2, session_closed: "2026-01-01 10:40:00"}
+        - {user_id: u2, session_start: "2026-01-01 10:05:00", session_end: "2026-01-01 10:05:00", clicks: 1, session_closed: "2026-01-01 10:35:00"}
+        - {user_id: u1, session_start: "2026-01-01 11:00:00", session_end: "2026-01-01 11:00:00", clicks: 1, session_closed: "2026-01-01 11:30:00"}
+
+  - name: late_clicks_go_to_the_side_output
+    target: sessions_late
+    watermarks: manual
+    given:
+      clicks:
+        - {user_id: u1, url: /a, ts: "2026-01-01 10:00:00"}
+        - {_watermark: "2026-01-01 10:50:00"}
+        - {user_id: u1, url: /old, ts: "2026-01-01 10:20:00"}
+    expect:
+      rows:
+        - {user_id: u1, url: /old, ts: "2026-01-01 10:20:00"}
+
+  - name: sql_window_over_the_process_output
+    target: sessions_per_hour
+    watermarks: end_of_input
+    given:
+      clicks:
+        - {user_id: u1, url: /a, ts: "2026-01-01 10:00:00"}
+        - {user_id: u2, url: /a, ts: "2026-01-01 10:05:00"}
+        - {user_id: u1, url: /b, ts: "2026-01-01 10:10:00"}
+        - {user_id: u1, url: /c, ts: "2026-01-01 11:00:00"}
+    expect:
+      rows:
+        - {window_start: "2026-01-01 10:00:00", sessions: 2, clicks: 3}
+        - {window_start: "2026-01-01 11:00:00", sessions: 1, clicks: 1}

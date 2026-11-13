@@ -165,6 +165,12 @@ def _check_sources(c: Checked):
                     conn=p.connections.get(s.connection))
                 _report_option_problems(c, problems, s.loc, s.name)
                 c.options[s.name] = opts
+                if opts.get("connector") == "oracle-cdc" and opts.get("scan.incremental.snapshot.enabled") == "false":
+                    d.warning("CD216", f"source '{s.name}': Oracle CDC in a pluggable database uses Flink CDC's legacy "
+                              "reader (the incremental one can't find tables in a PDB in Flink CDC 3.7); how it "
+                              "resumes after a restore isn't verified by cascade's tests", s.loc, node=s.name,
+                              hint="verify with `cascade restore-test` against a test database before relying on "
+                                   "savepoint upgrades")
         p.relations[s.name] = RelationInfo(columns=out_cols, rowtime=rowtime, changelog=changelog,
                                            upsert_key=list(s.primary_key) or None)
 
@@ -465,7 +471,8 @@ def _analyze_process(c: Checked, name: str, inputs: list[str]):
     _check_expectations(c, m, columns, changelog)
     p.relations[name] = RelationInfo(
         columns=columns, rowtime={et} if et else set(), changelog=changelog, inputs=inputs,
-        stateful_ops=[] if side else [StatefulOp("process", True, f"process {pr['class']}")],
+        stateful_ops=[] if side else [StatefulOp("process", True, "process " + (
+            pr["class"] if pr.get("language", "java") == "java" else f"{pr.get('file')}:{pr.get('function')}"))],
         upsert_key=pk or None)
 
 
@@ -502,7 +509,8 @@ def process_identity(m, inputs: list[str] | None = None) -> list:
     if "side_of" in pr:
         return ["side", pr["side"], pr.get("event_time")]
     ins = [f"_input{i}" for i in range(len(inputs))] if inputs is not None else pr["inputs"]
-    return [pr["class"], ins, pr.get("key_by"), sorted(pr.get("config", {}).items()), pr.get("changelog"),
+    code = pr["class"] if pr.get("language", "java") == "java" else f"{pr.get('file')}:{pr.get('function')}"
+    return [code, ins, pr.get("key_by"), sorted(pr.get("config", {}).items()), pr.get("changelog"),
             pr.get("primary_key"), pr.get("event_time"),
             sorted((k, [(c.name, c.type.text) for c in v["columns"]], v.get("event_time"))
                    for k, v in pr.get("side_outputs", {}).items())]
@@ -795,8 +803,9 @@ def _cdc_as_jdbc(connector: str, opts: dict) -> dict | None:
         url = f"jdbc:mysql://{host}:{port or 3306}/{db}"
     elif connector == "sqlserver-cdc":
         url = f"jdbc:sqlserver://{host}:{port or 1433};databaseName={db};encrypt=false"
-    elif connector == "oracle-cdc":
-        url, table = f"jdbc:oracle:thin:@{host}:{port or 1521}/{db}", f"{opts.get('schema-name')}.{table}"
+    elif connector == "oracle-cdc":  # a table in a pluggable database is reached through its service
+        service = opts.get("debezium.database.pdb.name") or db
+        url, table = f"jdbc:oracle:thin:@{host}:{port or 1521}/{service}", f"{opts.get('schema-name')}.{table}"
     elif connector == "db2-cdc":
         url = f"jdbc:db2://{host}:{port or 50000}/{db}"
     else:

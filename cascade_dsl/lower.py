@@ -341,6 +341,10 @@ def _process_directive(p, m, view_name: str, comment: str) -> Stmt:
     }
     if spec["jar"] is None:
         del spec["jar"]
+    if pr.get("language") == "python":  # run by cascade_dsl/pyrunner.py
+        spec.update({"language": "python", "file": os.path.abspath(os.path.join(p.root_dir, pr["file"])),
+                     "function": pr["function"]})
+        spec.pop("class", None)
     return Stmt("process", m.name, f"{PROCESS_DIRECTIVE} {json.dumps(spec, sort_keys=True)}", comment=comment)
 
 

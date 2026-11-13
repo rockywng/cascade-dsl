@@ -32,7 +32,7 @@ from cascade_dsl.jvm import script  # noqa: E402
 COMPOSE = os.path.join(it.HERE, "connectors-compose.yml")
 WORK = os.path.join(it.WORK, "connectors")
 RUNTIME = os.path.join(it.REPO, "runtime", "target", "cascade-runtime.jar")
-SECRETS = {"CASCADE_SECRET_PW": "pw", "CASCADE_SECRET_MSSQL": "Cascade-pw1", "CASCADE_SECRET_AWS_KEY": "x",
+SECRETS = {"CASCADE_SECRET_PW": "pw", "CASCADE_SECRET_MSSQL": "Cascade-pw1", "CASCADE_SECRET_ORACLE": "flinkpw", "CASCADE_SECRET_AWS_KEY": "x",
            "CASCADE_SECRET_AWS_SECRET": "x"}
 
 RESULTS = """
@@ -553,10 +553,149 @@ def case_sqlserver_cleanup():
                                      for line in sql("SELECT id, v FROM dbo.hist").splitlines() if line.strip()))
 
 
+def case_slot_metrics():
+    """The replication-slot alerts cascade generates use postgres_exporter's metrics: every one must be
+    reported for the slot of a running Postgres CDC source."""
+    from cascade_dsl import monitoring
+    if "app" not in sh("postgres", "psql", "-U", "postgres", "-tAc", "SELECT datname FROM pg_database"):
+        sh("postgres", "psql", "-U", "postgres", "-c", "CREATE DATABASE app")
+    sh("postgres", "psql", "-U", "postgres", "-d", "app", "-c",
+       "CREATE TABLE IF NOT EXISTS slotprobe (id INT PRIMARY KEY); ALTER TABLE slotprobe REPLICA IDENTITY FULL")
+    # postgres_exporter reports safe_wal_size only with a WAL budget for slots
+    sh("postgres", "psql", "-U", "postgres", "-c", "ALTER SYSTEM SET max_slot_wal_keep_size = '2GB'")
+    sh("postgres", "psql", "-U", "postgres", "-c", "SELECT pg_reload_conf()")
+    pg_table("id INT PRIMARY KEY")("slotprobe")
+    text = f"""
+pipeline: slot_metrics
+flink: {{config: {{execution.checkpointing.interval: 2s}}}}
+deploy: {{monitoring: true}}
+connections:
+  src: {{type: postgres-cdc, properties: {{hostname: localhost, port: 15432, database: app, username: postgres,
+         password: "${{secret:pw}}"}}}}{RESULTS}
+sources:
+  probe: {{connection: src, table: public.slotprobe, columns: {{id: INT NOT NULL}}, primary_key: [id]}}
+sinks:
+  out: {{from: probe, connection: results, table: slotprobe, mode: upsert, primary_key: [id]}}
+"""
+    job = Job("slot-metrics", text)
+    r = compile_once(text, "slot-metrics-rules")
+    rules = monitoring.rules(r, r.checked.pipeline.deploy)
+    wanted = {m for m in monitoring.metric_names(rules) if m.startswith("pg_")}
+    if len(wanted) < 4:
+        raise Failed(f"expected replication-slot alerts, got metrics {wanted}")
+    dc("up", "-d", "pg-exporter")
+    job.start()
+    try:
+        def scraped():
+            job.check_alive()
+            with urllib.request.urlopen("http://localhost:19187/metrics", timeout=10) as resp:
+                lines = [x for x in resp.read().decode().splitlines() if x and not x.startswith("#")]
+            have = {x.split("{")[0].split(" ")[0] for x in lines if 'slot_name="slot_metrics_probe' in x}
+            return have if wanted <= have else None
+        try:
+            it.wait_for("postgres_exporter reporting the slot", scraped, timeout=120, every=5)
+        except Failed:
+            raise Failed(f"postgres_exporter doesn't report {sorted(wanted - (scraped() or set()))} for the slot")
+        ok(f"slot alerts: all {len(wanted)} postgres_exporter metrics they use are reported for the CDC slot")
+    finally:
+        job.stop()
+
+
+def case_postgres_failover():
+    """A CDC source survives a Postgres failover: its slot, created with failover = true by the runner, is
+    synced to the standby; the primary dies while the job is down (with a change it hasn't read), the
+    standby is promoted, and the job, restored against it, still delivers every change."""
+    def on(service, sql, db="app"):
+        return sh(service, "psql", "-U", "postgres", "-d", db, "-tAF", "\t", "-c", sql)
+    dc("up", "-d", "pgprimary")
+    it.wait_for("primary", lambda: "1" in on("pgprimary", "SELECT 1", "postgres"), timeout=120, every=3)
+    dc("up", "-d", "pgstandby")
+    it.wait_for("standby streaming", lambda: on("pgprimary", "SELECT count(*) FROM pg_stat_replication").strip()
+                == "1", timeout=180, every=3)
+    on("pgprimary", "DROP TABLE IF EXISTS items; CREATE TABLE items (id INT PRIMARY KEY, v TEXT); "
+                    "ALTER TABLE items REPLICA IDENTITY FULL; INSERT INTO items VALUES (1,'a'),(2,'b')")
+    pg_table("id INT PRIMARY KEY, v TEXT")("failover_items")
+    truth = lambda svc: sorted(tuple(x.split("\t")) for x in on(svc, "SELECT id, v FROM items").splitlines())  # noqa: E731
+    mirror = lambda: sorted(tuple(r) for r in results("SELECT id, v FROM failover_items ORDER BY 1"))  # noqa: E731
+
+    def pipeline(port):
+        return f"""
+pipeline: failover
+flink:
+  config:
+    execution.checkpointing.interval: 1s
+    execution.checkpointing.dir: "file://{os.path.join(WORK, 'postgres-failover', 'checkpoints')}"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+connections:
+  src: {{type: postgres-cdc, properties: {{hostname: localhost, port: {port}, database: app, username: postgres,
+         password: "${{secret:pw}}"}}}}{RESULTS}
+sources:
+  items: {{connection: src, table: public.items, columns: {{id: INT NOT NULL, v: STRING}}, primary_key: [id]}}
+sinks:
+  out: {{from: items, connection: results, table: failover_items, mode: upsert, primary_key: [id]}}
+"""
+    job = Job("postgres-failover", pipeline(25432))
+    job.start()
+    try:
+        converge("failover: mirrored from the primary", mirror, truth("pgprimary"), job)
+        on("pgprimary", "INSERT INTO items VALUES (3,'before failover, read')")
+        converge("failover: a change read from the primary", mirror, truth("pgprimary"), job)
+        it.wait_for("the failover slot synced to the standby", lambda: on(
+            "pgstandby", "SELECT failover AND synced FROM pg_replication_slots WHERE slot_name = 'failover_items'")
+            .strip() == "t", timeout=120, every=3)
+        ok("failover: the runner-created slot is a failover slot, synced to the standby")
+        time.sleep(4)  # a checkpoint (and slot confirmation) after the last change read
+    finally:
+        job.stop()
+    checkpoint = job.latest_checkpoint()
+    on("pgprimary", "INSERT INTO items VALUES (4,'before failover, unread'); UPDATE items SET v = 'B' WHERE id = 2")
+    it.wait_for("standby caught up", lambda: on("pgstandby", "SELECT count(*) FROM items").strip() == "4",
+                timeout=60, every=2)
+    dc("stop", "pgprimary")
+    on("pgstandby", "SELECT pg_promote()", "postgres")
+    it.wait_for("standby promoted", lambda: on("pgstandby", "SELECT pg_is_in_recovery()", "postgres").strip() == "f",
+                timeout=60, every=2)
+    ok("failover: primary stopped, standby promoted")
+    restored = Job("postgres-failover-restored", pipeline(25433))
+    restored.start(restore=checkpoint)
+    try:
+        on("pgstandby", "INSERT INTO items VALUES (5,'after failover'); DELETE FROM items WHERE id = 1")
+        converge("failover: restored against the promoted standby, every change arrived (none lost)", mirror,
+                 truth("pgstandby"), restored)
+    finally:
+        restored.stop()
+
+
+def case_oracle():
+    """Oracle CDC (LogMiner, multitenant): snapshot, live changes, batch read through JDBC."""
+    dc("up", "-d", "oracle")
+    it.wait_for("Oracle", lambda: "DATABASE IS READY TO USE" in dc("logs", "oracle", check=False), timeout=900,
+                every=10)
+    if "ready for cdc" not in sh("oracle", "bash", "-c", "ls /tmp/cdc-ready 2>/dev/null && echo ready for cdc",
+                                 check=False):
+        out = sh("oracle", "bash", "/cascade-oracle/setup.sh")
+        sh("oracle", "bash", "-c", "touch /tmp/cdc-ready")
+        ok("oracle: archivelog, supplemental logging, CDC user: " + out.strip().splitlines()[-1])
+
+    def sql(q):
+        return sh("oracle", "bash", "-c", f"sqlplus -s app/apppw@localhost:1521/XEPDB1 <<'SQL'\n"
+                  f"SET HEADING OFF FEEDBACK OFF PAGESIZE 0 COLSEP '|'\n{q}\nSQL")
+    truth = lambda: sorted(tuple(x.strip() for x in line.split("|"))  # noqa: E731
+                           for line in sql("SELECT id, name, qty FROM items ORDER BY id;").splitlines() if line.strip())
+    mirror_case("oracle-cdc", '{type: oracle-cdc, properties: {hostname: localhost, port: 11521, username: c##flinkuser, '
+                'password: "${secret:oracle}", database: XE, pdb: XEPDB1}}',
+                "    table: APP.ITEMS",
+                "{ID: INT NOT NULL, NAME: STRING, QTY: INT}", "ID", truth,
+                lambda: sql("INSERT INTO items VALUES (4, 'd', 1);\nUPDATE items SET qty = 70 WHERE id = 2;\n"
+                            "DELETE FROM items WHERE id = 3;\nCOMMIT;"),
+                pg_table("id INT PRIMARY KEY, name TEXT, qty INT"))  # Flink's Postgres dialect doesn't quote names
+
+
 CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,
          "elasticsearch": case_elasticsearch, "dynamodb": case_dynamodb, "kinesis": case_kinesis,
          "hudi": case_hudi, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
-         "sqlserver-cleaned-up": case_sqlserver_cleanup}
+         "sqlserver-cleaned-up": case_sqlserver_cleanup, "slot-metrics": case_slot_metrics,
+         "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle}
 
 
 def prepare():

@@ -797,8 +797,9 @@ def _cdc_as_jdbc(connector: str, opts: dict) -> dict | None:
         url = f"jdbc:mysql://{host}:{port or 3306}/{db}"
     elif connector == "sqlserver-cdc":
         url = f"jdbc:sqlserver://{host}:{port or 1433};databaseName={db};encrypt=false"
-    elif connector == "oracle-cdc":
-        url, table = f"jdbc:oracle:thin:@{host}:{port or 1521}/{db}", f"{opts.get('schema-name')}.{table}"
+    elif connector == "oracle-cdc":  # a table in a pluggable database is reached through its service
+        service = opts.get("debezium.database.pdb.name") or db
+        url, table = f"jdbc:oracle:thin:@{host}:{port or 1521}/{service}", f"{opts.get('schema-name')}.{table}"
     elif connector == "db2-cdc":
         url = f"jdbc:db2://{host}:{port or 50000}/{db}"
     else:

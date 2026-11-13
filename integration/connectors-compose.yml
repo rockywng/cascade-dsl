@@ -34,6 +34,11 @@ services:
     command: ["--collector.replication_slot"]
     ports: ["19187:9187"]
     depends_on: [postgres]
+  oracle:   # Oracle XE 21c (gvenzl, the image Oracle's own docs point to); LogMiner set up by oracle/setup.sh
+    image: gvenzl/oracle-xe:21-slim
+    environment: {ORACLE_PASSWORD: syspw}
+    volumes: ["./oracle:/cascade-oracle:ro"]
+    ports: ["11521:1521"]
   pgprimary:   # failover pair: primary ...
     image: postgres:17
     environment: {POSTGRES_PASSWORD: pw, POSTGRES_DB: app}

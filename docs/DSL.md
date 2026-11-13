@@ -125,13 +125,27 @@ created, and Postgres releases the WAL behind a dropped slot. So cascade does tw
 - **Every start logs each slot's WAL status and lag,** and warns at `unreserved` (about to be
   invalidated).
 
-The runner only runs at start, so alert on slots between starts too:
+The runner only runs at start. Between starts, `deploy.monitoring` adds slot alerts for every
+Postgres CDC source, read from the standard
+[postgres_exporter](https://github.com/prometheus-community/postgres_exporter) (its
+`replication_slot` collector) scraping the source database:
+- **Lag:** the slot is behind by more than `alerts.max_slot_lag_bytes` (default 1 GiB).
+- **Inactive:** nothing has read the slot for 10 minutes.
+- **At risk:** its remaining WAL budget is under `alerts.min_slot_safe_wal_bytes` (needs
+  `max_slot_wal_keep_size`).
+- **Gone:** the slot disappeared.
 
-```sql
-SELECT slot_name, active, wal_status,
-       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
-FROM pg_replication_slots;   -- alert on wal_status <> 'reserved', or lag above your budget
-```
+They match the slot and the generations the runner may move it to. The connector tests check the
+metric names against a real exporter.
+
+**Failover is tested.** A Postgres 17 primary with a streaming standby that syncs slots:
+1. The runner creates the source's slot as a failover slot, and it's synced to the standby.
+2. The primary is stopped while the job is down, with a change the job hasn't read.
+3. The standby is promoted.
+4. The job is restored against it, and the unread change plus later changes all arrive.
+
+The standby needs `sync_replication_slots = on` and `hot_standby_feedback = on`, and the primary
+needs `synchronized_standby_slots`.
 
 **When a slot is gone on restore, `on_slot_loss` on the source decides:**
 
@@ -449,6 +463,41 @@ Limits:
   the old version on stand-in connectors, a savepoint, then the new version restored strictly. That
   checks every operator, including the process model's own state. For example, a changed `config`
   restores, and a removed process model is refused.
+
+### Python process models
+
+```yaml
+    process:
+      language: python
+      file: jobs/sessionize.py
+      function: sessionize          # def sessionize(ctx, inputs): -> DataStream
+      inputs: [clicks]
+      key_by: [user_id]
+```
+
+The function gets one PyFlink `DataStream` of `Row`s per input, and `ctx`:
+- `ctx.config`
+- `ctx.uid(name)`
+- `ctx.output_type`: the declared columns as row type information
+- `ctx.side_output(name)`: an `OutputTag`; emit with `yield tag, row`
+
+It returns a stream of rows matching the columns. Keyed state, timers and side outputs work as in
+PyFlink. `examples/sessions_py` mirrors the Java sessionizer.
+
+PyFlink builds Python operators from Python, so these pipelines are driven by
+`cascade_dsl/pyrunner.py`. It applies the job script through SqlRunner's Java helpers and adds the
+Python models in between:
+- **Kubernetes:** Flink's `PythonDriver` in application mode. The image gets PyFlink, and the
+  runner and model files ship in the Python ConfigMap.
+- **`flink-run`:** `flink run -py`.
+- **`cascade test`:** runs them too (needs PyFlink: `pip install apache-flink`, or `CASCADE_PYTHON`).
+
+The function and the classes in its file are pickled by value, so workers need nothing installed.
+Two PyFlink differences:
+- **Watermarks per bundle.** PyFlink hands Python functions records in bundles, with the watermark
+  per bundle (`python.fn-execution.bundle.size`), so lateness checks in `process_element` are only
+  as exact as the bundle. The example's late-data branch sets the bundle size to 1.
+- **Supported column types:** strings, integers, floats, decimals, booleans, dates and timestamps.
 
 ## Functions
 
@@ -827,7 +876,9 @@ The cluster supplies everything else, and `REQUIREMENTS` lists it:
 - process and UDF jars in `usrlib`
 - the secrets as environment variables
 
-Python UDFs need files on the cluster, so they aren't supported here. On a shared cluster, one
+Python UDFs and process models need files on the cluster, so they aren't supported here. The operator
+fetches `jar_uri` over https only, unless `kubernetes.operator.user.artifacts.allowed-schemes` allows
+more; `cascade deploy` warns otherwise. The kind integration run deploys a session job this way. On a shared cluster, one
 JDBC sink's database outage takes down a TaskManager that other jobs run on (CD215).
 
 **`flink-run`: a `run.sh` around `flink run`, for clusters the operator doesn't manage.**
@@ -911,6 +962,18 @@ the data itself, not something missing from the compiler.
   "Postgres CDC and lost replication slots"). It runs on a CI runner. State in the tens of GBs, high parallelism and sustained high
   throughput need a real cluster; run `soak.py` there with `--rate`, `--customers` and
   `--partitions` scaled up.
+
+## Editors
+
+`cascade lsp` is a language server (LSP over stdio) for `pipeline.yaml`:
+- **Diagnostics:** the compiler's own, as you type. Unsaved buffers are checked from a temporary copy
+  of the project.
+- **Completion:** connector types after `type:`; the connector's properties inside a connection,
+  source or sink; and section keys.
+- **Hover:** a diagnostic code's meaning.
+
+`editors/vscode` is a small VS Code extension that starts it. Any other LSP client can run
+`cascade lsp`.
 
 ## Diagnostic codes
 

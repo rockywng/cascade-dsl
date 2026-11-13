@@ -298,7 +298,8 @@ def _passthrough_table(role, mode, fmt, opts, ctx):
 register(ConnectorSpec(
     type="oracle-cdc", roles={"source"},
     doc="Oracle change data capture via Flink CDC (LogMiner). Emits an updating changelog.",
-    connection={**_CDC_COMMON, "port": Prop("port", default=1521), "database": Prop("database-name", required=True)},
+    connection={**_CDC_COMMON, "port": Prop("port", default=1521), "database": Prop("database-name", required=True),
+                "pdb": Prop("debezium.database.pdb.name", doc="the pluggable database, in a multitenant (CDB) setup")},
     source={"table": Prop("__table", required=True, doc="schema.table"), "startup": _CDC_STARTUP},
     source_changelog="updating", source_requires_pk=True,
     artifact="org.apache.flink:flink-sql-connector-oracle-cdc",

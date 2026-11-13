@@ -401,6 +401,11 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_lsp(args) -> int:
+    from .lsp import main as lsp_main
+    return lsp_main()
+
+
 def cmd_lineage(args) -> int:
     from .lineage import mermaid
     print(mermaid(args.root, args.env), end="")
@@ -544,6 +549,9 @@ def main(argv=None) -> int:
     sp.add_argument("--name", help="pipeline name (default: the directory name)")
     sp.add_argument("--owner", default="data")
     sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("lsp", help="language server for pipeline.yaml (LSP over stdio; editors/vscode uses it)")
+    sp.set_defaults(fn=cmd_lsp)
 
     sp = sub.add_parser("lineage", help="Mermaid graph of the pipelines under a directory and who reads whom")
     sp.add_argument("root")

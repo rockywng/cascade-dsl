@@ -32,7 +32,7 @@ from cascade_dsl.jvm import script  # noqa: E402
 COMPOSE = os.path.join(it.HERE, "connectors-compose.yml")
 WORK = os.path.join(it.WORK, "connectors")
 RUNTIME = os.path.join(it.REPO, "runtime", "target", "cascade-runtime.jar")
-SECRETS = {"CASCADE_SECRET_PW": "pw", "CASCADE_SECRET_MSSQL": "Cascade-pw1", "CASCADE_SECRET_AWS_KEY": "x",
+SECRETS = {"CASCADE_SECRET_PW": "pw", "CASCADE_SECRET_MSSQL": "Cascade-pw1", "CASCADE_SECRET_ORACLE": "flinkpw", "CASCADE_SECRET_AWS_KEY": "x",
            "CASCADE_SECRET_AWS_SECRET": "x"}
 
 RESULTS = """
@@ -666,11 +666,35 @@ sinks:
         restored.stop()
 
 
+def case_oracle():
+    """Oracle CDC (LogMiner, multitenant): snapshot, live changes, batch read through JDBC."""
+    dc("up", "-d", "oracle")
+    it.wait_for("Oracle", lambda: "DATABASE IS READY TO USE" in dc("logs", "oracle", check=False), timeout=900,
+                every=10)
+    if "ready for cdc" not in sh("oracle", "bash", "-c", "ls /tmp/cdc-ready 2>/dev/null && echo ready for cdc",
+                                 check=False):
+        out = sh("oracle", "bash", "/cascade-oracle/setup.sh")
+        sh("oracle", "bash", "-c", "touch /tmp/cdc-ready")
+        ok("oracle: archivelog, supplemental logging, CDC user: " + out.strip().splitlines()[-1])
+
+    def sql(q):
+        return sh("oracle", "bash", "-c", f"sqlplus -s app/apppw@localhost:1521/XEPDB1 <<'SQL'\n"
+                  f"SET HEADING OFF FEEDBACK OFF PAGESIZE 0 COLSEP '|'\n{q}\nSQL")
+    truth = lambda: sorted(tuple(x.strip() for x in line.split("|"))  # noqa: E731
+                           for line in sql("SELECT id, name, qty FROM items ORDER BY id;").splitlines() if line.strip())
+    mirror_case("oracle-cdc", '{type: oracle-cdc, properties: {hostname: localhost, port: 11521, username: c##flinkuser, '
+                'password: "${secret:oracle}", database: XE, pdb: XEPDB1}}', "    table: APP.ITEMS",
+                "{ID: INT NOT NULL, NAME: STRING, QTY: INT}", "ID", truth,
+                lambda: sql("INSERT INTO items VALUES (4, 'd', 1);\nUPDATE items SET qty = 70 WHERE id = 2;\n"
+                            "DELETE FROM items WHERE id = 3;\nCOMMIT;"),
+                pg_table('"ID" INT PRIMARY KEY, "NAME" TEXT, "QTY" INT'))
+
+
 CASES = {"postgres-cdc": case_postgres, "mysql-cdc": case_mysql, "sqlserver-cdc": case_sqlserver, "mongodb-cdc": case_mongodb,
          "elasticsearch": case_elasticsearch, "dynamodb": case_dynamodb, "kinesis": case_kinesis,
          "hudi": case_hudi, "paimon": case_paimon, "iceberg": case_iceberg, "mysql-binlog-purged": case_mysql_binlog_purge,
          "sqlserver-cleaned-up": case_sqlserver_cleanup, "slot-metrics": case_slot_metrics,
-         "postgres-failover": case_postgres_failover}
+         "postgres-failover": case_postgres_failover, "oracle-cdc": case_oracle}
 
 
 def prepare():
